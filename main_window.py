@@ -1,0 +1,86 @@
+"""主窗口：左侧导航 + 右侧 QStackedWidget。"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QHBoxLayout,
+    QMainWindow,
+    QStackedWidget,
+    QStatusBar,
+    QWidget,
+)
+
+from pages.monitor_page import MonitorPage
+from pages.control_page import ControlPage
+from pages.communication_page import CommunicationPage
+from pages.ai_page import AIPage
+from pages.edge_ai_page import EdgeAIPage
+from pages.operation_log_page import OperationLogPage
+from widgets.side_nav import SideNav
+from communications.comm_manager import CommManager
+from logs.operation_logger import logger
+
+
+class MainWindow(QMainWindow):
+    def __init__(self, enable_training: bool = True) -> None:
+        super().__init__()
+        self.setWindowTitle("电机控制上位机 v1.0")
+        self.resize(1280, 800)
+
+        # 通信管理器：所有页面共享同一个通信会话
+        self.comm_manager = CommManager()
+
+        # 中心容器：左右布局
+        central = QWidget()
+        layout = QHBoxLayout(central)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+
+        nav_items = ["监控页面", "电机控制", "通信设置", "AI 分析", "边缘AI"]
+        if enable_training:
+            nav_items.append("模型训练")
+        nav_items.append("操作记录")
+
+        self.nav = SideNav(nav_items)
+        self.stack = QStackedWidget()
+
+        self.control_page = ControlPage(self.comm_manager)
+        self.monitor_page = MonitorPage(self.comm_manager, self.control_page)
+        self.communication_page = CommunicationPage(self.comm_manager)
+        self.ai_page = AIPage(self.comm_manager)
+        self.edge_ai_page = EdgeAIPage(self.comm_manager)
+        self.operation_log_page = OperationLogPage()
+
+        self.stack.addWidget(self.monitor_page)
+        self.stack.addWidget(self.control_page)
+        self.stack.addWidget(self.communication_page)
+        self.stack.addWidget(self.ai_page)
+        self.stack.addWidget(self.edge_ai_page)
+
+        if enable_training:
+            from pages.training_page import TrainingPage
+            self.training_page = TrainingPage(self.comm_manager, self.control_page)
+            self.stack.addWidget(self.training_page)
+
+        self.stack.addWidget(self.operation_log_page)
+
+        layout.addWidget(self.nav)
+        layout.addWidget(self.stack, 1)
+        self.setCentralWidget(central)
+
+        self.nav.currentIndexChanged.connect(self.stack.setCurrentIndex)
+        self.nav.setCurrentRow(0)
+
+        # 状态栏显示连接状态
+        bar = QStatusBar()
+        self.setStatusBar(bar)
+        self.comm_manager.statusChanged.connect(
+            lambda ok, msg: bar.showMessage(f"通信：{'已连接' if ok else '未连接'} - {msg}")
+        )
+        bar.showMessage("通信：未连接")
+        logger.log("软件启动")
+
+    def closeEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        try:
+            self.comm_manager.disconnect()
+        except Exception:
+            pass
+        super().closeEvent(event)

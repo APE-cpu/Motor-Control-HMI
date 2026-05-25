@@ -1,0 +1,8 @@
+{
+  "kind": "CAN总线",
+  "params": {
+    "channel": "COM9",
+    "bitrate": 250000,
+    "interface": "slcan"
+  }
+}

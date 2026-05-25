@@ -1,0 +1,106 @@
+/* 深色商务风格 */
+QMainWindow, QWidget {
+    background-color: #2b2f38;
+    color: #e6e6e6;
+    font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
+    font-size: 13px;
+}
+
+QLabel { color: #e6e6e6; }
+QLabel#TitleLabel {
+    font-size: 18px;
+    font-weight: bold;
+    color: #ffffff;
+    padding: 6px;
+}
+QLabel#BigValue {
+    font-size: 22px;
+    font-weight: bold;
+    color: #4fc3f7;
+}
+QLabel#TempNormal { color: #66bb6a; font-weight: bold; }
+QLabel#TempHigh   { color: #ef5350; font-weight: bold; }
+
+QPushButton {
+    background-color: #3a4150;
+    color: #ffffff;
+    border: 1px solid #4a5260;
+    border-radius: 4px;
+    padding: 6px 14px;
+    min-height: 22px;
+}
+QPushButton:hover { background-color: #475063; }
+QPushButton:pressed { background-color: #5a6478; }
+QPushButton:disabled { color: #888; background-color: #333; }
+
+QPushButton#EmergencyButton {
+    background-color: #c62828;
+    color: white;
+    font-weight: bold;
+    font-size: 14px;
+    border: 2px solid #ff5252;
+}
+QPushButton#EmergencyButton:hover { background-color: #e53935; }
+
+QPushButton#PrimaryButton {
+    background-color: #1976d2;
+    border-color: #2196f3;
+}
+QPushButton#PrimaryButton:hover { background-color: #1e88e5; }
+
+QComboBox, QLineEdit, QSpinBox, QDoubleSpinBox {
+    background-color: #1f232a;
+    color: #ffffff;
+    border: 1px solid #4a5260;
+    border-radius: 3px;
+    padding: 3px 6px;
+    min-height: 22px;
+}
+QComboBox QAbstractItemView {
+    background-color: #1f232a;
+    color: #ffffff;
+    selection-background-color: #1976d2;
+}
+
+QGroupBox {
+    border: 1px solid #4a5260;
+    border-radius: 6px;
+    margin-top: 12px;
+    padding-top: 10px;
+    font-weight: bold;
+    color: #b0bec5;
+}
+QGroupBox::title {
+    subcontrol-origin: margin;
+    left: 12px;
+    padding: 0 5px;
+}
+
+QTextEdit, QPlainTextEdit {
+    background-color: #1f232a;
+    color: #cfd8dc;
+    border: 1px solid #4a5260;
+    font-family: Consolas, "Courier New", monospace;
+}
+
+/* 侧边导航 */
+QListWidget#SideNav {
+    background-color: #1e222a;
+    border: none;
+    outline: 0;
+}
+QListWidget#SideNav::item {
+    color: #b0bec5;
+    padding: 14px 18px;
+    border-left: 3px solid transparent;
+}
+QListWidget#SideNav::item:hover {
+    background-color: #2a2f3a;
+}
+QListWidget#SideNav::item:selected {
+    background-color: #2a2f3a;
+    color: #ffffff;
+    border-left: 3px solid #1976d2;
+}
+
+QStatusBar { background-color: #1e222a; color: #b0bec5; }

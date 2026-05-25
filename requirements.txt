@@ -1,0 +1,9 @@
+PySide6>=6.5
+pyserial>=3.5
+python-can>=4.2
+pyqtgraph>=0.13
+numpy>=1.24
+torch>=2.0
+scikit-learn>=1.2
+onnx>=1.14
+onnxruntime>=1.16

@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+
+# Build & dist
+build/
+dist/
+*.spec
+
+# Logs
+logs/
+
+# IDE
+.vscode/
+.idea/
