@@ -11,6 +11,9 @@ dist/
 # Logs
 logs/
 
+# Local config
+config/ai_config.json
+
 # IDE
 .vscode/
 .idea/
