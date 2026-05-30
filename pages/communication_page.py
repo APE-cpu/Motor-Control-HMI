@@ -65,12 +65,49 @@ class _CanPanel(QWidget):
         self.channel = QLineEdit("COM9")
         self.bitrate = QComboBox(); self.bitrate.addItems([str(b) for b in BAUD_RATES_CAN])
         self.bitrate.setCurrentText("250000")
-        self.interface = QComboBox(); self.interface.addItems(["slcan", "gs_usb", "socketcan", "pcan", "kvaser", "vector", "virtual"])
-        f.addRow("CAN 通道", self.channel)
+        self.interface = QComboBox()
+        self.interface.addItems(["zlgcan", "zlgcan-zcan", "slcan", "gs_usb", "socketcan", "pcan", "kvaser", "vector", "virtual"])
+        # ZLG 专属参数：设备类型/设备索引/通道（仅 zlgcan / zlgcan-zcan 时显示）
+        self.device_type = QSpinBox(); self.device_type.setRange(0, 99); self.device_type.setValue(4)
+        self.device_index = QSpinBox(); self.device_index.setRange(0, 7); self.device_index.setValue(0)
+        self.can_channel = QSpinBox(); self.can_channel.setRange(0, 7); self.can_channel.setValue(0)
+        self._lbl_channel = QLabel("CAN 通道")
+        self._lbl_devtype = QLabel("设备类型号")
+        self._lbl_devidx = QLabel("设备索引")
+        self._lbl_chn = QLabel("CAN 通道号")
+        self._hint = QLabel("ZLG 设备类型号：3=USBCAN-I，4=USBCAN-II / CANalyst-II。"
+                            "zlgcan=创芯 ControlCAN.dll，zlgcan-zcan=致远原厂 zlgcan.dll")
+        self._hint.setWordWrap(True)
+        f.addRow(self._lbl_channel, self.channel)
         f.addRow("波特率 (bps)", self.bitrate)
         f.addRow("驱动接口", self.interface)
+        f.addRow(self._lbl_devtype, self.device_type)
+        f.addRow(self._lbl_devidx, self.device_index)
+        f.addRow(self._lbl_chn, self.can_channel)
+        f.addRow("", self._hint)
+        self.interface.currentTextChanged.connect(self._on_iface_changed)
+        self._on_iface_changed(self.interface.currentText())
+
+    def _on_iface_changed(self, iface: str) -> None:
+        is_zlg = iface.lower() in ("zlgcan", "zlgcan-zcan")
+        # ZLG 专属字段
+        for w in (self.device_type, self.device_index, self.can_channel,
+                  self._lbl_devtype, self._lbl_devidx, self._lbl_chn, self._hint):
+            w.setVisible(is_zlg)
+        # python-can 用的通道名字段
+        self.channel.setVisible(not is_zlg)
+        self._lbl_channel.setVisible(not is_zlg)
 
     def cfg(self) -> dict:
+        iface = self.interface.currentText().lower()
+        if iface in ("zlgcan", "zlgcan-zcan"):
+            return {
+                "interface": iface,
+                "bitrate": int(self.bitrate.currentText()),
+                "device_type": int(self.device_type.value()),
+                "device_index": int(self.device_index.value()),
+                "can_channel": int(self.can_channel.value()),
+            }
         return {
             "channel": self.channel.text().strip(),
             "bitrate": int(self.bitrate.currentText()),
