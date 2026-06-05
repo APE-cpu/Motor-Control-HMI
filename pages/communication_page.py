@@ -318,14 +318,10 @@ class CommunicationPage(QWidget):
         self._append_log(f"[状态] {msg}")
 
     def _on_raw_received(self, arb_id: int, data: bytes) -> None:
-        for enc in ("utf-8", "gbk"):
-            try:
-                text = data.decode(enc).rstrip("\x00\r\n")
-                self._append_log(f"[接收] {text}  ({data.hex(' ').upper()})")
-                return
-            except Exception:
-                pass
-        self._append_log(f"[接收] ID=0x{arb_id:03X} {data.hex(' ').upper()}")
+        if arb_id:
+            self._append_log(f"[接收] ID=0x{arb_id:03X}  ({data.hex(' ').upper()})")
+        else:
+            self._append_log(f"[接收]   ({data.hex(' ').upper()})")
 
     def _append_log(self, line: str) -> None:
         self._log_lines.append(line)
