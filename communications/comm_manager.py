@@ -15,13 +15,15 @@ from typing import Optional, Tuple
 from PySide6.QtCore import QObject, Signal
 
 from config.config import (
-    CMD_TELEMETRY, FRAME_HEADER, FRAME_TAIL,
+    CMD_EMERGENCY_STOP, CMD_START, CMD_STOP, CMD_TELEMETRY,
+    FRAME_HEADER, FRAME_TAIL,
     TELEM_ANGLE_SCALE, TELEM_CURRENT_SCALE, TELEM_FMT, TELEM_FMT_CAN,
     TELEM_LEN, TELEM_LEN_CAN, TELEM_TEMP_OFFSET, TELEM_TORQUE_FROM_CURRENT,
 )
 
 from .base_comm import BaseComm
 from .can_comm import CANComm
+from .motor_sim import MotorSim
 from .protocol import decode_frame
 from .serial_comm import SerialComm
 from .tcp_comm import TCPComm
@@ -80,9 +82,10 @@ class CommManager(QObject):
         # 当前活跃位置传感器（影响仿真分支与 CAN ID 透传），默认 QEP
         self._active_sensor_id: int = 1
         self._active_sensor_name: str = "增量式编码器(QEP)"
-        self._sim_pulse_count: int = 0
         self._rx_buf = bytearray()
         self._latest_frame = TelemetryFrame()
+        # 数字孪生 L1：PMSM 物理模型（虚拟下位机）
+        self._motor_sim = MotorSim()
 
     # ------------------ 公共接口 ------------------
     def connect(self, kind: str, **cfg) -> bool:
@@ -134,8 +137,54 @@ class CommManager(QObject):
         if sensor_name:
             self._active_sensor_name = sensor_name
 
+    def is_sim_running(self) -> bool:
+        """仿真数据流是否在跑（未连接真机、后台线程存活）。"""
+        return (not self.is_connected()
+                and self._thread is not None and self._thread.is_alive())
+
+    def motor_sim_params(self):
+        """数字孪生的 PMSM 参数对象（参数辨识页可读写）。"""
+        return self._motor_sim.p
+
+    def motor_sim_trace(self) -> list:
+        """取走虚拟电机的高速轨迹缓冲 [(θe, id, iq), ...]（1 kHz）。"""
+        pts = list(self._motor_sim.trace)
+        self._motor_sim.trace.clear()
+        return pts
+
+    def _dispatch_to_sim(self, data: bytes) -> bool:
+        """仿真模式下把控制帧交给虚拟电机执行（数字孪生 L1）。"""
+        decoded = decode_frame(data)
+        if decoded is None:
+            self.logMessage.emit("[仿真] 非法帧，虚拟电机忽略")
+            return False
+        cmd, payload = decoded
+        if cmd == CMD_START:
+            target = None
+            try:
+                text = payload.decode("utf-8")
+                for part in text.split(";"):
+                    if part.startswith("target="):
+                        target = float(part.split("=", 1)[1])
+            except Exception:
+                pass
+            self._motor_sim.start(target)
+            self.logMessage.emit(
+                f"[仿真] 虚拟电机启动，目标转速 {self._motor_sim.speed_ref_rpm:.0f} rpm")
+        elif cmd == CMD_STOP:
+            self._motor_sim.stop()
+            self.logMessage.emit("[仿真] 虚拟电机停止（滑行）")
+        elif cmd == CMD_EMERGENCY_STOP:
+            self._motor_sim.emergency_stop()
+            self.logMessage.emit("[仿真] 虚拟电机紧急停止")
+        else:
+            self.logMessage.emit(f"[仿真] 虚拟电机收到 CMD=0x{cmd:02X}（未实现，忽略）")
+        return True
+
     def send_frame(self, data: bytes) -> bool:
         if not self.is_connected():
+            if self.is_sim_running():
+                return self._dispatch_to_sim(data)
             self.logMessage.emit("[警告] 当前未连接，无法发送")
             return False
         try:
@@ -148,6 +197,8 @@ class CommManager(QObject):
 
     def send_frame_with_id(self, data: bytes, can_id: int = 0x100) -> bool:
         if not self.is_connected():
+            if self.is_sim_running():
+                return self._dispatch_to_sim(data)
             self.logMessage.emit("[警告] 当前未连接，无法发送")
             return False
         try:
@@ -278,9 +329,11 @@ class CommManager(QObject):
         return f
 
     def start_simulation(self) -> None:
-        """启动模拟数据流。"""
+        """启动模拟数据流（虚拟电机默认上电并运行到 1500 rpm）。"""
         if self._thread is not None and self._thread.is_alive():
             return
+        self._motor_sim.reset()
+        self._motor_sim.start(1500.0)
         self._stop.clear()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
@@ -295,17 +348,19 @@ class CommManager(QObject):
             self._thread = None
 
     def _make_simulated_frame(self) -> TelemetryFrame:
+        """步进 PMSM 物理模型 0.1 s，采样为一帧遥测（数字孪生 L1）。"""
         self._sim_t += 0.1
+        sim = self._motor_sim
+        sim.step(0.1)
         f = TelemetryFrame()
-        f.speed_target = 1500.0
-        f.speed_actual = 1500.0 + 30.0 * math.sin(self._sim_t) + random.uniform(-5, 5)
-        f.current_target = 5.0
-        f.current_actual = 5.0 + 0.3 * math.sin(self._sim_t * 1.7)
-        f.torque_target = 2.0
-        f.torque_actual = 2.0 + 0.1 * math.cos(self._sim_t * 1.3)
-        f.temperature = 35.0 + 10.0 * (0.5 + 0.5 * math.sin(self._sim_t * 0.05))
-        # 默认（QEP）的角度：连续平滑
-        base_angle = (self._sim_t * 30.0) % 360.0
+        f.speed_target = sim.speed_ref_rpm if sim.enabled else 0.0
+        f.speed_actual = sim.speed_rpm + random.uniform(-2.0, 2.0)   # 测量噪声
+        f.current_target = sim.iq_ref
+        f.current_actual = sim.i_q + random.uniform(-0.03, 0.03)
+        f.torque_target = sim.torque_ref
+        f.torque_actual = sim.torque
+        f.temperature = sim.temp
+        base_angle = sim.angle_deg
         f.angle_actual = base_angle
         f.sensor_source = self._active_sensor_name
         f.data_source = "sim"
@@ -317,18 +372,17 @@ class CommManager(QObject):
         sid = self._active_sensor_id
         speed = f.speed_actual
 
-        if sid == 0:  # Hall：60° 离散，质量较低，但低速换相稳定
-            step = int(self._sim_t * 10) % 6
+        if sid == 0:  # Hall：60° 离散量化真实角度，质量较低，但低速换相稳定
+            step = int(base_angle // 60.0) % 6
             f.angle_actual = step * 60.0
             f.angle_raw = float(step)
             f.sensor_quality = 0.7 + random.uniform(-0.05, 0.05)
             f.convergence = 1.0
             f.low_speed_warn = False
 
-        elif sid == 1:  # QEP：高分辨率角度，原始量为脉冲计数
+        elif sid == 1:  # QEP：高分辨率角度，原始量为真实角度对应的脉冲计数
             f.angle_actual = base_angle + random.uniform(-0.05, 0.05)
-            self._sim_pulse_count = (self._sim_pulse_count + 21) % 2500
-            f.angle_raw = float(self._sim_pulse_count)
+            f.angle_raw = float(int(base_angle / 360.0 * 2500.0) % 2500)
             f.sensor_quality = 0.99
             f.convergence = 1.0
             f.low_speed_warn = False

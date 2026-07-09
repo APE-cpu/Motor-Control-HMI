@@ -184,13 +184,13 @@ CMD_SET_SENSOR = 0x21        # 单独下发位置传感器配置
 
 
 # ============ 上行遥测 payload 格式 ============
-# 串口完整 14 字节 payload：
+# 串口完整 15 字节 payload：
 #   int16 speed_actual(rpm)、uint16 speed_target(rpm)
 #   int16 current_actual(mA)、uint16 angle_raw(传感器自定义)
 #   int16 angle_actual(0.01°)、int8 temperature(°C, 偏置 +40)
 #   uint8 sensor_quality(0-255)、uint8 convergence(0-255)、uint8 flags、padding
 TELEM_FMT = "<hHhHhbBBBx"
-TELEM_LEN = struct.calcsize(TELEM_FMT)        # = 14
+TELEM_LEN = struct.calcsize(TELEM_FMT)        # = 15
 
 # CAN 8 字节裸 payload（无帧头/校验/帧尾，直接 4 个核心字段）：
 #   int16 speed_actual、uint16 speed_target、int16 current_actual、uint16 angle_raw

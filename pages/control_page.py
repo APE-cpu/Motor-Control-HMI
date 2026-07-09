@@ -343,8 +343,10 @@ class ControlPage(QWidget):
         self._comm.send_frame_with_id(frame, can_id=can_id)
 
     def _on_start(self) -> None:
-        if not self._comm.is_connected():
-            QMessageBox.warning(self, "无法启动", "通信未连接，请先在「通信设置」页面建立连接。")
+        if not self._comm.is_connected() and not self._comm.is_sim_running():
+            QMessageBox.warning(
+                self, "无法启动",
+                "通信未连接，请先在「通信设置」页面建立连接，或启动仿真（虚拟电机）。")
             return
         if not self._selected_sensors():
             ans = QMessageBox.question(

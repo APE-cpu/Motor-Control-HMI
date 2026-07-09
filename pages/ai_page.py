@@ -1,11 +1,12 @@
 """AI 分析页面：接入外部大模型，分析电机运行状态与故障诊断。"""
+import base64
 import json
 import os
 import threading
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtWidgets import (
-    QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
+    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
     QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -47,12 +48,20 @@ class _Worker(QObject):
             self.error.emit(str(exc))
 
 
+_IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
+               ".bmp": "image/bmp", ".webp": "image/webp"}
+
+_WAVEFORM_QUESTION = "请分析这张波形截图，判断电机运行状态是否正常，有无异常或故障迹象。"
+
+
 class AIPage(QWidget):
-    def __init__(self, comm: CommManager) -> None:
+    def __init__(self, comm: CommManager, monitor_page=None) -> None:
         super().__init__()
         self._comm = comm
+        self._monitor = monitor_page
         self._latest: TelemetryFrame = TelemetryFrame()
         self._worker = None  # 持有引用，防止 GC
+        self._attachments: list = []  # [(文件名, mime, 原始字节)]
 
         root = QVBoxLayout(self)
 
@@ -116,6 +125,22 @@ class AIPage(QWidget):
         h.addWidget(self._btn_send)
         h.addWidget(btn_clear)
         v.addLayout(h)
+
+        # 图片附件行（需要支持视觉输入的模型，如 qwen3.7-plus / qwen-vl 系列）
+        h2 = QHBoxLayout()
+        btn_img = QPushButton("添加图片")
+        btn_img.clicked.connect(self._on_add_images)
+        self._btn_wave = QPushButton("分析当前波形")
+        self._btn_wave.clicked.connect(self._on_analyze_waveform)
+        self._attach_label = QLabel("")
+        self._attach_label.setStyleSheet("color: #90a4ae;")
+        btn_attach_clear = QPushButton("移除图片")
+        btn_attach_clear.clicked.connect(self._clear_attachments)
+        h2.addWidget(btn_img)
+        h2.addWidget(self._btn_wave)
+        h2.addWidget(btn_attach_clear)
+        h2.addWidget(self._attach_label, 1)
+        v.addLayout(h2)
         return box
 
     # -------- 配置持久化 --------
@@ -170,6 +195,44 @@ class AIPage(QWidget):
         )
         self._snapshot_label.setPlainText(snap)
 
+    def _on_add_images(self) -> None:
+        paths, _ = QFileDialog.getOpenFileNames(
+            self, "选择图片", "", "图片 (*.png *.jpg *.jpeg *.bmp *.webp)"
+        )
+        for p in paths:
+            mime = _IMAGE_MIME.get(os.path.splitext(p)[1].lower())
+            if mime is None:
+                continue
+            with open(p, "rb") as f:
+                self._attachments.append((os.path.basename(p), mime, f.read()))
+        self._update_attach_label()
+
+    def _on_analyze_waveform(self) -> None:
+        """截取监控页波形图并立即发送给 AI 分析。"""
+        if self._monitor is None:
+            self._append_chat("系统", "监控页面不可用，无法截取波形。")
+            return
+        png = self._monitor.render_waveforms_png()
+        if not png:
+            self._append_chat("系统", "暂无波形数据，请先启动仿真或连接通信。")
+            return
+        self._attachments.append(("波形截图.png", "image/png", png))
+        self._update_attach_label()
+        if not self._input.text().strip():
+            self._input.setText(_WAVEFORM_QUESTION)
+        self._on_send()
+
+    def _clear_attachments(self) -> None:
+        self._attachments.clear()
+        self._update_attach_label()
+
+    def _update_attach_label(self) -> None:
+        if self._attachments:
+            names = "、".join(n for n, _, _ in self._attachments)
+            self._attach_label.setText(f"已附 {len(self._attachments)} 张图片：{names}")
+        else:
+            self._attach_label.setText("")
+
     def _on_send(self) -> None:
         question = self._input.text().strip()
         if not question:
@@ -178,16 +241,32 @@ class AIPage(QWidget):
             self._append_chat("系统", "请先填写 API 配置并点击「保存配置」。")
             return
 
-        self._append_chat("用户", question)
+        attachments = self._attachments
+        self._attachments = []
+        self._update_attach_label()
+
+        suffix = f"（附 {len(attachments)} 张图片）" if attachments else ""
+        self._append_chat("用户", question + suffix)
         self._input.clear()
         self._btn_send.setEnabled(False)
         self._btn_send.setText("等待回复…")
-        logger.log("AI分析提问", question[:80])
+        logger.log("AI分析提问", (question + suffix)[:80])
+
+        if attachments:
+            user_content = [{"type": "text", "text": question}]
+            for _name, mime, data in attachments:
+                b64 = base64.b64encode(data).decode("ascii")
+                user_content.append({
+                    "type": "image_url",
+                    "image_url": {"url": f"data:{mime};base64,{b64}"},
+                })
+        else:
+            user_content = question
 
         snapshot = self._snapshot_label.toPlainText()
         messages = [
             {"role": "system", "content": _SYS_PROMPT.format(snapshot=snapshot)},
-            {"role": "user", "content": question},
+            {"role": "user", "content": user_content},
         ]
 
         self._worker = _Worker(self._client, messages)

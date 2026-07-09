@@ -3,12 +3,13 @@ import datetime
 import os
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
-    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QProgressBar,
-    QPushButton, QVBoxLayout, QWidget,
+    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
+    QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
-from config.config import MONITOR_REFRESH_MS
+from communications.protocol import encode_frame
+from config.config import CMD_START, MONITOR_REFRESH_MS
 from widgets.trend_curve import TrendCurve
 
 
@@ -126,6 +127,16 @@ class MonitorPage(QWidget):
         self._btn_emerg.clicked.connect(self._on_emergency)
         self._btn_sim.clicked.connect(self._on_toggle_sim)
         self._sim_running = False
+        # 在线调速：运行中直接改目标转速，无需切换页面
+        title_row.addWidget(QLabel("目标转速"))
+        self._speed_spin = QSpinBox()
+        self._speed_spin.setRange(0, 20000)
+        self._speed_spin.setValue(1500)
+        self._speed_spin.setSuffix(" rpm")
+        title_row.addWidget(self._speed_spin)
+        btn_set_speed = QPushButton("设定")
+        btn_set_speed.clicked.connect(self._on_set_speed)
+        title_row.addWidget(btn_set_speed)
         for b in (self._btn_sim, self._btn_start, self._btn_stop, self._btn_emerg):
             title_row.addWidget(b)
         root.addLayout(title_row)
@@ -270,20 +281,15 @@ class MonitorPage(QWidget):
             self._datasrc_label.setText("[ 仿真数据 ]")
             self._datasrc_label.setStyleSheet("color: #ff8a65; font-weight: bold;")
 
-    def _save_all_curves(self) -> None:
+    def render_waveforms_png(self) -> bytes:
+        """把全部趋势曲线离屏渲染成一张 PNG，返回字节流。
+
+        未安装 pyqtgraph 或尚无数据时返回 b""。
+        """
         try:
             import pyqtgraph as pg
         except ImportError:
-            from PySide6.QtWidgets import QMessageBox
-            QMessageBox.warning(self, "提示", "未安装 pyqtgraph，无法保存波形")
-            return
-        path, _ = QFileDialog.getSaveFileName(
-            self, "保存所有波形",
-            f"波形_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
-            "PNG (*.png)"
-        )
-        if not path:
-            return
+            return b""
         curves = [
             (self._c_speed,    "转速"),
             (self._c_current,  "电流"),
@@ -291,6 +297,8 @@ class MonitorPage(QWidget):
             (self._c_angle,    "角度"),
             (self._c_sensor_q, "传感器诊断"),
         ]
+        if not any(len(src._times) for src, _ in curves):
+            return b""
         win = pg.GraphicsLayoutWidget()
         win.setBackground("#2b2f38")
         win.resize(900, 200 * len(curves))
@@ -303,9 +311,40 @@ class MonitorPage(QWidget):
             for sname, color in src._series.items():
                 p.plot(ts, list(src._buffers[sname]),
                        pen=pg.mkPen(color=color, width=2), name=sname)
+        win.setAttribute(Qt.WA_DontShowOnScreen, True)
         win.show()
-        win.grab().save(path)
+        pixmap = win.grab()
         win.close()
+        from PySide6.QtCore import QBuffer, QIODevice
+        buf = QBuffer()
+        buf.open(QIODevice.WriteOnly)
+        pixmap.save(buf, "PNG")
+        return bytes(buf.data())
+
+    def _save_all_curves(self) -> None:
+        png = self.render_waveforms_png()
+        if not png:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.warning(self, "提示", "暂无波形数据（或未安装 pyqtgraph）")
+            return
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存所有波形",
+            f"波形_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+            "PNG (*.png)"
+        )
+        if not path:
+            return
+        with open(path, "wb") as f:
+            f.write(png)
+
+    def _on_set_speed(self) -> None:
+        """把新目标转速下发给下位机/虚拟电机（运行中即时生效）。"""
+        if not (self._comm.is_connected() or self._comm.is_sim_running()):
+            QMessageBox.warning(self, "无法设定", "请先启动仿真或连接通信。")
+            return
+        target = float(self._speed_spin.value())
+        payload = f"target={target}".encode("utf-8")
+        self._comm.send_frame(encode_frame(CMD_START, payload))
 
     def _on_start(self) -> None:
         if self._ctrl is not None:

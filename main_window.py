@@ -13,6 +13,8 @@ from pages.control_page import ControlPage
 from pages.communication_page import CommunicationPage
 from pages.ai_page import AIPage
 from pages.edge_ai_page import EdgeAIPage
+from pages.identify_page import IdentifyPage
+from pages.vector_page import VectorPage
 from pages.operation_log_page import OperationLogPage
 from widgets.side_nav import SideNav
 from communications.comm_manager import CommManager
@@ -34,7 +36,8 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        nav_items = ["监控页面", "电机控制", "通信设置", "AI 分析", "边缘AI"]
+        nav_items = ["监控页面", "电机控制", "矢量可视化", "参数辨识",
+                     "通信设置", "AI 分析", "边缘AI"]
         if enable_training:
             nav_items.append("模型训练")
         nav_items.append("操作记录")
@@ -44,13 +47,17 @@ class MainWindow(QMainWindow):
 
         self.control_page = ControlPage(self.comm_manager)
         self.monitor_page = MonitorPage(self.comm_manager, self.control_page)
+        self.vector_page = VectorPage(self.comm_manager)
+        self.identify_page = IdentifyPage(self.comm_manager)
         self.communication_page = CommunicationPage(self.comm_manager)
-        self.ai_page = AIPage(self.comm_manager)
+        self.ai_page = AIPage(self.comm_manager, monitor_page=self.monitor_page)
         self.edge_ai_page = EdgeAIPage(self.comm_manager)
         self.operation_log_page = OperationLogPage()
 
         self.stack.addWidget(self.monitor_page)
         self.stack.addWidget(self.control_page)
+        self.stack.addWidget(self.vector_page)
+        self.stack.addWidget(self.identify_page)
         self.stack.addWidget(self.communication_page)
         self.stack.addWidget(self.ai_page)
         self.stack.addWidget(self.edge_ai_page)

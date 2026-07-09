@@ -1,10 +1,11 @@
 """通信设置页面：通信方式选择、参数配置、连接控制、收发测试与日志。"""
 import json
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import (
-    QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox, QStackedWidget,
-    QVBoxLayout, QWidget,
+    QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout,
+    QLabel, QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QSpinBox,
+    QStackedWidget, QVBoxLayout, QWidget,
 )
 
 _LOG_PREFIXES = {
@@ -19,11 +20,104 @@ from communications.comm_manager import CommManager
 from communications.serial_comm import SerialComm
 from config.config import (
     BAUD_RATES_CAN, BAUD_RATES_SERIAL, COMM_TYPES,
+    CMD_EMERGENCY_STOP, CMD_SET_PARAMS, CMD_SET_SENSOR, CMD_START, CMD_STOP,
+    CMD_TELEMETRY, FRAME_HEADER, FRAME_TAIL,
     PARITY_OPTIONS, STOP_BITS_OPTIONS,
+    TELEM_ANGLE_SCALE, TELEM_CURRENT_SCALE, TELEM_FMT, TELEM_FMT_CAN,
+    TELEM_LEN, TELEM_LEN_CAN, TELEM_TEMP_OFFSET,
 )
 from runtime_paths import writable_path
 
 _COMM_CFG_FILE = writable_path("config", "comm_config.json")
+
+
+def _protocol_doc() -> str:
+    """从 config 常量生成下位机对接协议速查文本（常量改动自动同步）。"""
+    return f"""\
+═══════ 下位机对接协议速查 ═══════
+（内容由 config/config.py 常量实时生成；可移植 C 协议栈见仓库 下位机适配/ 目录）
+
+【一、串口帧格式（RS-232 / RS-485 通用）】
+
+  [HEAD] [CMD] [LEN] [PAYLOAD × LEN] [CHKSUM] [TAIL]
+   1B     1B    1B      N 字节          1B      1B
+
+  HEAD   = 0x{FRAME_HEADER:02X}
+  TAIL   = 0x{FRAME_TAIL:02X}
+  CHKSUM = 所有 PAYLOAD 字节求和 & 0xFF（不含头/命令/长度）
+  字节序 = 小端（little-endian）
+
+【二、命令字】
+
+  上行（下位机 → 上位机）：
+    0x{CMD_TELEMETRY:02X}  遥测帧（payload 格式见下）
+
+  下行（上位机 → 下位机）：
+    0x{CMD_START:02X}  启动电机
+    0x{CMD_STOP:02X}  停止电机
+    0x{CMD_EMERGENCY_STOP:02X}  紧急停止
+    0x{CMD_SET_PARAMS:02X}  下发控制参数
+    0x{CMD_SET_SENSOR:02X}  下发位置传感器配置
+
+【三、上行遥测 payload（串口，{TELEM_LEN} 字节，struct "{TELEM_FMT}"）】
+
+  偏移  类型    字段            单位/换算
+   0    int16   speed_actual    rpm
+   2    uint16  speed_target    rpm
+   4    int16   current_actual  mA（上位机 ÷{TELEM_CURRENT_SCALE:.0f} → A）
+   6    uint16  angle_raw       传感器原始量（Hall 扇区/QEP 计数等）
+   8    int16   angle_actual    0.01°（上位机 ÷{TELEM_ANGLE_SCALE:.0f} → °）
+  10    int8    temperature     °C，偏置 -{TELEM_TEMP_OFFSET:.0f}（上位机 +{TELEM_TEMP_OFFSET:.0f} 还原）
+  11    uint8   sensor_quality  0~255 → 0~1
+  12    uint8   convergence     0~255 → 0~1
+  13    uint8   flags           bit0 = 低速警告
+  （末尾 1 字节 padding，payload 共 {TELEM_LEN} 字节）
+
+  下位机建议发送频率 ≥10 Hz（上位机以 10 Hz 轮询显示）。
+
+【四、CAN 总线】
+
+  遥测上行：8 字节裸 payload（无帧头/校验/帧尾），struct "{TELEM_FMT_CAN}"：
+    int16 speed_actual | uint16 speed_target | int16 current_actual(mA) | uint16 angle_raw
+  上位机下行默认仲裁 ID = 0x100；旋转变压器遥测默认 ID = 0x201。
+  标准帧（11 位 ID），波特率与本页「波特率」设置一致。
+
+【五、以太网 TCP】
+
+  上位机作为监听端（Server）等待下位机接入。
+  当前版本 TCP 数据仅原样显示在日志中，不做遥测帧解析。
+
+【六、下位机侧参考实现】
+
+  仓库 下位机适配/ 目录提供可移植 C 协议栈：
+    protocol_portable.c/h        —— 串口帧编解码（与本页协议同源）
+    can_protocol_portable.c/h    —— CAN 版
+    platforms/                   —— STM32 HAL / TI C2000 / Arduino / FPGA 适配示例
+"""
+
+
+class _ProtocolDialog(QDialog):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("下位机对接说明")
+        self.resize(680, 640)
+        v = QVBoxLayout(self)
+        text = QPlainTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(_protocol_doc())
+        text.setStyleSheet("font-family: Consolas, 'Courier New', monospace;")
+        v.addWidget(text, 1)
+        h = QHBoxLayout()
+        btn_copy = QPushButton("复制全文")
+        btn_copy.clicked.connect(
+            lambda: QGuiApplication.clipboard().setText(text.toPlainText())
+        )
+        btn_close = QPushButton("关闭")
+        btn_close.clicked.connect(self.accept)
+        h.addStretch(1)
+        h.addWidget(btn_copy)
+        h.addWidget(btn_close)
+        v.addLayout(h)
 
 
 class _SerialPanel(QWidget):
@@ -147,10 +241,13 @@ class CommunicationPage(QWidget):
         btn_load_cfg = QPushButton("加载配置")
         btn_save_cfg.clicked.connect(self._on_save_cfg)
         btn_load_cfg.clicked.connect(self._on_load_cfg)
+        btn_protocol = QPushButton("下位机对接说明")
+        btn_protocol.clicked.connect(lambda: _ProtocolDialog(self).exec())
         ctrl_h.addWidget(self._btn_connect)
         ctrl_h.addWidget(self._btn_disconnect)
         ctrl_h.addWidget(btn_save_cfg)
         ctrl_h.addWidget(btn_load_cfg)
+        ctrl_h.addWidget(btn_protocol)
         ctrl_h.addStretch(1)
         root.addLayout(ctrl_h)
 
