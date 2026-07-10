@@ -56,3 +56,15 @@ class CANComm(BaseComm):
         if msg is None:
             return b""
         return bytes(msg.data[:size])
+
+    def recv_can(self, timeout: float = 0.05):
+        """读取一帧 CAN，返回 (arbitration_id, data) 或 None。
+
+        与 ZlgCanComm 保持同一接口，供 comm_manager 统一调用。
+        """
+        if not self.is_open():
+            return None
+        msg = self._bus.recv(timeout=timeout)
+        if msg is None:
+            return None
+        return int(msg.arbitration_id), bytes(msg.data)

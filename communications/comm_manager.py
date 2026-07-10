@@ -27,6 +27,8 @@ from .motor_sim import MotorSim
 from .protocol import decode_frame
 from .serial_comm import SerialComm
 from .tcp_comm import TCPComm
+from .zlgcan_comm import ZlgCanComm
+from .zlgcan_zcan_comm import ZlgCanZcanComm
 
 
 class TelemetryFrame:
@@ -96,7 +98,17 @@ class CommManager(QObject):
                 self._driver = SerialComm()
                 self._driver.open(**cfg)
             elif kind == "CAN总线":
-                self._driver = CANComm()
+                # interface 决定后端：
+                #   zlgcan       -> 创芯 ControlCAN.dll（VCI_* 老接口）
+                #   zlgcan-zcan  -> 致远原厂 zlgcan.dll（ZCAN_* 新接口）
+                #   其余          -> python-can
+                iface = str(cfg.get("interface", "")).lower()
+                if iface == "zlgcan":
+                    self._driver = ZlgCanComm()
+                elif iface == "zlgcan-zcan":
+                    self._driver = ZlgCanZcanComm()
+                else:
+                    self._driver = CANComm()
                 self._driver.open(**cfg)
             elif kind == "以太网TCP":
                 self._driver = TCPComm()
@@ -238,12 +250,11 @@ class CommManager(QObject):
     def _read_real_frame(self) -> Optional[TelemetryFrame]:
         """从真实驱动读取并解析一帧遥测；解析不到则返回 None（保留上一帧）。"""
         if self._kind == "CAN总线":
-            import can as _c
-            msg = self._driver._bus.recv(timeout=0.05)
-            if msg is None:
+            result = self._driver.recv_can(timeout=0.05)
+            if result is None:
                 return None
-            raw = bytes(msg.data)
-            self.rawReceived.emit(msg.arbitration_id, raw)
+            arb_id, raw = result
+            self.rawReceived.emit(arb_id, raw)
             if len(raw) < TELEM_LEN_CAN:
                 return None
             return self._parse_can_raw(raw)

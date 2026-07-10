@@ -37,12 +37,24 @@ if errorlevel 1 goto :error
 
 echo [2/3] Building %BUILD_NAME%...
 
+rem 若项目根目录存在 ZLG 驱动，则一并打入 exe（放在 exe 同级可被加载）
+set ZLG_DLL=
+if exist "ControlCAN.dll" set ZLG_DLL=--add-binary "ControlCAN.dll;."
+if defined ZLG_DLL (echo   [+] Found ControlCAN.dll, bundling into exe.) else (echo   [!] ControlCAN.dll not found, ZLG CAN will be unavailable in the exe.)
+
+rem 致远原厂 zlgcan.dll + kerneldlls 整目录（ZCAN_* 新接口，USBCAN-II）
+set ZLG_ZCAN=
+if exist "zlgcan_x64\zlgcan.dll" set ZLG_ZCAN=--add-data "zlgcan_x64;zlgcan_x64"
+if defined ZLG_ZCAN (echo   [+] Found zlgcan_x64, bundling into exe.) else (echo   [!] zlgcan_x64 not found, ZLGCAN-ZCAN backend will be unavailable in the exe.)
+
 if "%MODE%"=="lite" (
     pyinstaller --noconfirm --clean --onefile --windowed ^
       --name "%BUILD_NAME%" ^
       --add-data "config/style.qss;config" ^
       --add-data "motor_anomaly.onnx;." ^
       --add-data "motor_anomaly.onnx.data;." ^
+      %ZLG_DLL% ^
+      %ZLG_ZCAN% ^
       --exclude-module torch ^
       --exclude-module torchvision ^
       --exclude-module torchaudio ^
@@ -56,6 +68,8 @@ if "%MODE%"=="lite" (
       --add-data "config/style.qss;config" ^
       --add-data "motor_anomaly.onnx;." ^
       --add-data "motor_anomaly.onnx.data;." ^
+      %ZLG_DLL% ^
+      %ZLG_ZCAN% ^
       %ENTRY%
 )
 if errorlevel 1 goto :error
