@@ -39,6 +39,10 @@ class TelemetryFrame:
         "current_actual", "current_target",
         "torque_actual", "torque_target",
         "angle_actual", "temperature",
+        # 母线/硬件侧字段
+        "vdc",             # 直流母线电压 V
+        "bus_state",       # "normal" / "brake"(斩波) / "uv"(欠压) / "ov"(过压跳闸)
+        "powers",          # 功率流快照 dict（W），键见 MotorSim；真机暂为 {}
         # 传感器差异化字段
         "sensor_source",   # 当前活跃传感器名称
         "sensor_quality",  # 0-1 之间的数据质量/置信度
@@ -57,6 +61,9 @@ class TelemetryFrame:
         self.torque_target = 0.0
         self.angle_actual = 0.0
         self.temperature = 25.0
+        self.vdc = 48.0
+        self.bus_state = "normal"
+        self.powers = {}
         self.sensor_source = ""
         self.sensor_quality = 1.0
         self.angle_raw = 0.0
@@ -313,6 +320,9 @@ class CommManager(QObject):
         f.low_speed_warn = bool(flags & 0x01)
         f.torque_actual = f.current_actual * TELEM_TORQUE_FROM_CURRENT
         f.torque_target = self._latest_frame.torque_target
+        # 真机协议暂无母线字段，沿用上一帧（待协议扩展 CMD 后替换）
+        f.vdc = self._latest_frame.vdc
+        f.bus_state = self._latest_frame.bus_state
         f.sensor_source = self._active_sensor_name
         f.data_source = "real"
         return f
@@ -330,6 +340,8 @@ class CommManager(QObject):
         f.low_speed_warn = prev.low_speed_warn
         f.torque_target = prev.torque_target
         f.current_target = prev.current_target
+        f.vdc = prev.vdc
+        f.bus_state = prev.bus_state
         f.speed_actual = float(speed)
         f.speed_target = float(spd_tgt)
         f.current_actual = cur_ma / TELEM_CURRENT_SCALE
@@ -371,12 +383,35 @@ class CommManager(QObject):
         f.torque_target = sim.torque_ref
         f.torque_actual = sim.torque
         f.temperature = sim.temp
+        f.vdc = sim.vdc
+        f.bus_state = sim.bus_state
+        f.powers = {
+            "supply": sim.p_supply, "loss_src": sim.p_loss_src,
+            "brake": sim.p_brake, "inv": sim.p_inv, "cu": sim.p_cu,
+            "em": sim.p_em, "fric": sim.p_fric, "kinetic": sim.p_kinetic,
+        }
+        self._log_bus_transition(f.bus_state, sim.vdc)
         base_angle = sim.angle_deg
         f.angle_actual = base_angle
         f.sensor_source = self._active_sensor_name
         f.data_source = "sim"
         self._fill_sensor_specific(f, base_angle)
         return f
+
+    def _log_bus_transition(self, state: str, vdc: float) -> None:
+        """母线状态跳变时写一条日志（斩波动作/欠压/过压跳闸）。"""
+        prev = getattr(self, "_bus_state_prev", "normal")
+        if state == prev:
+            return
+        self._bus_state_prev = state
+        text = {
+            "brake": f"[母线] 回馈泵升，制动斩波器动作（Vdc={vdc:.1f} V）",
+            "uv": f"[母线] 欠压告警（Vdc={vdc:.1f} V）",
+            "ov": f"[母线] 过压跳闸，逆变器封管保护（Vdc={vdc:.1f} V）",
+            "normal": f"[母线] 恢复正常（Vdc={vdc:.1f} V）",
+        }.get(state)
+        if text:
+            self.logMessage.emit(text)
 
     def _fill_sensor_specific(self, f: TelemetryFrame, base_angle: float) -> None:
         """按当前活跃传感器，注入差异化的角度/质量/收敛/原始量。"""

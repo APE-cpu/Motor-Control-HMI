@@ -449,7 +449,7 @@ class TrainingPage(QWidget):
         win.resize(800, 400)
         h = QHBoxLayout(win)
         self._plot = pg.PlotWidget(title="Loss")
-        self._plot.setBackground("#2b2f38"); self._plot.showGrid(x=True, y=True, alpha=0.3)
+        self._plot.setBackground("#10131a"); self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.addLegend(); self._plot.setLabel("left", "Loss"); self._plot.setLabel("bottom", "Epoch")
         self._curve_tr = self._plot.plot(pen=pg.mkPen("#4fc3f7", width=2), name="Train Loss")
         self._curve_val = self._plot.plot(pen=pg.mkPen("#ffb74d", width=2), name="Val Loss")
@@ -459,7 +459,7 @@ class TrainingPage(QWidget):
             self._curve_val.setData(xs, list(self._val_losses))
 
         self._plot_acc = pg.PlotWidget(title="准确率")
-        self._plot_acc.setBackground("#2b2f38"); self._plot_acc.showGrid(x=True, y=True, alpha=0.3)
+        self._plot_acc.setBackground("#10131a"); self._plot_acc.showGrid(x=True, y=True, alpha=0.3)
         self._plot_acc.addLegend(); self._plot_acc.setLabel("left", "Accuracy"); self._plot_acc.setLabel("bottom", "Epoch")
         self._plot_acc.setYRange(0, 1)
         self._curve_acc_tr = self._plot_acc.plot(pen=pg.mkPen("#81c784", width=2), name="Train Acc")

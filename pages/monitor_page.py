@@ -1,10 +1,13 @@
 """监控页面：实时数据、统计、趋势曲线。"""
 import datetime
+import math
 import os
-from PySide6.QtCore import Qt, QTimer
+import time
+from PySide6.QtCore import Qt, QTimer, QPointF
+from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QProgressBar, QPushButton, QSpinBox, QVBoxLayout, QWidget,
+    QProgressBar, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
@@ -76,6 +79,91 @@ class _DataItem(QWidget):
         self._value.setText(f"{v:.2f} {self._unit}".strip())
 
 
+class _AngleDial(QWidget):
+    """机械角度表盘。
+
+    低速（<SLOW_RPM，10 Hz 采样不混叠）指针直读真实角度，适合对位/
+    找零/验编码器；高速时角度数字只是混叠噪声，切换为慢放模式：
+    指针按实际转向匀速旋转示意，数字区显示累计圈数（转速积分）。
+    双击清零累计圈数。
+    """
+
+    SLOW_RPM = 90.0        # 直读/慢放切换阈值 rpm
+    SLOW_MO_DPS = 120.0    # 慢放指针角速度 °/s（3 s 一圈）
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setMinimumSize(120, 118)
+        self._disp = 0.0       # 指针显示角 °
+        self._true = 0.0       # 最新真实角 °
+        self._rpm = 0.0
+        self._revs = 0.0       # 累计圈数（含方向）
+        self._last_feed = None
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(40)
+        self.setToolTip("低速直读角度；高速慢放示意转向，显示累计圈数。双击清零圈数")
+
+    def feed(self, angle_deg: float, rpm: float) -> None:
+        now = time.time()
+        if self._last_feed is not None:
+            self._revs += rpm / 60.0 * min(now - self._last_feed, 1.0)
+        self._last_feed = now
+        self._true = angle_deg % 360.0
+        self._rpm = rpm
+
+    def _tick(self) -> None:
+        if abs(self._rpm) < self.SLOW_RPM:
+            # 低速直读：沿最短路径平滑跟随真实角
+            err = (self._true - self._disp + 180.0) % 360.0 - 180.0
+            self._disp = (self._disp + err * 0.35) % 360.0
+        else:
+            # 高速慢放：按实际转向匀速旋转
+            self._disp = (self._disp + math.copysign(
+                self.SLOW_MO_DPS * 0.04, self._rpm)) % 360.0
+        if self.isVisible():
+            self.update()
+
+    def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802 - Qt signature
+        self._revs = 0.0
+        super().mouseDoubleClickEvent(ev)
+
+    def paintEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        qp = QPainter(self)
+        qp.setRenderHint(QPainter.Antialiasing)
+        w, h = self.width(), self.height()
+        r = min(w, h - 30) / 2.0 - 6
+        cx, cy = w / 2.0, r + 8
+        # 表盘环 + 刻度（每 30°，0° 在正上方，顺时针）
+        qp.setPen(QPen(QColor("#2c3442"), 2))
+        qp.drawEllipse(QPointF(cx, cy), r, r)
+        for k in range(12):
+            a = math.radians(k * 30.0 - 90.0)
+            major = (k % 3 == 0)
+            r0 = r - (7 if major else 4)
+            qp.setPen(QPen(QColor("#55627a"), 2 if major else 1))
+            qp.drawLine(QPointF(cx + r0 * math.cos(a), cy + r0 * math.sin(a)),
+                        QPointF(cx + r * math.cos(a), cy + r * math.sin(a)))
+        # 指针
+        slow_mo = abs(self._rpm) >= self.SLOW_RPM
+        color = QColor("#ffb74d") if slow_mo else QColor("#4fc3f7")
+        a = math.radians(self._disp - 90.0)
+        qp.setPen(QPen(color, 2.5))
+        qp.drawLine(QPointF(cx, cy),
+                    QPointF(cx + (r - 9) * math.cos(a),
+                            cy + (r - 9) * math.sin(a)))
+        qp.setBrush(color)
+        qp.setPen(Qt.NoPen)
+        qp.drawEllipse(QPointF(cx, cy), 3, 3)
+        # 数字区：低速显示角度，高速显示慢放标记；累计圈数常显
+        qp.setPen(QPen(QColor("#dfe6ee")))
+        top = "慢放示意" if slow_mo else f"θ = {self._true:.1f}°"
+        qp.drawText(0, int(cy + r + 2), w, 14, Qt.AlignHCenter, top)
+        qp.setPen(QPen(QColor("#8fa3b8")))
+        qp.drawText(0, int(cy + r + 16), w, 14, Qt.AlignHCenter,
+                    f"累计 {self._revs:+.1f} 圈")
+
+
 class _StatItem(QWidget):
     def __init__(self, title: str) -> None:
         super().__init__()
@@ -141,25 +229,37 @@ class MonitorPage(QWidget):
             title_row.addWidget(b)
         root.addLayout(title_row)
 
-        # ---------- 实时数据 ----------
-        rt_box = QGroupBox("实时数据")
-        rt_grid = QGridLayout(rt_box)
-        self._speed_actual = _DataItem("实际转速", "rpm")
-        self._speed_target = _DataItem("给定转速", "rpm")
-        self._current_actual = _DataItem("实际电流", "A")
-        self._current_target = _DataItem("给定电流", "A")
-        self._torque_actual = _DataItem("实际转矩", "Nm")
-        self._torque_target = _DataItem("给定转矩", "Nm")
-        self._angle_actual = _DataItem("实际角度", "°")
-        self._angle_raw = _DataItem("原始角度/计数", "")
+        # ---------- 实时数据：按物理量分类分框，2 行 × 3 框 ----------
+        self._speed_actual = _DataItem("实际", "rpm")
+        self._speed_target = _DataItem("给定", "rpm")
+        self._current_actual = _DataItem("实际", "A")
+        self._current_target = _DataItem("给定", "A")
+        self._torque_actual = _DataItem("实际", "Nm")
+        self._torque_target = _DataItem("给定", "Nm")
+        self._angle_dial = _AngleDial()
+        self._angle_raw = _DataItem("原始/计数", "")
+        self._vdc_item = _DataItem("电压", "V")
+        self._bus_state = QLabel("状态：--")
+        self._bus_state.setAlignment(Qt.AlignCenter)
 
-        for col, w in enumerate([self._speed_actual, self._speed_target,
-                                 self._current_actual, self._current_target]):
-            rt_grid.addWidget(w, 0, col)
-        for col, w in enumerate([self._torque_actual, self._torque_target,
-                                 self._angle_actual, self._angle_raw]):
-            rt_grid.addWidget(w, 1, col)
-        root.addWidget(rt_box)
+        def _category_box(title: str, *widgets: QWidget) -> QGroupBox:
+            box = QGroupBox(title)
+            h = QHBoxLayout(box)
+            for w in widgets:
+                h.addWidget(w, 1)
+            return box
+
+        rt_grid = QGridLayout()
+        rt_grid.addWidget(_category_box("转速", self._speed_actual,
+                                        self._speed_target), 0, 0)
+        rt_grid.addWidget(_category_box("电流", self._current_actual,
+                                        self._current_target), 0, 1)
+        rt_grid.addWidget(_category_box("直流母线", self._vdc_item,
+                                        self._bus_state), 0, 2)
+        rt_grid.addWidget(_category_box("转矩", self._torque_actual,
+                                        self._torque_target), 1, 0)
+        rt_grid.addWidget(_category_box("角度", self._angle_dial,
+                                        self._angle_raw), 1, 1)
 
         # ---------- 传感器状态 ----------
         sensor_box = QGroupBox("传感器状态")
@@ -174,7 +274,8 @@ class MonitorPage(QWidget):
         sensor_grid.addWidget(self._sensor_quality, 0, 1)
         sensor_grid.addWidget(self._sensor_convergence, 1, 0)
         sensor_grid.addWidget(self._sensor_warn, 1, 1)
-        root.addWidget(sensor_box)
+        rt_grid.addWidget(sensor_box, 1, 2)
+        root.addLayout(rt_grid)
 
         # ---------- 统计 ----------
         stat_box = QGroupBox("统计（最大/最小）")
@@ -186,25 +287,28 @@ class MonitorPage(QWidget):
             stat_h.addWidget(w)
         root.addWidget(stat_box)
 
-        # ---------- 趋势曲线 ----------
-        curve_box = QGroupBox("趋势曲线（最近 100 点）")
-        curve_h = QHBoxLayout(curve_box)
+        # ---------- 曲线标签页（同屏只显示一排，高度翻倍）----------
         self._c_speed = TrendCurve("转速 rpm", {"实际": "#4fc3f7", "给定": "#ffb74d"}, y_label="rpm")
         self._c_current = TrendCurve("电流 A", {"实际": "#81c784"}, y_label="A")
         self._c_torque = TrendCurve("转矩 Nm", {"实际": "#ba68c8"}, y_label="Nm")
+        self._c_angle = TrendCurve("角度 °", {"估算/实际": "#f48fb1", "原始": "#80cbc4"}, y_label="°")
+        self._c_sensor_q = TrendCurve("传感器诊断 (0-1)", {"质量": "#ffcc80", "收敛度": "#ce93d8"}, y_label="")
+
+        trend_tab = QWidget()
+        curve_h = QHBoxLayout(trend_tab)
         curve_h.addWidget(_make_curve_panel(self._c_speed, "转速 rpm"))
         curve_h.addWidget(_make_curve_panel(self._c_current, "电流 A"))
         curve_h.addWidget(_make_curve_panel(self._c_torque, "转矩 Nm"))
-        root.addWidget(curve_box, 1)
 
-        # ---------- 传感器波形 ----------
-        sensor_curve_box = QGroupBox("传感器波形")
-        sensor_curve_h = QHBoxLayout(sensor_curve_box)
-        self._c_angle = TrendCurve("角度 °", {"估算/实际": "#f48fb1", "原始": "#80cbc4"}, y_label="°")
-        self._c_sensor_q = TrendCurve("传感器诊断 (0-1)", {"质量": "#ffcc80", "收敛度": "#ce93d8"}, y_label="")
+        sensor_tab = QWidget()
+        sensor_curve_h = QHBoxLayout(sensor_tab)
         sensor_curve_h.addWidget(_make_curve_panel(self._c_angle, "角度 °"))
         sensor_curve_h.addWidget(_make_curve_panel(self._c_sensor_q, "传感器诊断"))
-        root.addWidget(sensor_curve_box, 1)
+
+        tabs = QTabWidget()
+        tabs.addTab(trend_tab, "趋势曲线（最近 100 点）")
+        tabs.addTab(sensor_tab, "传感器波形")
+        root.addWidget(tabs, 1)
 
         # ---------- 连接信号 ----------
         comm.telemetryReceived.connect(self._on_telemetry)
@@ -233,8 +337,16 @@ class MonitorPage(QWidget):
         self._current_target.set_value(f.current_target)
         self._torque_actual.set_value(f.torque_actual)
         self._torque_target.set_value(f.torque_target)
-        self._angle_actual.set_value(f.angle_actual)
+        self._angle_dial.feed(f.angle_actual, f.speed_actual)
         self._angle_raw.set_value(f.angle_raw)
+        self._vdc_item.set_value(f.vdc)
+        state_text, style = {
+            "brake": ("回馈泵升\n制动斩波中", "color: #ffb74d; font-weight: bold;"),
+            "uv": ("欠压告警", "color: #ffd740; font-weight: bold;"),
+            "ov": ("过压跳闸\n（已封管）", "color: #ff5252; font-weight: bold;"),
+        }.get(f.bus_state, ("状态：正常", "color: #69f0ae;"))
+        self._bus_state.setText(state_text)
+        self._bus_state.setStyleSheet(style)
 
         self._sensor_source.setText(f"来源：{f.sensor_source or '--'}")
         self._sensor_quality.setValue(max(0, min(100, int(f.sensor_quality * 100))))
@@ -300,7 +412,7 @@ class MonitorPage(QWidget):
         if not any(len(src._times) for src, _ in curves):
             return b""
         win = pg.GraphicsLayoutWidget()
-        win.setBackground("#2b2f38")
+        win.setBackground("#10131a")
         win.resize(900, 200 * len(curves))
         for i, (src, name) in enumerate(curves):
             p = win.addPlot(row=i, col=0, title=name)

@@ -13,7 +13,7 @@
 import math
 from collections import deque
 
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QGroupBox, QHBoxLayout, QLabel, QPushButton, QVBoxLayout, QWidget,
 )
@@ -41,7 +41,7 @@ class _CirclePlot(QWidget):
         self._ys: deque = deque(maxlen=_TRAIL_MAX)
         self._unit = unit
         self._plot = pg.PlotWidget(title=title)
-        self._plot.setBackground("#2b2f38")
+        self._plot.setBackground("#10131a")
         self._plot.showGrid(x=True, y=True, alpha=0.3)
         self._plot.setAspectLocked(True)
         self._plot.setLabel("left", f"β ({unit})")
@@ -50,6 +50,10 @@ class _CirclePlot(QWidget):
             size=4, pen=None, brush=pg.mkBrush(color + "80"))
         self._plot.addItem(self._scatter)
         self._vector = self._plot.plot(pen=pg.mkPen(color, width=2))
+        # 极限圆（虚线）：电流圆=电流限幅，磁链圆=电压极限（随 Vdc/转速缩放）
+        self._limit = self._plot.plot(
+            pen=pg.mkPen("#ef5350", width=1.5, style=Qt.DashLine))
+        self._limit_text = ""
         self._info = QLabel("|·| = --")
         v.addWidget(self._plot, 1)
         v.addWidget(self._info)
@@ -61,6 +65,16 @@ class _CirclePlot(QWidget):
     def clear(self) -> None:
         self._xs.clear()
         self._ys.clear()
+
+    def set_limit(self, radius: float, text: str = "") -> None:
+        """画/隐藏极限圆（radius 为 None 时隐藏），text 附加到信息栏。"""
+        self._limit_text = text
+        if radius is None:
+            self._limit.setData([], [])
+            return
+        angs = [i * 2.0 * math.pi / 120 for i in range(121)]
+        self._limit.setData([radius * math.cos(a) for a in angs],
+                            [radius * math.sin(a) for a in angs])
 
     def refresh(self, unlimited: bool = True, spin_angle: float = None) -> None:
         xs, ys = list(self._xs), list(self._ys)
@@ -84,13 +98,14 @@ class _CirclePlot(QWidget):
                 _, tip_x, tip_y = best
         self._vector.setData([0.0, tip_x], [0.0, tip_y])
         mag = math.hypot(tip_x, tip_y)
-        self._info.setText(f"|·| = {mag:.3f} {self._unit}")
+        self._info.setText(f"|·| = {mag:.3f} {self._unit}    {self._limit_text}")
 
 
 class VectorPage(QWidget):
     def __init__(self, comm: CommManager) -> None:
         super().__init__()
         self._comm = comm
+        self._latest = TelemetryFrame()   # 极限圆需要转速与母线电压
 
         root = QVBoxLayout(self)
         title_row = QHBoxLayout()
@@ -108,7 +123,9 @@ class VectorPage(QWidget):
         hint = QLabel(
             "仿真模式：直接取虚拟电机 1 kHz 高速轨迹（真实 dq 变换，无频闪）；"
             "真机模式：由 10 Hz 遥测按 id≈0 重构（欠采样，需协议突发快照通道）。"
-            "正圆 = 正常，圆度/圆心异常 = 不平衡、偏心、退磁等征兆。")
+            "正圆 = 正常，圆度/圆心异常 = 不平衡、偏心、退磁等征兆。"
+            "红色虚线为极限圆：电流圆=电流限幅；磁链圆=电压极限（半径 Vdc/√3/ωe，"
+            "随母线电压和转速实时缩放，轨迹逼近它 = 电压余量耗尽/弱磁边界）。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #90a4ae;")
         root.addWidget(hint)
@@ -144,6 +161,7 @@ class VectorPage(QWidget):
         self._psi_plot.append(psi_d * c - psi_q * s, psi_d * s + psi_q * c)
 
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
+        self._latest = frame
         # 仿真模式走 1 kHz 高速轨迹（_refresh 里取），10 Hz 遥测只在真机时用
         if self._comm.is_sim_running():
             return
@@ -157,6 +175,27 @@ class VectorPage(QWidget):
                 self._append_point(theta_e, i_d, i_q)
         # 演示旋转角：每帧 0.35 rad，约 1.8 s 扫一圈（慢放，幅值取真实采样点）
         self._spin = (getattr(self, "_spin", 0.0) + 0.35) % (2.0 * math.pi)
+        self._update_limits()
         unlimited = self._chk_persist.isChecked()
         self._i_plot.refresh(unlimited, self._spin)
         self._psi_plot.refresh(unlimited, self._spin)
+
+    def _update_limits(self) -> None:
+        """极限圆：电流圆画 i_max；磁链圆画电压极限 |ψ|≤Vdc/√3/ωe（忽略 Rs）。
+
+        母线下垂/泵升或转速升高都会让电压极限圆实时缩放——磁链轨迹
+        逼近该圆即意味着电压余量耗尽（进入弱磁边界）。
+        """
+        p = self._comm.motor_sim_params()
+        f = self._latest
+        self._i_plot.set_limit(p.i_max, f"极限 {p.i_max:.1f} A")
+        we = abs(f.speed_actual) * math.pi / 30.0 * p.pole_pairs
+        vdc_text = f"Vdc={f.vdc:.1f} V"
+        if we < 1.0:
+            self._psi_plot.set_limit(None, vdc_text)
+            return
+        r = f.vdc / math.sqrt(3.0) / we
+        if r > 5.0 * p.psi_f:   # 低速时极限圆远超视图，不画避免轨迹被压缩
+            self._psi_plot.set_limit(None, f"电压极限圆超视图  {vdc_text}")
+        else:
+            self._psi_plot.set_limit(r, f"电压极限 {r:.4f} Wb  {vdc_text}")

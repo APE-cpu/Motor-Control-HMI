@@ -4,6 +4,10 @@
 内嵌转速/电流双闭环 PI（相当于下位机固件的控制环），
 欧拉法 0.5 ms 步长积分，上层每 0.1 s 采样一次。
 
+母线硬件层（L2）：电源不再是理想电压源——内阻导致重载下垂，
+防反灌二极管使减速回馈时母线泵升，超过滞环阈值由制动斩波器
+泄放，仍超过过压阈值则封管跳闸；可用电压 v_lim 随母线实时变化。
+
 同时充当"虚拟下位机"：可接收启动/停止/急停/目标转速指令，
 仿真模式下控制页的操作产生真实的动态响应（阶跃、超调、滑行停机）。
 
@@ -26,8 +30,16 @@ class PMSMParams:
     B: float = 1.5e-3        # 粘滞摩擦系数 N·m·s/rad
     T_coulomb: float = 0.1   # 库仑摩擦 N·m
     T_cogging: float = 0.03  # 齿槽转矩幅值 N·m（6 倍电角频率脉动）
-    Vdc: float = 48.0        # 母线电压 V
+    Vdc: float = 48.0        # 电源空载电压 V（母线额定）
     i_max: float = 8.0       # 电流限幅 A
+    # 直流母线硬件（数字孪生 L2：电源内阻 + 母线电容 + 制动斩波器）
+    r_src: float = 0.3       # 电源内阻 Ω（重载时母线下垂的来源）
+    c_bus: float = 2.0e-3    # 母线电容 F
+    r_brake: float = 10.0    # 制动斩波电阻 Ω
+    v_brake_on: float = 54.0     # 斩波开启阈值 V（滞环上限）
+    v_brake_off: float = 51.0    # 斩波关闭阈值 V（滞环下限）
+    v_ov_trip: float = 60.0      # 过压跳闸阈值 V（封管保护）
+    v_uv_warn: float = 42.0      # 欠压告警阈值 V
     # 一阶热模型（铜损发热）
     rth: float = 1.5         # 热阻 K/W
     tau_th: float = 60.0     # 热时间常数 s
@@ -55,6 +67,19 @@ class MotorSim:
         self.theta = 0.0          # 机械角 rad（0~2π）
         self.temp = self.p.t_amb
         self.enabled = False      # 逆变器使能
+        self.vdc = self.p.Vdc     # 母线电压状态量 V
+        self.brake_on = False     # 制动斩波器导通中
+        self.ov_trip = False      # 过压跳闸锁存（start 复位）
+        self.uv_warn = False      # 欠压告警
+        # 功率流各级快照 W（功率流页消费）
+        self.p_supply = 0.0       # 电源发出（含内阻损耗）
+        self.p_loss_src = 0.0     # 电源内阻损耗
+        self.p_brake = 0.0        # 制动电阻泄放
+        self.p_inv = 0.0          # 逆变器直流侧输入（回馈时为负）
+        self.p_cu = 0.0           # 定子铜损
+        self.p_em = 0.0           # 电磁功率（气隙→机械）
+        self.p_fric = 0.0         # 摩擦/负载耗散
+        self.p_kinetic = 0.0      # 动能变化率（加速为正）
         self.speed_ref_rpm = 0.0
         self.iq_ref = 0.0
         self._int_spd = 0.0       # PI 积分器
@@ -65,6 +90,7 @@ class MotorSim:
     def start(self, target_rpm: float = None) -> None:
         if target_rpm is not None:
             self.speed_ref_rpm = float(target_rpm)
+        self.ov_trip = False     # 重新使能视为故障复位
         self.enabled = True
 
     def stop(self) -> None:
@@ -89,7 +115,8 @@ class MotorSim:
         p = self.p
         we = self.omega * p.pole_pairs          # 电角速度
         theta_e = self.theta * p.pole_pairs
-        v_lim = p.Vdc / math.sqrt(3.0)
+        v_lim = self.vdc / math.sqrt(3.0)   # 可用电压随母线实时变化
+        vd = vq = 0.0
 
         if self.enabled:
             # --- 转速环（输出 iq 给定，带限幅抗饱和）---
@@ -139,10 +166,44 @@ class MotorSim:
         self.omega += domega * dt
         self.theta = (self.theta + self.omega * dt) % (2.0 * math.pi)
 
+        # --- 直流母线动力学：电源(内阻+防反灌二极管) + 电容 + 制动斩波器 ---
+        # 逆变器直流侧电流 = 电机电功率 / 母线电压（忽略开关损耗）
+        p_inv = 1.5 * (vd * self.i_d + vq * self.i_q) if self.enabled else 0.0
+        i_inv = p_inv / max(self.vdc, 1.0)
+        if self.vdc >= p.v_brake_on:        # 斩波器滞环
+            self.brake_on = True
+        elif self.vdc <= p.v_brake_off:
+            self.brake_on = False
+        i_brk = self.vdc / p.r_brake if self.brake_on else 0.0
+        self.p_brake = i_brk * self.vdc
+        if self.vdc >= p.Vdc:
+            # 回馈泵升段：二极管截止，电源不吸收能量，电容独自充/放电
+            self.vdc += (-i_inv - i_brk) * dt / p.c_bus
+            i_src = 0.0
+        else:
+            # 电源支路隐式欧拉（r_src·c_bus 远小于 dt，显式积分会发散）
+            self.vdc = ((self.vdc + dt / p.c_bus * (p.Vdc / p.r_src - i_inv - i_brk))
+                        / (1.0 + dt / (p.r_src * p.c_bus)))
+            i_src = max(0.0, (p.Vdc - self.vdc) / p.r_src)
+        self.vdc = max(self.vdc, 0.0)
+        self.p_supply = p.Vdc * i_src
+        self.p_loss_src = i_src * i_src * p.r_src
+        self.p_inv = p_inv
+        self.uv_warn = self.vdc < p.v_uv_warn
+        if self.vdc > p.v_ov_trip and not self.ov_trip:
+            self.ov_trip = True
+            self.stop()                     # 过压保护：封管滑行
+
         # --- 一阶热模型（铜损）---
         p_cu = 1.5 * p.Rs * (self.i_d ** 2 + self.i_q ** 2)
         t_ss = p.t_amb + p_cu * p.rth
         self.temp += (t_ss - self.temp) * dt / p.tau_th
+
+        # --- 功率流快照（机械侧）---
+        self.p_cu = p_cu
+        self.p_em = te * self.omega
+        self.p_fric = t_load * self.omega
+        self.p_kinetic = self.p_em - self.p_fric   # 剩余功率进入/取自转动动能
 
         # --- 高速轨迹（每 2 个积分步记一点 = 1 kHz）---
         self._trace_n += 1
@@ -168,3 +229,14 @@ class MotorSim:
     @property
     def angle_deg(self) -> float:
         return math.degrees(self.theta)
+
+    @property
+    def bus_state(self) -> str:
+        """母线状态："ov"跳闸 > "brake"斩波 > "uv"欠压 > "normal"。"""
+        if self.ov_trip:
+            return "ov"
+        if self.brake_on:
+            return "brake"
+        if self.uv_warn:
+            return "uv"
+        return "normal"

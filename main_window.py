@@ -15,6 +15,7 @@ from pages.ai_page import AIPage
 from pages.edge_ai_page import EdgeAIPage
 from pages.identify_page import IdentifyPage
 from pages.vector_page import VectorPage
+from pages.power_flow_page import PowerFlowPage
 from pages.operation_log_page import OperationLogPage
 from widgets.side_nav import SideNav
 from communications.comm_manager import CommManager
@@ -36,18 +37,26 @@ class MainWindow(QMainWindow):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
-        nav_items = ["监控页面", "电机控制", "矢量可视化", "参数辨识",
-                     "通信设置", "AI 分析", "边缘AI"]
+        # 页面索引与 stack.addWidget 顺序一致；导航顺序按功能分组，与之解耦
+        log_idx = 9 if enable_training else 8
+        ai_section = [("🤖 AI 分析", 6), ("🧠 边缘AI", 7)]
         if enable_training:
-            nav_items.append("模型训练")
-        nav_items.append("操作记录")
+            ai_section.append(("🎓 模型训练", 8))
+        nav_sections = [
+            ("运行控制", [("📊 监控页面", 0), ("🎮 电机控制", 1)]),
+            ("分析可视化", [("🌀 矢量可视化", 2), ("⚡ 功率流", 3),
+                            ("🔍 参数辨识", 4)]),
+            ("AI 智能", ai_section),
+            ("系统", [("📡 通信设置", 5), ("📋 操作记录", log_idx)]),
+        ]
 
-        self.nav = SideNav(nav_items)
+        self.nav = SideNav(nav_sections)
         self.stack = QStackedWidget()
 
         self.control_page = ControlPage(self.comm_manager)
         self.monitor_page = MonitorPage(self.comm_manager, self.control_page)
         self.vector_page = VectorPage(self.comm_manager)
+        self.power_flow_page = PowerFlowPage(self.comm_manager)
         self.identify_page = IdentifyPage(self.comm_manager)
         self.communication_page = CommunicationPage(self.comm_manager)
         self.ai_page = AIPage(self.comm_manager, monitor_page=self.monitor_page)
@@ -57,6 +66,7 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.monitor_page)
         self.stack.addWidget(self.control_page)
         self.stack.addWidget(self.vector_page)
+        self.stack.addWidget(self.power_flow_page)
         self.stack.addWidget(self.identify_page)
         self.stack.addWidget(self.communication_page)
         self.stack.addWidget(self.ai_page)
@@ -74,7 +84,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(central)
 
         self.nav.currentIndexChanged.connect(self.stack.setCurrentIndex)
-        self.nav.setCurrentRow(0)
+        self.nav.select_page(0)
 
         # 状态栏显示连接状态
         bar = QStatusBar()
