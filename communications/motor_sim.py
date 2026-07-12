@@ -82,6 +82,7 @@ class MotorSim:
         self.p_kinetic = 0.0      # 动能变化率（加速为正）
         self.speed_ref_rpm = 0.0
         self.iq_ref = 0.0
+        self.load_ext = 0.0       # 外部负载转矩 N·m（测功机/扫频注入）
         self._int_spd = 0.0       # PI 积分器
         self._int_d = 0.0
         self._int_q = 0.0
@@ -92,6 +93,10 @@ class MotorSim:
             self.speed_ref_rpm = float(target_rpm)
         self.ov_trip = False     # 重新使能视为故障复位
         self.enabled = True
+
+    def set_load(self, torque_nm: float) -> None:
+        """设置外部负载转矩（数字孪生 L2：模拟测功机加载）。"""
+        self.load_ext = float(torque_nm)
 
     def stop(self) -> None:
         """封管停机：切断驱动，靠负载转矩自然滑行到零。"""
@@ -160,6 +165,8 @@ class MotorSim:
         t_load = p.B * self.omega
         if abs(self.omega) > 0.5:
             t_load += math.copysign(p.T_coulomb, self.omega)
+            # 外部负载：转动时按转向阻转（测功机加载）
+            t_load += math.copysign(self.load_ext, self.omega)
         elif not self.enabled:
             self.omega = 0.0     # 低速滑行时库仑摩擦直接锁死，避免过零抖动
         domega = (te - t_load) / p.J

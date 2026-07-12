@@ -165,6 +165,10 @@ class CommManager(QObject):
         """数字孪生的 PMSM 参数对象（参数辨识页可读写）。"""
         return self._motor_sim.p
 
+    def set_sim_load(self, torque_nm: float) -> None:
+        """给虚拟电机注入外部负载转矩（扫频/测功机加载，仅仿真有效）。"""
+        self._motor_sim.set_load(torque_nm)
+
     def motor_sim_trace(self) -> list:
         """取走虚拟电机的高速轨迹缓冲 [(θe, id, iq), ...]（1 kHz）。"""
         pts = list(self._motor_sim.trace)

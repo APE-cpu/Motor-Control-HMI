@@ -101,6 +101,23 @@ def test_高速轨迹缓冲以1kHz记录(sim):
     assert 0.0 <= theta_e < 2.0 * math.pi * sim.p.pole_pairs
 
 
+def test_外部负载降低稳态转速裕度并增大电流(sim):
+    """加外部负载后，稳态电流（转矩电流）应显著增大。"""
+    sim.start(2000.0)
+    sim.step(4.0)
+    iq_noload = sim.i_q
+    sim.set_load(0.3)          # 注入 0.3 N·m 负载
+    sim.step(4.0)
+    assert sim.i_q > iq_noload + 0.5   # 负载靠更大 q 轴电流克服
+    assert sim.speed_rpm == pytest.approx(2000.0, rel=0.03)  # 闭环仍守住转速
+
+
+def test_reset清零外部负载(sim):
+    sim.set_load(0.5)
+    sim.reset()
+    assert sim.load_ext == 0.0
+
+
 def test_自定义参数生效():
     p = PMSMParams(J=5.0e-3)
     sim = MotorSim(p)

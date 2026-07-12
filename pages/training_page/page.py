@@ -16,13 +16,15 @@ from PySide6.QtWidgets import (
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
+from communications.protocol import encode_frame
 from config.config import (
-    MONITOR_REFRESH_MS, TRAIN_LOSSES, TRAIN_MODEL_TYPES,
+    CMD_START, MONITOR_REFRESH_MS, TRAIN_LOSSES, TRAIN_MODEL_TYPES,
     TRAIN_OPTIMIZERS, TRAIN_SCHEDULERS,
 )
 from logs.operation_logger import logger
 from training.trainer import Trainer
 from training.drl_trainer import DRLTrainer
+from widgets.fault_sweep_dialogs import FaultCriteriaDialog, SweepConfigDialog
 
 from .model_panels import DRLPanel, MODEL_PANELS, ModelPanel
 from .model_struct import describe_model
@@ -43,9 +45,15 @@ _FEATURE_NAMES = [
 
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "training", "data")
 
-# 自动标注阈值（数字孪生量级；真机可按铭牌调整）
-_TEMP_FAULT = 85.0     # 过温故障 °C
-_TEMP_WARN = 65.0      # 温度告警 °C
+# 自动标注默认判据（数字孪生量级；真机可在「故障判据」对话框调整）
+_DEFAULT_FAULT_CFG = {
+    "temp_fault": 85.0,     # 过温故障 °C
+    "temp_warn": 65.0,      # 温度告警 °C
+    "cur_fault": 0.0,       # 过流故障 A（0=禁用）
+    "cur_warn": 0.0,        # 过流告警 A（0=禁用）
+    "sensor_q_warn": 0.5,   # 传感器质量告警下限
+    "use_bus": True,        # 是否采用母线状态判据（过压→故障/欠压斩波→告警）
+}
 
 
 def _frame_to_row(f: TelemetryFrame) -> list:
@@ -55,19 +63,27 @@ def _frame_to_row(f: TelemetryFrame) -> list:
             f.angle_actual, f.temperature]
 
 
-def _auto_label(f: TelemetryFrame) -> float:
+def _auto_label(f: TelemetryFrame, cfg: dict = None) -> float:
     """按遥测健康度自动判定标签：0.0 正常 / 0.5 警告 / 1.0 故障。
 
-    直接采用数字孪生/下位机已算好的健康信号（母线状态、温度、
-    传感器质量、低速不可用标志），无需人工判断。
+    判据可自定义（cfg）：温度、电流阈值、传感器质量、母线状态。
+    默认采用数字孪生/下位机已算好的健康信号，无需人工判断。
     """
-    # 故障：母线过压跳闸 或 过温
-    if getattr(f, "bus_state", "normal") == "ov" or f.temperature >= _TEMP_FAULT:
+    cfg = cfg or _DEFAULT_FAULT_CFG
+    bus = getattr(f, "bus_state", "normal")
+    cur = abs(getattr(f, "current_actual", 0.0))
+    use_bus = cfg.get("use_bus", True)
+
+    # 故障：母线过压跳闸 / 过温 / 过流
+    if ((use_bus and bus == "ov")
+            or f.temperature >= cfg["temp_fault"]
+            or (cfg.get("cur_fault", 0.0) > 0 and cur >= cfg["cur_fault"])):
         return 1.0
-    # 警告：欠压 / 制动斩波 / 温度偏高 / 传感器质量低 / 低速不可用
-    if (getattr(f, "bus_state", "normal") in ("uv", "brake")
-            or f.temperature >= _TEMP_WARN
-            or getattr(f, "sensor_quality", 1.0) < 0.5
+    # 警告：欠压/制动斩波 / 温度偏高 / 电流偏高 / 传感器质量低 / 低速不可用
+    if ((use_bus and bus in ("uv", "brake"))
+            or f.temperature >= cfg["temp_warn"]
+            or (cfg.get("cur_warn", 0.0) > 0 and cur >= cfg["cur_warn"])
+            or getattr(f, "sensor_quality", 1.0) < cfg["sensor_q_warn"]
             or getattr(f, "low_speed_warn", False)):
         return 0.5
     return 0.0
@@ -104,6 +120,8 @@ class TrainingPage(QWidget):
         self._latest = TelemetryFrame()
         self._raw: list[list] = []
         self._collecting = False
+        self._fault_cfg = dict(_DEFAULT_FAULT_CFG)
+        self._sweeping = False
         self._trainer = Trainer()
         self._drl_trainer = DRLTrainer()
         self._tr_losses: deque = deque(maxlen=500)
@@ -172,11 +190,23 @@ class TrainingPage(QWidget):
         self._chk_auto_label.setToolTip(
             "勾选后忽略上面的「数据标签」，每帧标签由母线状态、温度、传感器质量\n"
             "等健康信号自动判定：正常 0.0 / 警告 0.5 / 故障 1.0。\n"
-            "配合驱动电机进入故障工况（如急减速触发母线过压、高速长跑触发过温），\n"
-            "即可自动采集到带标签的故障样本。")
+            "判据可在「故障判据…」中自定义。")
         self._chk_auto_label.toggled.connect(
             lambda c: self._label_combo.setEnabled(not c))
         v.addWidget(self._chk_auto_label)
+
+        auto_h = QHBoxLayout()
+        btn_fault = QPushButton("故障判据…")
+        btn_fault.setToolTip("自定义自动标注的故障/告警阈值（温度、电流、传感器、母线）")
+        btn_fault.clicked.connect(self._on_fault_criteria)
+        self._btn_sweep = QPushButton("扫频采集…")
+        self._btn_sweep.setToolTip("自动遍历「转速×负载」测试点网格采集，免逐点手动采样")
+        self._btn_sweep.clicked.connect(self._on_sweep)
+        auto_h.addWidget(btn_fault)
+        auto_h.addWidget(self._btn_sweep)
+        auto_h.addStretch(1)
+        v.addLayout(auto_h)
+
         self._auto_label_hint = QLabel("")
         self._auto_label_hint.setStyleSheet("color: #8fa3b8;")
         v.addWidget(self._auto_label_hint)
@@ -505,7 +535,7 @@ class TrainingPage(QWidget):
         self._latest = frame
         if self._collecting:
             if self._chk_auto_label.isChecked():
-                label = _auto_label(frame)
+                label = _auto_label(frame, self._fault_cfg)
             else:
                 label = [0.0, 0.5, 1.0][self._label_combo.currentIndex()]
             full = _frame_to_row(frame)
@@ -521,11 +551,87 @@ class TrainingPage(QWidget):
         n0 = labels.count(0.0)
         n5 = labels.count(0.5)
         n1 = labels.count(1.0)
-        cur = _auto_label(self._latest)
+        cur = _auto_label(self._latest, self._fault_cfg)
         cur_txt = {0.0: "正常", 0.5: "警告", 1.0: "故障"}[cur]
+        prefix = "扫频中" if self._sweeping else "自动标注中"
         self._auto_label_hint.setText(
-            f"自动标注中 → 当前：{cur_txt}　｜　"
+            f"{prefix} → 当前：{cur_txt}　｜　"
             f"正常 {n0} / 警告 {n5} / 故障 {n1}")
+
+    # ─── 自定义故障判据 ──────────────────────────────────────
+    def _on_fault_criteria(self) -> None:
+        dlg = FaultCriteriaDialog(self._fault_cfg, self)
+        if dlg.exec():
+            self._fault_cfg = dlg.values()
+            logger.log("故障判据更新", str(self._fault_cfg))
+
+    # ─── 扫频采集 ────────────────────────────────────────────
+    def _on_sweep(self) -> None:
+        if self._sweeping:
+            self._sweep_finish(aborted=True)
+            return
+        if not (self._comm.is_connected() or self._comm.is_sim_running()):
+            QMessageBox.warning(self, "无法扫频",
+                                "请先启动仿真（虚拟电机）或连接真机。")
+            return
+        has_load = self._comm.is_sim_running()
+        dlg = SweepConfigDialog(self, has_load=has_load)
+        if not dlg.exec():
+            return
+        cfg = dlg.values()
+        self._sweep_points = [(s, l) for s in cfg["speeds"] for l in cfg["loads"]]
+        self._sweep_dwell = cfg["dwell_s"]
+        self._sweep_collect = cfg["collect_s"]
+        self._sweep_idx = 0
+        self._sweeping = True
+        self._chk_auto_label.setChecked(True)   # 扫频强制自动标注
+        self._btn_sweep.setText("停止扫频")
+        self._btn_collect.setEnabled(False)
+        logger.log("开始扫频采集",
+                   f"{len(self._sweep_points)} 点 稳定{self._sweep_dwell}s "
+                   f"采集{self._sweep_collect}s")
+        self._sweep_next()
+
+    def _sweep_next(self) -> None:
+        if not self._sweeping:
+            return
+        if self._sweep_idx >= len(self._sweep_points):
+            self._sweep_finish()
+            return
+        spd, load = self._sweep_points[self._sweep_idx]
+        self._comm.send_frame(encode_frame(CMD_START, f"target={spd}".encode("utf-8")))
+        if self._comm.is_sim_running():
+            self._comm.set_sim_load(load)
+        self._auto_label_hint.setText(
+            f"扫频 {self._sweep_idx + 1}/{len(self._sweep_points)}："
+            f"转速 {spd:.0f} rpm，负载 {load:.2f} N·m —— 稳定中…")
+        QTimer.singleShot(int(self._sweep_dwell * 1000), self._sweep_collect_start)
+
+    def _sweep_collect_start(self) -> None:
+        if not self._sweeping:
+            return
+        self._collecting = True
+        QTimer.singleShot(int(self._sweep_collect * 1000), self._sweep_collect_end)
+
+    def _sweep_collect_end(self) -> None:
+        if not self._sweeping:
+            return
+        self._collecting = False
+        self._sweep_idx += 1
+        self._refresh_preview()
+        self._sweep_next()
+
+    def _sweep_finish(self, aborted: bool = False) -> None:
+        self._sweeping = False
+        self._collecting = False
+        if self._comm.is_sim_running():
+            self._comm.set_sim_load(0.0)     # 卸载
+        self._btn_sweep.setText("扫频采集…")
+        self._btn_collect.setEnabled(True)
+        self._refresh_preview()
+        msg = "扫频已停止" if aborted else "扫频完成"
+        self._auto_label_hint.setText(f"{msg}，共采集 {len(self._raw)} 条")
+        logger.log("扫频采集", f"{msg}，共 {len(self._raw)} 条")
 
     def _on_toggle_collect(self) -> None:
         if not self._collecting:
