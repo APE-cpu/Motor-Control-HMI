@@ -1,5 +1,6 @@
 """边缘AI页面：本地 ONNX 推理 + 规则检测，实时显示异常分数。"""
 import os
+import time
 from collections import deque
 
 from PySide6.QtCore import QTimer
@@ -47,6 +48,8 @@ class EdgeAIPage(QWidget):
         self._engine = EdgeAIEngine()   # 占位，_on_model_choice 里正式初始化
         self._hi_streak = 0        # 连续高分帧计数（时间去抖）
         self._confirmed = False    # 去抖后确认的故障态
+        self._prev_label = ""      # 上一帧的判定标签（用于记录状态跳变）
+        self._infer_n = 0          # 推理帧计数（用于定期心跳记录）
         # 雷达图滑动窗口：最近 ~20 帧（约 10s）的 6 维快照，用于算平均值
         self._radar_win = deque(maxlen=20)
 
@@ -246,13 +249,19 @@ class EdgeAIPage(QWidget):
             f"QProgressBar::chunk {{ background-color: {color}; }}"
         )
 
-        # 仅在去抖确认后记入历史，且每段故障只记一次（上升沿）
-        if self._confirmed and self._hi_streak == need:
-            self._history.appendPlainText(
-                f"[异常] 原始分数={raw_score:.2f}  连续{need}帧确认  {result.detail}  "
-                f"转速={f.speed_actual:.0f}rpm  电流={f.current_actual:.2f}A  "
-                f"温度={f.temperature:.1f}°C"
-            )
+        # 检测历史：状态跳变即记录 + 每 ~30s 一条心跳，确保始终有输出
+        ts = time.strftime("%H:%M:%S")
+        self._infer_n += 1
+        line = (f"分数={raw_score:.2f} 转速={f.speed_actual:.0f}rpm "
+                f"电流={f.current_actual:.2f}A 温度={f.temperature:.1f}°C")
+        if label != self._prev_label:
+            # 状态跳变（正常/警告/疑似/异常之间切换）——记一条带箭头的转移
+            arrow = f"{self._prev_label or '—'} → {label}"
+            self._history.appendPlainText(f"[{ts}] [{arrow}] {line}")
+            self._prev_label = label
+        elif self._infer_n % 60 == 0:
+            # 状态未变时，每 60 帧（~30s @500ms）记一条心跳，证明在持续检测
+            self._history.appendPlainText(f"[{ts}] [{label}] {line}")
 
         # 六维雷达图：当前值 + 滑动窗口平均值（维度顺序对齐 _RADAR_AXES）
         radar_cur = [abs(f.speed_actual), abs(f.current_actual),
