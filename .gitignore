@@ -13,6 +13,13 @@ logs/*.txt
 
 # Local config
 config/ai_config.json
+config/motor_info.json
+
+# 本机 RAG 知识库（用户自行放置的资料）
+knowledge/
+
+# AI 生成的实验报告输出
+reports/
 
 # IDE
 .vscode/

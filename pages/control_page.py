@@ -24,6 +24,8 @@ from pages.control_param_panels import (
     MPCPanel, MRASPanel, OpenLoopPanel, PIPanel, QEPPanel, ResolverPanel,
     SMOPanel, SensorlessPanel, VoltageControlPanel,
 )
+from widgets.motor_info_dialog import MotorInfoDialog, load_motor_info
+from widgets.sensor_detail_dialog import SensorDetailDialog
 from widgets.temperature_label import TemperatureLabel
 from logs.operation_logger import logger
 
@@ -52,6 +54,31 @@ _SENSOR_PANEL_CLS = {
 
 # 控制方式名称后追加的警告标记
 _WARN_SUFFIX = " ⚠"
+
+# 各控制方式的一句话原理 + 适用场景（选中时显示在下拉框下方）
+_MODE_DESCRIPTIONS = {
+    "闭环PI控制":
+        "转速/电流双闭环 PI，工业标配：参数少、易整定、稳态精度高。"
+        "适合绝大多数调速场景。",
+    "开环控制":
+        "无反馈直接给定电压/频率，结构最简单，带载能力差、可能失步。"
+        "仅用于调试和低要求场合。",
+    "模型预测控制(MPC)":
+        "基于电机模型滚动优化未来若干拍的控制量，动态响应快、可显式处理"
+        "电流/电压约束；依赖参数准确度，计算量大。",
+    "无位置传感器控制":
+        "用观测器（SMO/EKF/MRAS/HFI）估算转子位置替代物理传感器，省成本、"
+        "高可靠；低速性能取决于所选方法（反电动势法低速失效，HFI 可到零速）。",
+    "电流斩波控制(CCC)":
+        "电流滞环斩波限幅，双凸极电机低速大转矩的常用方式；转矩脉动较大，"
+        "斩波频率不固定。",
+    "角度位置控制(APC)":
+        "按转子位置角控制各相开通/关断角，双凸极电机中高速区的主流方式；"
+        "开通/关断角整定直接影响效率与转矩脉动。",
+    "电压PWM控制":
+        "直接调节 PWM 占空比控制绕组平均电压，实现简单、响应直接；"
+        "无电流闭环保护，注意限流。",
+}
 
 
 class ControlPage(QWidget):
@@ -89,11 +116,13 @@ class ControlPage(QWidget):
     def _build_motor_box(self) -> QGroupBox:
         box = QGroupBox("电机信息")
         f = QFormLayout(box)
+        saved = load_motor_info()
         self._motor_type = QComboBox()
         self._motor_type.addItems(MOTOR_TYPES)
         self._motor_type.currentIndexChanged.connect(self._on_motor_type_changed)
-        self._motor_model = QLineEdit("M-001")
-        self._pole_pairs = QSpinBox(); self._pole_pairs.setRange(1, 64); self._pole_pairs.setValue(4)
+        self._motor_model = QLineEdit(saved.get("model", "M-001"))
+        self._pole_pairs = QSpinBox(); self._pole_pairs.setRange(1, 64)
+        self._pole_pairs.setValue(int(saved.get("pole_pairs", 4)))
         self._max_rpm = QSpinBox(); self._max_rpm.setRange(1, 100000); self._max_rpm.setValue(3000)
         self._temp_label = TemperatureLabel()
 
@@ -102,7 +131,24 @@ class ControlPage(QWidget):
         f.addRow("极对数", self._pole_pairs)
         f.addRow("最高转速 (rpm)", self._max_rpm)
         f.addRow("实际温度", self._temp_label)
+
+        btn_detail = QPushButton("电机详情（额定/实测/描述）…")
+        btn_detail.clicked.connect(self._on_motor_detail)
+        f.addRow("", btn_detail)
         return box
+
+    def _on_sensor_detail(self) -> None:
+        name = self._current_sensor_name or POSITION_SENSORS[1]
+        SensorDetailDialog(name, self._comm, self).exec()
+
+    def _on_motor_detail(self) -> None:
+        dlg = MotorInfoDialog(self._comm, self)
+        if dlg.exec():
+            info = load_motor_info()
+            if info.get("model"):
+                self._motor_model.setText(info["model"])
+            if info.get("pole_pairs"):
+                self._pole_pairs.setValue(int(info["pole_pairs"]))
 
     def _build_sensor_box(self) -> QGroupBox:
         """位置传感器树形列表：有传感器 / 无位置传感器 两组。"""
@@ -135,6 +181,10 @@ class ControlPage(QWidget):
         self._sensor_status = QLabel("已选：增量式编码器(QEP)")
         v.addWidget(self._sensor_status)
 
+        btn_sensor_detail = QPushButton("传感器详情 / 自检…")
+        btn_sensor_detail.clicked.connect(self._on_sensor_detail)
+        v.addWidget(btn_sensor_detail)
+
         self._sensor_param_stack = QStackedWidget()
         self._sensor_panel_index: dict[str, int] = {}
         for name in POSITION_SENSORS:
@@ -156,10 +206,15 @@ class ControlPage(QWidget):
         self._mode_combo.currentIndexChanged.connect(self._on_mode_changed)
         v.addWidget(self._mode_combo)
 
-        f = QFormLayout()
-        self._target_speed = QSpinBox(); self._target_speed.setRange(-100000, 100000); self._target_speed.setValue(1500)
-        f.addRow("目标转速 (rpm)", self._target_speed)
-        v.addLayout(f)
+        self._mode_desc = QLabel("")
+        self._mode_desc.setWordWrap(True)
+        self._mode_desc.setStyleSheet("color: #8fa3b8;")
+        v.addWidget(self._mode_desc)
+
+        # 目标转速统一在监控页设置；监控页构造时会把它的转速框注入进来
+        self._target_speed = QSpinBox()
+        self._target_speed.setRange(-100000, 100000)
+        self._target_speed.setValue(1500)
 
         v.addStretch(1)
         return box
@@ -221,6 +276,7 @@ class ControlPage(QWidget):
                 self._mode_combo.setCurrentIndex(i)
                 break
         self._stack.setCurrentIndex(self._panel_index[target])
+        self._update_mode_desc()
 
     def _on_motor_type_changed(self, _idx: int) -> None:
         self._refresh_modes_for_motor()
@@ -230,6 +286,16 @@ class ControlPage(QWidget):
         mode = self._current_mode()
         if mode in self._panel_index:
             self._stack.setCurrentIndex(self._panel_index[mode])
+        self._update_mode_desc()
+
+    def _update_mode_desc(self) -> None:
+        if not hasattr(self, "_mode_desc"):
+            return
+        mode = self._current_mode()
+        desc = _MODE_DESCRIPTIONS.get(mode, "")
+        if self._mode_combo.currentText().endswith(_WARN_SUFFIX):
+            desc += "\n⚠ 当前传感器与该方式匹配度低（分辨率/带宽受限），谨慎使用。"
+        self._mode_desc.setText(desc)
 
     def _on_sensor_changed(self, _curr: QTreeWidgetItem, _prev: QTreeWidgetItem) -> None:
         sensors = self._selected_sensors()

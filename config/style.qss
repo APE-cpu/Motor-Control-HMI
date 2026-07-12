@@ -144,6 +144,24 @@ QTabBar::tab {
 QTabBar::tab:hover { color: #dfe6ee; }
 QTabBar::tab:selected { color: #4fc3f7; border-bottom: 2px solid #4fc3f7; }
 
+/* 监控页曲线标签页：加大加亮，突出可切换 */
+QTabWidget#CurveTabs QTabBar::tab {
+    font-size: 15px;
+    padding: 10px 30px;
+    color: #b8c6d8;
+    background-color: #171c26;
+    border: 1px solid #2c3442;
+    border-bottom: 3px solid transparent;
+    border-top-left-radius: 8px;
+    border-top-right-radius: 8px;
+}
+QTabWidget#CurveTabs QTabBar::tab:hover { color: #ffffff; background-color: #1d2430; }
+QTabWidget#CurveTabs QTabBar::tab:selected {
+    color: #4fc3f7;
+    background-color: #1d222c;
+    border-bottom: 3px solid #4fc3f7;
+}
+
 /* ---------- 进度条 ---------- */
 QProgressBar {
     background-color: #10131a;
