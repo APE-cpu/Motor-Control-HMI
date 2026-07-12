@@ -63,12 +63,45 @@ def _split_chunks(text: str, source: str) -> List[Tuple[str, str]]:
     return chunks
 
 
-def _read_pdf_pages(p: Path) -> List[Tuple[str, str]]:
+_OCR_ENGINE = None      # RapidOCR 单例；False 表示不可用
+
+
+def _get_ocr():
+    """懒加载本地 OCR 引擎（rapidocr_onnxruntime）；未安装返回 None。"""
+    global _OCR_ENGINE
+    if _OCR_ENGINE is None:
+        try:
+            from rapidocr_onnxruntime import RapidOCR
+            _OCR_ENGINE = RapidOCR()
+        except Exception:
+            _OCR_ENGINE = False
+    return _OCR_ENGINE or None
+
+
+def _ocr_page(page) -> str:
+    """对扫描页的内嵌图片做本地 OCR，返回识别文本（不可用时空串）。"""
+    engine = _get_ocr()
+    if engine is None:
+        return ""
+    texts = []
+    for img in page.images:
+        try:
+            result, _ = engine(img.data)
+        except Exception:
+            continue
+        if result:
+            texts.extend(t for _box, t, _score in result)
+    return "\n".join(texts)
+
+
+def _read_pdf_pages(p: Path, progress=None) -> List[Tuple[str, str]]:
     """提取 PDF 逐页文本，返回 [(出处标签, 页文本)]。
 
+    - 文本层缺失的页（扫描版）自动走本地 OCR（需 rapidocr_onnxruntime）
     - 未安装 pypdf 或提取失败返回 []（调用方静默跳过）
     - 结果缓存到同目录 .pdfcache/，按文件 mtime 失效——
-      大部头教材只在首次或更新后慢一次
+      大部头教材只在首次或更新后慢一次（OCR 结果同样进缓存）
+    - progress(msg)：逐页进度回调，供 UI 显示
     """
     cache = p.parent / ".pdfcache" / f"{p.stem}_{int(p.stat().st_mtime)}.json"
     if cache.exists():
@@ -83,9 +116,16 @@ def _read_pdf_pages(p: Path) -> List[Tuple[str, str]]:
         return []
     try:
         reader = PdfReader(str(p))
+        total = len(reader.pages)
         pages = []
         for i, page in enumerate(reader.pages, 1):
             text = (page.extract_text() or "").strip()
+            if not text:
+                if progress:
+                    progress(f"OCR {p.stem} 第 {i}/{total} 页…")
+                text = _ocr_page(page).strip()
+            elif progress and i % 20 == 0:
+                progress(f"提取 {p.stem} 第 {i}/{total} 页…")
             # PDF 数学字体常产生不成对代理字符（U+D800-DFFF），无法编码须剔除
             text = re.sub(r"[\ud800-\udfff]", "", text)
             if text:
@@ -118,8 +158,8 @@ class RAGIndex:
         current = {str(p): p.stat().st_mtime for p in self._paths if p.exists()}
         return current != self._mtimes
 
-    def build(self) -> int:
-        """重建索引，返回块数。"""
+    def build(self, progress=None) -> int:
+        """重建索引，返回块数。progress(msg) 为可选进度回调。"""
         self._chunks, self._tf, self._doc_len = [], [], []
         self._df = Counter()
         self._mtimes = {}
@@ -128,7 +168,7 @@ class RAGIndex:
                 continue
             self._mtimes[str(p)] = p.stat().st_mtime
             if p.suffix.lower() == ".pdf":
-                for label, page_text in _read_pdf_pages(p):
+                for label, page_text in _read_pdf_pages(p, progress):
                     self._chunks.extend(_split_chunks(page_text, label))
                 continue
             try:

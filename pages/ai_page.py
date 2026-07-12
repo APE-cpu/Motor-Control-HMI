@@ -84,6 +84,21 @@ _IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
 _WAVEFORM_QUESTION = "请分析这张波形截图，判断电机运行状态是否正常，有无异常或故障迹象。"
 
 
+class _IndexBuilder(QObject):
+    """后台构建 RAG 索引（扫描版 PDF OCR 可能耗时数分钟）。"""
+    progress = Signal(str)
+    done = Signal(object)     # 构建完成的 RAGIndex
+
+    def __init__(self, paths: list) -> None:
+        super().__init__()
+        self._paths = paths
+
+    def run(self) -> None:
+        index = RAGIndex(self._paths)
+        index.build(progress=self.progress.emit)
+        self.done.emit(index)
+
+
 class AIPage(QWidget):
     def __init__(self, comm: CommManager, monitor_page=None) -> None:
         super().__init__()
@@ -93,6 +108,8 @@ class AIPage(QWidget):
         self._worker = None  # 持有引用，防止 GC
         self._attachments: list = []  # [(文件名, mime, 原始字节)]
         self._rag_index: RAGIndex | None = None
+        self._rag_builder = None      # 后台索引构建 worker（防 GC）
+        self._rag_building = False
 
         root = QVBoxLayout(self)
 
@@ -208,15 +225,32 @@ class AIPage(QWidget):
         paths += sorted(_REPORT_DIR.glob("*.md"))
         return [p for p in paths if p.exists() and p.name != ".keep"]
 
-    def _ensure_rag_index(self) -> RAGIndex:
+    def _ensure_rag_index(self):
+        """索引最新则直接返回；需要重建则后台构建并返回 None（不阻塞 UI）。
+
+        重建可能很慢（扫描版 PDF 逐页 OCR），故放到线程里，
+        进度实时显示在状态标签上，完成后自动可用。
+        """
         paths = self._gather_rag_paths()
-        if (self._rag_index is None
-                or self._rag_index.sources != [str(p) for p in paths]
-                or self._rag_index.needs_rebuild()):
-            self._rag_index = RAGIndex(paths)
-            n = self._rag_index.build()
-            self._rag_status.setText(f"知识库：{len(paths)} 个文档，{n} 个检索块")
-        return self._rag_index
+        if (self._rag_index is not None
+                and self._rag_index.sources == [str(p) for p in paths]
+                and not self._rag_index.needs_rebuild()):
+            return self._rag_index
+        if self._rag_building:
+            return None
+        self._rag_building = True
+        self._rag_builder = _IndexBuilder(paths)
+        self._rag_builder.progress.connect(self._rag_status.setText)
+        self._rag_builder.done.connect(self._on_index_ready)
+        threading.Thread(target=self._rag_builder.run, daemon=True).start()
+        return None
+
+    def _on_index_ready(self, index: object) -> None:
+        self._rag_index = index
+        self._rag_building = False
+        self._rag_builder = None
+        self._rag_status.setText(
+            f"知识库：{len(index.sources)} 个文档，{index.num_chunks} 个检索块")
 
     def _on_add_docs(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
@@ -357,10 +391,16 @@ class AIPage(QWidget):
         snapshot = self._snapshot_label.toPlainText()
         sys_prompt = _SYS_PROMPT.format(snapshot=snapshot)
         if self._chk_rag.isChecked():
+            hits = []
             try:
-                hits = self._ensure_rag_index().search(question, top_k=4)
+                index = self._ensure_rag_index()
+                if index is None:
+                    self._append_chat(
+                        "系统", "知识库索引正在后台构建（大文件 OCR 较慢，"
+                        "进度见下方状态栏），本次回答未使用检索。")
+                else:
+                    hits = index.search(question, top_k=4)
             except Exception as e:
-                hits = []
                 self._append_chat("系统", f"知识库检索失败（不影响回答）：{e}")
             if hits:
                 sys_prompt = _SYS_PROMPT_RAG.format(

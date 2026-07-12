@@ -71,7 +71,7 @@ def test_pdf按页入索引_出处带页码(tmp_path, monkeypatch):
     import ai.rag as rag_mod
     fake = tmp_path / "教材.pdf"
     fake.write_bytes(b"%PDF-fake")
-    monkeypatch.setattr(rag_mod, "_read_pdf_pages", lambda p: [
+    monkeypatch.setattr(rag_mod, "_read_pdf_pages", lambda p, progress=None: [
         (f"{p.stem}·P1", "同步电机的电磁转矩由磁场储能对转子角求偏导得到，"
                          "这是机电能量转换的基本原理。" * 3),
         (f"{p.stem}·P2", "感应电机的等效电路包含定子电阻漏抗与励磁支路，"

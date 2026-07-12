@@ -7,4 +7,5 @@ pyqtgraph>=0.13
 numpy>=1.24
 onnxruntime>=1.16
 pypdf>=4.0
+rapidocr-onnxruntime>=1.3   # 扫描版 PDF 本地 OCR（知识库）
 
