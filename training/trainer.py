@@ -31,17 +31,18 @@ except ImportError:
     _SK_OK = False
 
 
-IN_DIM = 8
+IN_DIM = 8   # 默认全特征维度；实际训练维度由数据列数决定
 
 
 # ──────────────────────────────────────────────────────────────
 # 模型定义
 # ──────────────────────────────────────────────────────────────
 class _MLP(nn.Module):
-    def __init__(self, hidden: int = 64, num_layers: int = 2, dropout: float = 0.0) -> None:
+    def __init__(self, hidden: int = 64, num_layers: int = 2, dropout: float = 0.0,
+                 in_dim: int = IN_DIM) -> None:
         super().__init__()
         layers: list[nn.Module] = []
-        last = IN_DIM
+        last = in_dim
         for _ in range(num_layers):
             layers += [nn.Linear(last, hidden), nn.ReLU()]
             if dropout > 0:
@@ -55,7 +56,8 @@ class _MLP(nn.Module):
 
 
 class _CNN1D(nn.Module):
-    def __init__(self, channels: int = 16, kernel: int = 3, dropout: float = 0.0) -> None:
+    def __init__(self, channels: int = 16, kernel: int = 3, dropout: float = 0.0,
+                 in_dim: int = IN_DIM) -> None:
         super().__init__()
         self.conv = nn.Sequential(
             nn.Conv1d(1, channels, kernel_size=kernel, padding=kernel // 2),
@@ -64,7 +66,7 @@ class _CNN1D(nn.Module):
             nn.ReLU(),
         )
         self.dropout = nn.Dropout(dropout) if dropout > 0 else nn.Identity()
-        self.fc = nn.Sequential(nn.Linear(channels * IN_DIM, 1), nn.Sigmoid())
+        self.fc = nn.Sequential(nn.Linear(channels * in_dim, 1), nn.Sigmoid())
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         z = self.conv(x.unsqueeze(1))            # [B,1,8] → [B,C,8]
@@ -105,18 +107,20 @@ class _Transformer(nn.Module):
         return self.fc(z.mean(dim=1))
 
 
-def _build_torch_model(name: str, hp: dict) -> nn.Module:
+def _build_torch_model(name: str, hp: dict, in_dim: int = IN_DIM) -> nn.Module:
     if name.startswith("MLP"):
         return _MLP(
             hidden=int(hp.get("hidden_size", 64)),
             num_layers=int(hp.get("num_layers", 2)),
             dropout=float(hp.get("dropout", 0.0)),
+            in_dim=in_dim,
         )
     if name.startswith("1D-CNN"):
         return _CNN1D(
             channels=int(hp.get("hidden_size", 16)),
             kernel=int(hp.get("kernel_size", 3)),
             dropout=float(hp.get("dropout", 0.0)),
+            in_dim=in_dim,
         )
     if name.startswith("LSTM"):
         return _LSTM(
@@ -183,6 +187,7 @@ class Trainer(QObject):
         self._torch_model: Optional[nn.Module] = None
         self._sk_model = None
         self._model_name: str = "MLP (多层感知机)"
+        self._in_dim: int = IN_DIM
         self._stop = threading.Event()
 
     # ─── 公共接口 ─────────────────────────────────────────────
@@ -210,13 +215,21 @@ class Trainer(QObject):
     def export_onnx(self, path: str) -> None:
         if self._torch_model is None:
             raise RuntimeError("当前模型不可导出 ONNX（仅 PyTorch 模型支持）")
-        dummy = torch.zeros(1, IN_DIM)
-        torch.onnx.export(
-            self._torch_model, dummy, path,
+        self._torch_model.eval()
+        dummy = torch.zeros(1, self._in_dim)
+        kwargs = dict(
             input_names=["features"], output_names=["score"],
             dynamic_axes={"features": {0: "batch"}, "score": {0: "batch"}},
             opset_version=11,
         )
+        try:
+            # torch≥2.9 默认走 dynamo 导出器（需额外的 onnxscript）；
+            # 显式 dynamo=False 使用稳定的 TorchScript 导出器，仅依赖 onnx
+            torch.onnx.export(self._torch_model, dummy, path,
+                              dynamo=False, **kwargs)
+        except TypeError:
+            # 旧版 torch 无 dynamo 参数
+            torch.onnx.export(self._torch_model, dummy, path, **kwargs)
 
     # ─── 调度 ────────────────────────────────────────────────
     def _dispatch(self, X, y, epochs, lr, batch_size, val_split,
@@ -248,7 +261,9 @@ class Trainer(QObject):
         loader = DataLoader(ds, batch_size=batch_size, shuffle=True)
 
         self._sk_model = None
-        self._torch_model = _build_torch_model(self._model_name, hyper)
+        self._in_dim = int(X.shape[1])   # 输入维度跟随所选特征数
+        self._torch_model = _build_torch_model(self._model_name, hyper,
+                                               in_dim=self._in_dim)
         opt = _build_optimizer(optimizer, self._torch_model.parameters(), lr, weight_decay)
         loss_fn = _build_loss(loss_name)
         sch = _build_scheduler(scheduler, opt, epochs)

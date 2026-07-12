@@ -119,6 +119,23 @@ class TrainingPage(QWidget):
     def _build_collect_box(self) -> QGroupBox:
         box = QGroupBox("数据采集")
         v = QVBoxLayout(box)
+
+        # 输入特征选择：决定采集哪些遥测量作为模型输入
+        feat_box = QGroupBox("输入特征（模型的输入维度 = 勾选数）")
+        fg = QHBoxLayout(feat_box)
+        fg.setContentsMargins(6, 2, 6, 2)
+        col1, col2 = QVBoxLayout(), QVBoxLayout()
+        self._feat_checks: dict[str, QCheckBox] = {}
+        for i, name in enumerate(_FEATURE_NAMES):
+            cb = QCheckBox(name)
+            cb.setChecked(True)
+            cb.toggled.connect(self._on_feature_toggled)
+            self._feat_checks[name] = cb
+            (col1 if i % 2 == 0 else col2).addWidget(cb)
+        fg.addLayout(col1)
+        fg.addLayout(col2)
+        v.addWidget(feat_box)
+
         f = QFormLayout()
         self._label_combo = QComboBox()
         self._label_combo.addItems(["正常 (0.0)", "警告 (0.5)", "异常 (1.0)"])
@@ -156,8 +173,36 @@ class TrainingPage(QWidget):
         v.addWidget(self._preview_info)
         return box
 
+    def _selected_features(self) -> list[str]:
+        return [n for n in _FEATURE_NAMES if self._feat_checks[n].isChecked()]
+
+    def _on_feature_toggled(self, _checked: bool) -> None:
+        sel = self._selected_features()
+        sender = self.sender()
+        if not sel:                       # 至少保留一个特征
+            sender.blockSignals(True)
+            sender.setChecked(True)
+            sender.blockSignals(False)
+            return
+        if self._raw:
+            ans = QMessageBox.question(
+                self, "变更输入特征",
+                "已采集的数据列与新特征选择不一致，需要清空现有数据。\n"
+                "确定变更并清空吗？")
+            if ans != QMessageBox.Yes:
+                sender.blockSignals(True)
+                sender.setChecked(not sender.isChecked())
+                sender.blockSignals(False)
+                return
+            self._raw.clear()
+            self._collect_status.setText("已采集：0 条")
+        self._refresh_preview()
+
     def _refresh_preview(self, head_n: int = 5) -> None:
-        """刷新数据预览表：前 head_n 条 + 形状说明。"""
+        """刷新数据预览表：列随所选特征，前 head_n 条 + 形状说明。"""
+        sel = self._selected_features()
+        self._preview.setColumnCount(len(sel) + 1)
+        self._preview.setHorizontalHeaderLabels(sel + ["label"])
         rows = self._raw[:head_n]
         self._preview.setRowCount(len(rows))
         for r, row in enumerate(rows):
@@ -168,10 +213,11 @@ class TrainingPage(QWidget):
             ncol = len(self._raw[0])
             mb = n * ncol * 8 / 1048576   # float64 估算
             self._preview_info.setText(
-                f"共 {n} 条 × {ncol} 列（8 特征 + 1 标签），"
+                f"共 {n} 条 × {ncol} 列（{ncol - 1} 特征 + 1 标签），"
                 f"约 {mb:.2f} MB；上表为前 {len(rows)} 条")
         else:
-            self._preview_info.setText("数据格式：8 特征 + 1 标签；暂无数据")
+            self._preview_info.setText(
+                f"数据格式：{len(sel)} 特征 + 1 标签；暂无数据")
 
     # ─── 数据清洗 ───────────────────────────────────────────
     def _build_clean_box(self) -> QGroupBox:
@@ -418,7 +464,10 @@ class TrainingPage(QWidget):
         if self._collecting:
             label_map = [0.0, 0.5, 1.0]
             label = label_map[self._label_combo.currentIndex()]
-            self._raw.append(_frame_to_row(frame) + [label])
+            full = _frame_to_row(frame)
+            row = [full[_FEATURE_NAMES.index(n)]
+                   for n in self._selected_features()]
+            self._raw.append(row + [label])
             self._collect_status.setText(f"已采集：{len(self._raw)} 条")
 
     def _on_toggle_collect(self) -> None:
@@ -448,6 +497,14 @@ class TrainingPage(QWidget):
                 reader = csv.reader(f)
                 header = next(reader, None)
                 rows = [list(map(float, r)) for r in reader if r]
+            expect = len(self._selected_features()) + 1
+            if rows and len(rows[0]) != expect:
+                QMessageBox.warning(
+                    self, "列数不匹配",
+                    f"该 CSV 每行 {len(rows[0])} 列，当前特征选择需要 {expect} 列"
+                    f"（{expect - 1} 特征 + 1 标签）。\n"
+                    "请调整上方「输入特征」勾选以匹配文件，再重新导入。")
+                return
             self._raw.extend(rows)
             self._collect_status.setText(f"已采集：{len(self._raw)} 条")
             self._refresh_preview()
@@ -463,7 +520,7 @@ class TrainingPage(QWidget):
         path = os.path.join(_DATA_DIR, f"dataset_{ts}.csv")
         with open(path, "w", newline="", encoding="utf-8") as f:
             w = csv.writer(f)
-            w.writerow(_FEATURE_NAMES + ["label"])
+            w.writerow(self._selected_features() + ["label"])
             w.writerows(self._raw)
         logger.log("保存数据集", os.path.basename(path))
         QMessageBox.information(self, "已保存", path)
@@ -474,26 +531,31 @@ class TrainingPage(QWidget):
             return
         data = np.array(self._raw, dtype=np.float64)
         n0 = len(data)
+        n_feat = data.shape[1] - 1
+        sel = self._selected_features()
 
         if self._chk_drop_nan.isChecked():
             data = data[np.isfinite(data).all(axis=1)]
 
-        mn, mx = self._speed_min.value(), self._speed_max.value()
-        data = data[(data[:, 0] >= mn) & (data[:, 0] <= mx)]
+        # 转速过滤只在选了 speed_actual 时按其所在列执行
+        if "speed_actual" in sel and len(sel) == n_feat:
+            col = sel.index("speed_actual")
+            mn, mx = self._speed_min.value(), self._speed_max.value()
+            data = data[(data[:, col] >= mn) & (data[:, col] <= mx)]
 
         if self._chk_dedup.isChecked():
             _, idx = np.unique(data, axis=0, return_index=True)
             data = data[np.sort(idx)]
 
-        X, y = data[:, :8], data[:, 8]
+        X, y = data[:, :n_feat], data[:, n_feat]
 
         if self._chk_norm.isChecked() and len(X) > 1:
             self._mean = X.mean(axis=0)
             self._std = X.std(axis=0) + 1e-8
             X = (X - self._mean) / self._std
         else:
-            self._mean = np.zeros(8)
-            self._std = np.ones(8)
+            self._mean = np.zeros(n_feat)
+            self._std = np.ones(n_feat)
 
         self._X_clean = X.astype(np.float32)
         self._y_clean = y.astype(np.float32)
