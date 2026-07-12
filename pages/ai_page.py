@@ -123,6 +123,8 @@ class AIPage(QWidget):
 
         comm.telemetryReceived.connect(self._on_telemetry)
         self._load_config()
+        # 启动即后台构建索引：有缓存时 <1s 就绪，首个问题不再错过检索
+        self._ensure_rag_index()
 
     # -------- 子构件 --------
     def _build_config_box(self) -> QGroupBox:
