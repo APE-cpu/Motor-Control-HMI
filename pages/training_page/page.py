@@ -33,14 +33,19 @@ try:
 except ImportError:
     _PG_OK = False
 
+# 特征中文名（顺序须与 _frame_to_row 一致）
 _FEATURE_NAMES = [
-    "speed_actual", "speed_target",
-    "current_actual", "current_target",
-    "torque_actual", "torque_target",
-    "angle_actual", "temperature",
+    "实际转速", "给定转速",
+    "实际电流", "给定电流",
+    "实际转矩", "给定转矩",
+    "转子角度", "温度",
 ]
 
 _DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "training", "data")
+
+# 自动标注阈值（数字孪生量级；真机可按铭牌调整）
+_TEMP_FAULT = 85.0     # 过温故障 °C
+_TEMP_WARN = 65.0      # 温度告警 °C
 
 
 def _frame_to_row(f: TelemetryFrame) -> list:
@@ -48,6 +53,24 @@ def _frame_to_row(f: TelemetryFrame) -> list:
             f.current_actual, f.current_target,
             f.torque_actual, f.torque_target,
             f.angle_actual, f.temperature]
+
+
+def _auto_label(f: TelemetryFrame) -> float:
+    """按遥测健康度自动判定标签：0.0 正常 / 0.5 警告 / 1.0 故障。
+
+    直接采用数字孪生/下位机已算好的健康信号（母线状态、温度、
+    传感器质量、低速不可用标志），无需人工判断。
+    """
+    # 故障：母线过压跳闸 或 过温
+    if getattr(f, "bus_state", "normal") == "ov" or f.temperature >= _TEMP_FAULT:
+        return 1.0
+    # 警告：欠压 / 制动斩波 / 温度偏高 / 传感器质量低 / 低速不可用
+    if (getattr(f, "bus_state", "normal") in ("uv", "brake")
+            or f.temperature >= _TEMP_WARN
+            or getattr(f, "sensor_quality", 1.0) < 0.5
+            or getattr(f, "low_speed_warn", False)):
+        return 0.5
+    return 0.0
 
 
 # 模型与任务类型的一句话介绍（选中时显示）
@@ -144,6 +167,20 @@ class TrainingPage(QWidget):
         f.addRow("采集时长 (s)", self._collect_dur)
         v.addLayout(f)
 
+        # 自动标注：按遥测健康度实时判定每帧标签，无需人工选标签
+        self._chk_auto_label = QCheckBox("自动标注故障（按遥测健康度：过压/过温/传感器异常）")
+        self._chk_auto_label.setToolTip(
+            "勾选后忽略上面的「数据标签」，每帧标签由母线状态、温度、传感器质量\n"
+            "等健康信号自动判定：正常 0.0 / 警告 0.5 / 故障 1.0。\n"
+            "配合驱动电机进入故障工况（如急减速触发母线过压、高速长跑触发过温），\n"
+            "即可自动采集到带标签的故障样本。")
+        self._chk_auto_label.toggled.connect(
+            lambda c: self._label_combo.setEnabled(not c))
+        v.addWidget(self._chk_auto_label)
+        self._auto_label_hint = QLabel("")
+        self._auto_label_hint.setStyleSheet("color: #8fa3b8;")
+        v.addWidget(self._auto_label_hint)
+
         h = QHBoxLayout()
         self._btn_collect = QPushButton("开始采集")
         self._btn_collect.setObjectName("PrimaryButton")
@@ -160,15 +197,16 @@ class TrainingPage(QWidget):
         self._collect_status = QLabel("已采集：0 条")
         v.addWidget(self._collect_status)
 
-        # 数据预览：展示前几条，直观确认格式与规模
+        # 数据预览：展示前若干条，直观确认格式与规模
         self._preview = QTableWidget(0, len(_FEATURE_NAMES) + 1)
-        self._preview.setHorizontalHeaderLabels(_FEATURE_NAMES + ["label"])
+        self._preview.setHorizontalHeaderLabels(_FEATURE_NAMES + ["标签"])
         self._preview.verticalHeader().setVisible(False)
         self._preview.setEditTriggers(QTableWidget.NoEditTriggers)
-        self._preview.setMaximumHeight(150)
-        self._preview.horizontalHeader().setDefaultSectionSize(88)
-        v.addWidget(self._preview)
-        self._preview_info = QLabel("数据格式：8 特征 + 1 标签；暂无数据")
+        self._preview.setMinimumHeight(240)
+        self._preview.horizontalHeader().setDefaultSectionSize(72)
+        self._preview.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self._preview, 1)      # 占据采集框剩余空间
+        self._preview_info = QLabel("数据格式：特征 + 1 标签；暂无数据")
         self._preview_info.setStyleSheet("color: #8fa3b8;")
         v.addWidget(self._preview_info)
         return box
@@ -198,11 +236,11 @@ class TrainingPage(QWidget):
             self._collect_status.setText("已采集：0 条")
         self._refresh_preview()
 
-    def _refresh_preview(self, head_n: int = 5) -> None:
+    def _refresh_preview(self, head_n: int = 20) -> None:
         """刷新数据预览表：列随所选特征，前 head_n 条 + 形状说明。"""
         sel = self._selected_features()
         self._preview.setColumnCount(len(sel) + 1)
-        self._preview.setHorizontalHeaderLabels(sel + ["label"])
+        self._preview.setHorizontalHeaderLabels(sel + ["标签"])
         rows = self._raw[:head_n]
         self._preview.setRowCount(len(rows))
         for r, row in enumerate(rows):
@@ -302,6 +340,8 @@ class TrainingPage(QWidget):
         h.addStretch(1)
         v.addLayout(h)
         self._drl_log = QPlainTextEdit(); self._drl_log.setReadOnly(True); self._drl_log.setMaximumHeight(80)
+        self._drl_log.setPlaceholderText(
+            "DRL 训练日志：显示环境步数、回报、MPC 专家轨迹与训练状态")
         v.addWidget(self._drl_log)
         v.addStretch(1)
         return w
@@ -399,6 +439,8 @@ class TrainingPage(QWidget):
         btn_curve.clicked.connect(self._show_curve_window)
         self._progress = QProgressBar(); self._progress.setRange(0, 100); self._progress.setValue(0)
         self._train_log = QPlainTextEdit(); self._train_log.setReadOnly(True); self._train_log.setMaximumHeight(80)
+        self._train_log.setPlaceholderText(
+            "训练日志：开始训练后逐轮显示 train/val 损失、进度与完成/错误信息")
         for b in (self._btn_train, self._btn_stop_train, self._btn_export, btn_curve):
             v2.addWidget(b)
         v2.addWidget(self._progress)
@@ -462,20 +504,36 @@ class TrainingPage(QWidget):
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._latest = frame
         if self._collecting:
-            label_map = [0.0, 0.5, 1.0]
-            label = label_map[self._label_combo.currentIndex()]
+            if self._chk_auto_label.isChecked():
+                label = _auto_label(frame)
+            else:
+                label = [0.0, 0.5, 1.0][self._label_combo.currentIndex()]
             full = _frame_to_row(frame)
             row = [full[_FEATURE_NAMES.index(n)]
                    for n in self._selected_features()]
             self._raw.append(row + [label])
             self._collect_status.setText(f"已采集：{len(self._raw)} 条")
+            if self._chk_auto_label.isChecked():
+                self._update_auto_label_hint()
+
+    def _update_auto_label_hint(self) -> None:
+        labels = [r[-1] for r in self._raw]
+        n0 = labels.count(0.0)
+        n5 = labels.count(0.5)
+        n1 = labels.count(1.0)
+        cur = _auto_label(self._latest)
+        cur_txt = {0.0: "正常", 0.5: "警告", 1.0: "故障"}[cur]
+        self._auto_label_hint.setText(
+            f"自动标注中 → 当前：{cur_txt}　｜　"
+            f"正常 {n0} / 警告 {n5} / 故障 {n1}")
 
     def _on_toggle_collect(self) -> None:
         if not self._collecting:
             dur = self._collect_dur.value()
             self._collecting = True
             self._btn_collect.setText("停止采集")
-            logger.log("开始数据采集", f"标签={self._label_combo.currentText()} 时长={dur}s")
+            mode = "自动标注" if self._chk_auto_label.isChecked() else self._label_combo.currentText()
+            logger.log("开始数据采集", f"标签={mode} 时长={dur}s")
             QTimer.singleShot(dur * 1000, self._stop_collect)
         else:
             self._stop_collect()
