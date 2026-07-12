@@ -170,7 +170,8 @@ FRAME_TAIL = 0x55
 # ============ AI 大模型配置默认值 ============
 AI_DEFAULT_BASE_URL = "https://api.openai.com/v1"
 AI_DEFAULT_MODEL = "gpt-4o"
-AI_REQUEST_TIMEOUT = 30
+# 非流式请求需等待完整回答生成；长提示词（RAG 参考资料）+长回答时 30s 不够
+AI_REQUEST_TIMEOUT = 120
 
 
 # 命令字定义（与下位机协商后可在此扩展）

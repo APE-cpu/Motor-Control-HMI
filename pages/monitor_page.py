@@ -206,6 +206,10 @@ class MonitorPage(QWidget):
         btn_save_all = QPushButton("保存所有波形")
         btn_save_all.clicked.connect(self._save_all_curves)
         title_row.addWidget(btn_save_all)
+        btn_report = QPushButton("AI 运行报告")
+        btn_report.setToolTip("汇总本次运行的统计数据并附波形截图，由 AI 生成格式化实验报告")
+        btn_report.clicked.connect(self._on_ai_report)
+        title_row.addWidget(btn_report)
         self._btn_start = QPushButton("启动"); self._btn_start.setObjectName("PrimaryButton")
         self._btn_stop = QPushButton("停止")
         self._btn_emerg = QPushButton("紧急停止"); self._btn_emerg.setObjectName("EmergencyButton")
@@ -222,6 +226,9 @@ class MonitorPage(QWidget):
         self._speed_spin.setValue(1500)
         self._speed_spin.setSuffix(" rpm")
         title_row.addWidget(self._speed_spin)
+        # 目标转速全局唯一入口：控制页启动电机时读取的也是这个框
+        if self._ctrl is not None:
+            self._ctrl._target_speed = self._speed_spin
         btn_set_speed = QPushButton("设定")
         btn_set_speed.clicked.connect(self._on_set_speed)
         title_row.addWidget(btn_set_speed)
@@ -262,14 +269,29 @@ class MonitorPage(QWidget):
                                         self._angle_raw), 1, 1)
 
         # ---------- 传感器状态 ----------
-        sensor_box = QGroupBox("传感器状态")
+        sensor_box = QGroupBox("传感器状态（悬停指标看说明）")
         sensor_grid = QGridLayout(sensor_box)
         self._sensor_source = QLabel("来源：--")
+        self._sensor_source.setToolTip("当前提供转子位置的传感器/估算方法")
         self._sensor_quality = QProgressBar()
         self._sensor_quality.setRange(0, 100)
         self._sensor_quality.setValue(100)
+        self._sensor_quality.setFormat("质量 %p%")
+        self._sensor_quality.setToolTip(
+            "质量：这一帧角度数据的置信度/信噪比（0~100%）。\n"
+            "反映传感器特性与工况：QEP≈99%、Resolver≈95%、\n"
+            "Hall≈70%（60°分辨率，扇区间靠插值）、无传感器法随转速在 40~90% 波动。\n"
+            "低于 50% 视为异常——依赖角度的控制（FOC 换相/位置控制）精度会下降。")
         self._sensor_convergence = QLabel("收敛度：--")
+        self._sensor_convergence.setToolTip(
+            "收敛度：无位置传感器观测器（SMO/EKF/MRAS/HFI）追上真实转子位置的程度（0~1）。\n"
+            "1.0 = 已锁定，位置估计可信，可放心闭环；\n"
+            "偏低 = 仍在收敛或已发散，此时角度估计不可用于换相。\n"
+            "物理传感器（Hall/QEP/Resolver）直接测量、无收敛过程，恒为 1.0。")
         self._sensor_warn = QLabel("低速警告：正常")
+        self._sensor_warn.setToolTip(
+            "反电动势类无传感器方法（SMO/EKF/MRAS）在低速段信噪比不足、位置估计失效，\n"
+            "进入该转速区时此处报警（HFI 例外，可工作到零速）。")
         sensor_grid.addWidget(self._sensor_source, 0, 0)
         sensor_grid.addWidget(self._sensor_quality, 0, 1)
         sensor_grid.addWidget(self._sensor_convergence, 1, 0)
@@ -306,8 +328,9 @@ class MonitorPage(QWidget):
         sensor_curve_h.addWidget(_make_curve_panel(self._c_sensor_q, "传感器诊断"))
 
         tabs = QTabWidget()
-        tabs.addTab(trend_tab, "趋势曲线（最近 100 点）")
-        tabs.addTab(sensor_tab, "传感器波形")
+        tabs.setObjectName("CurveTabs")
+        tabs.addTab(trend_tab, "📈 趋势曲线（最近 100 点）")
+        tabs.addTab(sensor_tab, "🧭 传感器波形")
         root.addWidget(tabs, 1)
 
         # ---------- 连接信号 ----------
@@ -448,6 +471,36 @@ class MonitorPage(QWidget):
             return
         with open(path, "wb") as f:
             f.write(png)
+
+    def _on_ai_report(self) -> None:
+        """汇总运行数据 + 波形截图，交给 AI 生成实验报告。"""
+        from widgets.report_dialog import ExperimentReportDialog
+        if not self._c_speed._times:
+            QMessageBox.information(self, "提示", "暂无运行数据，请先启动仿真或电机。")
+            return
+        f = self._latest
+        duration = (self._c_speed._times[-1] - self._c_speed._times[0]
+                    if len(self._c_speed._times) > 1 else 0.0)
+        ctx = (
+            "实验类型：电机运行实验（监控数据汇总）\n"
+            f"实验时间：{datetime.datetime.now():%Y-%m-%d %H:%M}\n"
+            f"数据来源：{self._datasrc_label.text()}\n"
+            f"记录时长：约 {duration:.0f} s（趋势曲线窗口内）\n\n"
+            "── 结束时刻状态 ──\n"
+            f"转速：实际 {f.speed_actual:.1f} / 给定 {f.speed_target:.1f} rpm\n"
+            f"电流：实际 {f.current_actual:.2f} / 给定 {f.current_target:.2f} A\n"
+            f"转矩：实际 {f.torque_actual:.2f} / 给定 {f.torque_target:.2f} Nm\n"
+            f"母线电压：{f.vdc:.1f} V（状态 {f.bus_state}）  温度：{f.temperature:.1f} °C\n"
+            f"位置传感器：{f.sensor_source or '--'}，质量 {f.sensor_quality:.2f}，"
+            f"收敛度 {f.convergence:.2f}\n\n"
+            "── 运行统计（本次会话） ──\n"
+            f"转速：最大 {self._stat_speed._mx:.1f} / 最小 {self._stat_speed._mn:.1f} rpm\n"
+            f"电流：最大 {self._stat_current._mx:.2f} / 最小 {self._stat_current._mn:.2f} A\n"
+            f"转矩：最大 {self._stat_torque._mx:.2f} / 最小 {self._stat_torque._mn:.2f} Nm\n"
+        )
+        png = self.render_waveforms_png()
+        images = [("image/png", png)] if png else []
+        ExperimentReportDialog("电机运行实验", ctx, images, parent=self).exec()
 
     def _on_set_speed(self) -> None:
         """把新目标转速下发给下位机/虚拟电机（运行中即时生效）。"""

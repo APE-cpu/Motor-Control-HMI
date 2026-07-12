@@ -18,7 +18,9 @@ from PySide6.QtWidgets import (
 from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import encode_frame
 from config.config import CMD_START, CMD_STOP
+from controllers.param_identify import fit_inertia, solve_friction, torque_constant
 from logs.operation_logger import logger
+from widgets.report_dialog import ExperimentReportDialog
 
 
 class IdentifyPage(QWidget):
@@ -61,9 +63,14 @@ class IdentifyPage(QWidget):
         self._btn_apply = QPushButton("应用到数字孪生")
         self._btn_apply.setEnabled(False)
         self._btn_apply.clicked.connect(self._on_apply)
+        self._btn_report = QPushButton("AI 实验报告")
+        self._btn_report.setEnabled(False)
+        self._btn_report.setToolTip("实验完成后，由 AI 生成格式化实验报告（可保存 Markdown）")
+        self._btn_report.clicked.connect(self._on_report)
         self._status = QLabel("就绪（请先启动仿真或连接真机）")
         h.addWidget(self._btn_run)
         h.addWidget(self._btn_apply)
+        h.addWidget(self._btn_report)
         h.addWidget(self._status, 1)
         root.addLayout(h)
 
@@ -151,41 +158,29 @@ class IdentifyPage(QWidget):
 
     # ---------- 参数求解 ----------
     def _compute(self, coast: list) -> None:
-        psi_f = float(self._psi_f.value())
-        p = int(self._pole_pairs.value())
-        kt = 1.5 * p * psi_f
-
+        kt = torque_constant(float(self._psi_f.value()),
+                             int(self._pole_pairs.value()))
         (w1, i1), (w2, i2) = self._steady1, self._steady2
-        if abs(w2 - w1) < 1.0:
-            raise RuntimeError("两个稳态转速点太接近")
-        # Kt·iq = B·ω + Tc
-        b_hat = kt * (i2 - i1) / (w2 - w1)
-        tc_hat = kt * i1 - b_hat * w1
-
-        # 滑行：J·dω/dt = −(B·ω + Tc)，取降速段做最小二乘
-        ws = [(t, rpm * math.pi / 30.0) for t, rpm, _ in coast]
-        num = den = 0.0
-        used = 0
-        for k in range(1, len(ws)):
-            dt = ws[k][0] - ws[k - 1][0]
-            if dt <= 0:
-                continue
-            dwdt = (ws[k][1] - ws[k - 1][1]) / dt
-            w_mid = 0.5 * (ws[k][1] + ws[k - 1][1])
-            if dwdt > -1.0 or w_mid < 5.0:   # 只用明显降速且未停死的区段
-                continue
-            torque = -(b_hat * w_mid + tc_hat)
-            num += torque * dwdt
-            den += dwdt * dwdt
-            used += 1
-        if used < 3:
-            raise RuntimeError(f"滑行段有效数据太少（{used} 点），试试提高转速点 2")
-        j_hat = num / den
+        b_hat, tc_hat = solve_friction(w1, i1, w2, i2, kt)
+        j_hat, used = fit_inertia([(t, rpm) for t, rpm, _ in coast],
+                                  b_hat, tc_hat)
 
         self._result = {"B": b_hat, "Tc": tc_hat, "J": j_hat}
         self._btn_apply.setEnabled(True)
         self._status.setText("辨识完成")
         logger.log("参数辨识", f"B={b_hat:.3e} Tc={tc_hat:.3e} J={j_hat:.3e}")
+
+        # 供 AI 实验报告使用的完整上下文
+        self._report_ctx_head = (
+            "实验类型：电机参数辨识（两点稳态 + 滑行实验）\n"
+            f"实验时间：{time.strftime('%Y-%m-%d %H:%M')}\n"
+            f"数据来源：{'数字孪生仿真' if self._comm.is_sim_running() else '真机'}\n"
+            "实验原理：稳态 Kt·iq = B·ω + Tc 两点解 B/Tc；"
+            "滑行 J·dω/dt = −(B·ω + Tc) 最小二乘拟合 J\n"
+            f"实验配置：ψf={self._psi_f.value()} Wb，"
+            f"极对数={self._pole_pairs.value()}，"
+            f"稳态点 n1={self._n1.value()} rpm，n2={self._n2.value()} rpm，"
+            f"滑行采样 {len(coast)} 帧\n")
 
         # 报告（仿真模式下附孪生真值对比）
         lines = [
@@ -210,6 +205,12 @@ class IdentifyPage(QWidget):
                 f"  J : 真值 {sp.J:.4e}   误差 {err(j_hat, sp.J)}",
             ]
         self._report.setPlainText("\n".join(lines))
+        self._btn_report.setEnabled(True)
+
+    def _on_report(self) -> None:
+        ctx = (getattr(self, "_report_ctx_head", "")
+               + "\n实验数据与结果：\n" + self._report.toPlainText())
+        ExperimentReportDialog("参数辨识实验", ctx, parent=self).exec()
 
     def _on_apply(self) -> None:
         if not self._result:

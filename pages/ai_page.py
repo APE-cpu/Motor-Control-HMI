@@ -1,26 +1,48 @@
-"""AI 分析页面：接入外部大模型，分析电机运行状态与故障诊断。"""
+"""AI 分析页面：接入外部大模型，分析电机运行状态与故障诊断。
+
+支持 RAG（检索增强生成）：本地 BM25 检索项目文档与 knowledge/ 目录资料，
+把相关片段注入提示词，让回答有据可依。
+"""
 import base64
 import json
 import os
+import shutil
 import threading
+from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
+from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
-    QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
+    QCheckBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
 from ai.ai_client import AIClient
+from ai.rag import RAGIndex, format_context
 from communications.comm_manager import CommManager, TelemetryFrame
 from config.config import AI_DEFAULT_BASE_URL, AI_DEFAULT_MODEL, AI_REQUEST_TIMEOUT
 from logs.operation_logger import logger
-from runtime_paths import writable_path
+from runtime_paths import app_base_dir, writable_path
 
 _CONFIG_FILE = writable_path("config", "ai_config.json")
+_KNOWLEDGE_DIR = writable_path("knowledge", ".keep").parent
+_REPORT_DIR = writable_path("reports", ".keep").parent
+
+# 随包自带的知识文档（项目根目录）
+_BUILTIN_DOCS = ["README.md", "使用说明书.md", "软件介绍.md"]
 
 _SYS_PROMPT = """你是一名电机控制专家。当前电机遥测数据如下：
 {snapshot}
 请根据以上数据回答用户的问题，重点关注异常状态和故障诊断。回答简洁专业。"""
+
+_SYS_PROMPT_RAG = """你是一名电机控制专家。当前电机遥测数据如下：
+{snapshot}
+
+以下是从本地知识库检索到的参考资料。回答时优先依据资料内容，引用处标注来源
+（如“据资料1”）；资料未覆盖的部分再用你的通用知识并注明：
+{context}
+
+请根据以上信息回答用户的问题，重点关注异常状态和故障诊断。回答简洁专业。"""
 
 
 def _normalize_url(url: str) -> str:
@@ -32,7 +54,8 @@ def _normalize_url(url: str) -> str:
 
 
 class _Worker(QObject):
-    finished = Signal(str)
+    chunk = Signal(str)       # 流式增量文本
+    finished = Signal(str)    # 完整回答
     error = Signal(str)
 
     def __init__(self, client: AIClient, messages: list) -> None:
@@ -42,10 +65,17 @@ class _Worker(QObject):
 
     def run(self) -> None:
         try:
-            reply = self._client.chat(self._messages, timeout=AI_REQUEST_TIMEOUT)
+            reply = self._client.chat_stream(
+                self._messages, timeout=AI_REQUEST_TIMEOUT,
+                on_delta=self.chunk.emit)
             self.finished.emit(reply)
         except Exception as exc:
-            self.error.emit(str(exc))
+            if "timed out" in str(exc).lower():
+                self.error.emit(
+                    f"网络读等待超过 {AI_REQUEST_TIMEOUT}s（流式下为相邻数据块"
+                    "间隔），请检查网络后重试。")
+            else:
+                self.error.emit(str(exc))
 
 
 _IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
@@ -62,6 +92,7 @@ class AIPage(QWidget):
         self._latest: TelemetryFrame = TelemetryFrame()
         self._worker = None  # 持有引用，防止 GC
         self._attachments: list = []  # [(文件名, mime, 原始字节)]
+        self._rag_index: RAGIndex | None = None
 
         root = QVBoxLayout(self)
 
@@ -141,7 +172,65 @@ class AIPage(QWidget):
         h2.addWidget(btn_attach_clear)
         h2.addWidget(self._attach_label, 1)
         v.addLayout(h2)
+
+        # RAG 行：知识库增强开关与管理
+        h3 = QHBoxLayout()
+        self._chk_rag = QCheckBox("📚 知识库增强 (RAG)")
+        self._chk_rag.setChecked(True)
+        self._chk_rag.setToolTip(
+            "发送前用 BM25 从本地知识库检索相关片段注入提示词，让回答有据可依。\n"
+            "知识库 = 项目自带文档（README/使用说明书/软件介绍）+ knowledge/ 目录\n"
+            "+ reports/ 目录的历史实验报告（AI 因此记得之前的实验结果与异常）。")
+        btn_add_doc = QPushButton("添加文档…")
+        btn_add_doc.setToolTip(f"把 md/txt 资料复制到知识库目录：\n{_KNOWLEDGE_DIR}")
+        btn_add_doc.clicked.connect(self._on_add_docs)
+        btn_rebuild = QPushButton("重建索引")
+        btn_rebuild.clicked.connect(self._on_rebuild_index)
+        self._rag_status = QLabel("知识库未索引（首次提问时自动构建）")
+        self._rag_status.setStyleSheet("color: #90a4ae;")
+        h3.addWidget(self._chk_rag)
+        h3.addWidget(btn_add_doc)
+        h3.addWidget(btn_rebuild)
+        h3.addWidget(self._rag_status, 1)
+        v.addLayout(h3)
         return box
+
+    # -------- RAG --------
+    @staticmethod
+    def _gather_rag_paths() -> list:
+        base = app_base_dir()
+        paths = [base / name for name in _BUILTIN_DOCS]
+        paths += sorted(_KNOWLEDGE_DIR.glob("*.md"))
+        paths += sorted(_KNOWLEDGE_DIR.glob("*.txt"))
+        # 历史实验报告自动入库：模型因此记得之前的实验结果与异常
+        paths += sorted(_REPORT_DIR.glob("*.md"))
+        return [p for p in paths if p.exists() and p.name != ".keep"]
+
+    def _ensure_rag_index(self) -> RAGIndex:
+        paths = self._gather_rag_paths()
+        if (self._rag_index is None
+                or self._rag_index.sources != [str(p) for p in paths]
+                or self._rag_index.needs_rebuild()):
+            self._rag_index = RAGIndex(paths)
+            n = self._rag_index.build()
+            self._rag_status.setText(f"知识库：{len(paths)} 个文档，{n} 个检索块")
+        return self._rag_index
+
+    def _on_add_docs(self) -> None:
+        files, _ = QFileDialog.getOpenFileNames(
+            self, "添加知识文档", "", "文档 (*.md *.txt)")
+        for src in files:
+            try:
+                shutil.copy2(src, _KNOWLEDGE_DIR / Path(src).name)
+            except OSError as e:
+                self._append_chat("系统", f"复制 {Path(src).name} 失败：{e}")
+        if files:
+            self._on_rebuild_index()
+            logger.log("知识库添加文档", "、".join(Path(f).name for f in files))
+
+    def _on_rebuild_index(self) -> None:
+        self._rag_index = None
+        self._ensure_rag_index()
 
     # -------- 配置持久化 --------
     def _load_config(self) -> None:
@@ -264,24 +353,64 @@ class AIPage(QWidget):
             user_content = question
 
         snapshot = self._snapshot_label.toPlainText()
+        sys_prompt = _SYS_PROMPT.format(snapshot=snapshot)
+        if self._chk_rag.isChecked():
+            try:
+                hits = self._ensure_rag_index().search(question, top_k=4)
+            except Exception as e:
+                hits = []
+                self._append_chat("系统", f"知识库检索失败（不影响回答）：{e}")
+            if hits:
+                sys_prompt = _SYS_PROMPT_RAG.format(
+                    snapshot=snapshot, context=format_context(hits))
+                srcs = "、".join(src for _s, src, _t in hits)
+                self._append_chat("系统", f"📚 检索到 {len(hits)} 条参考：{srcs}")
         messages = [
-            {"role": "system", "content": _SYS_PROMPT.format(snapshot=snapshot)},
+            {"role": "system", "content": sys_prompt},
             {"role": "user", "content": user_content},
         ]
 
+        self._stream_started = False
         self._worker = _Worker(self._client, messages)
-        self._worker.finished.connect(lambda r: self._on_reply(r))
-        self._worker.error.connect(lambda e: self._on_reply(f"[错误] {e}"))
+        self._worker.chunk.connect(self._on_chunk)
+        self._worker.finished.connect(self._on_stream_done)
+        self._worker.error.connect(self._on_stream_error)
         threading.Thread(target=self._worker.run, daemon=True).start()
 
-    def _on_reply(self, text: str) -> None:
-        self._append_chat("AI", text)
+    # -------- 流式渲染 --------
+    def _insert_at_end(self, text: str) -> None:
+        cursor = self._chat_display.textCursor()
+        cursor.movePosition(QTextCursor.End)
+        cursor.insertText(text)
+        self._chat_display.setTextCursor(cursor)
+        self._chat_display.ensureCursorVisible()
+
+    def _on_chunk(self, delta: str) -> None:
+        if not self._stream_started:
+            self._stream_started = True
+            self._btn_send.setText("生成中…")
+            self._insert_at_end("【AI】")
+        self._insert_at_end(delta)
+
+    def _on_stream_done(self, full: str) -> None:
+        if not self._stream_started:
+            # 服务端未按流式返回增量（或空回答），整段补上
+            self._append_chat("AI", full or "[空回答]")
+        else:
+            self._insert_at_end("\n\n")
         self._btn_send.setEnabled(True)
         self._btn_send.setText("发送")
-        if not text.startswith("[错误]"):
-            logger.log("AI分析回复", text[:80])
+        logger.log("AI分析回复", full[:80])
+        self._worker = None
+
+    def _on_stream_error(self, err: str) -> None:
+        if self._stream_started:
+            self._insert_at_end(f"\n[错误] {err}\n\n")
         else:
-            logger.log("AI分析失败", text)
+            self._append_chat("AI", f"[错误] {err}")
+        self._btn_send.setEnabled(True)
+        self._btn_send.setText("发送")
+        logger.log("AI分析失败", err[:120])
         self._worker = None
 
     def _append_chat(self, role: str, text: str) -> None:
