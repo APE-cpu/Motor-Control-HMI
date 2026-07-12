@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
     QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTabWidget,
-    QVBoxLayout, QWidget,
+    QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
@@ -50,6 +50,29 @@ def _frame_to_row(f: TelemetryFrame) -> list:
             f.angle_actual, f.temperature]
 
 
+# 模型与任务类型的一句话介绍（选中时显示）
+_MODEL_DESCS = {
+    "MLP (多层感知机)":
+        "全连接网络：结构简单、训练快，表格型遥测特征的首选基线。",
+    "1D-CNN (一维卷积)":
+        "一维卷积提取局部模式：适合波形片段类特征，参数量小。",
+    "LSTM (长短时记忆)":
+        "循环网络记忆时序依赖：适合按时间顺序采集的序列数据，训练较慢。",
+    "Transformer":
+        "自注意力建模长程依赖：能力强但需要较多数据，小数据集易过拟合。",
+    "随机森林 (Random Forest)":
+        "决策树集成（scikit-learn）：无需归一化、不易过拟合，小数据稳健，"
+        "训练秒级完成（无 Epoch/学习率概念）。",
+    "支持向量机 (SVM)":
+        "核方法（scikit-learn）：小样本高维表现好，数据量大时训练慢。",
+}
+
+_TASK_DESCS = {
+    0: "回归：输出 0~1 连续异常分数，能表达“轻微异常(0.5)”这类中间状态。",
+    1: "二分类：只判正常/异常两类，标签 ≥0.5 视为异常，界限分明。",
+}
+
+
 class TrainingPage(QWidget):
     def __init__(self, comm: CommManager, control_page=None) -> None:
         super().__init__()
@@ -79,6 +102,7 @@ class TrainingPage(QWidget):
         self._tab.addTab(self._build_fault_tab(), "电机故障分类")
         self._tab.addTab(self._build_drl_tab(), "深度强化学习(DRL) - 学习MPC")
         root.addWidget(self._tab, 1)
+        self._update_model_desc()
 
         comm.telemetryReceived.connect(self._on_telemetry)
         self._trainer.epochDone.connect(self._on_epoch)
@@ -118,7 +142,36 @@ class TrainingPage(QWidget):
 
         self._collect_status = QLabel("已采集：0 条")
         v.addWidget(self._collect_status)
+
+        # 数据预览：展示前几条，直观确认格式与规模
+        self._preview = QTableWidget(0, len(_FEATURE_NAMES) + 1)
+        self._preview.setHorizontalHeaderLabels(_FEATURE_NAMES + ["label"])
+        self._preview.verticalHeader().setVisible(False)
+        self._preview.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._preview.setMaximumHeight(150)
+        self._preview.horizontalHeader().setDefaultSectionSize(88)
+        v.addWidget(self._preview)
+        self._preview_info = QLabel("数据格式：8 特征 + 1 标签；暂无数据")
+        self._preview_info.setStyleSheet("color: #8fa3b8;")
+        v.addWidget(self._preview_info)
         return box
+
+    def _refresh_preview(self, head_n: int = 5) -> None:
+        """刷新数据预览表：前 head_n 条 + 形状说明。"""
+        rows = self._raw[:head_n]
+        self._preview.setRowCount(len(rows))
+        for r, row in enumerate(rows):
+            for c, val in enumerate(row):
+                self._preview.setItem(r, c, QTableWidgetItem(f"{val:.3f}"))
+        n = len(self._raw)
+        if n:
+            ncol = len(self._raw[0])
+            mb = n * ncol * 8 / 1048576   # float64 估算
+            self._preview_info.setText(
+                f"共 {n} 条 × {ncol} 列（8 特征 + 1 标签），"
+                f"约 {mb:.2f} MB；上表为前 {len(rows)} 条")
+        else:
+            self._preview_info.setText("数据格式：8 特征 + 1 标签；暂无数据")
 
     # ─── 数据清洗 ───────────────────────────────────────────
     def _build_clean_box(self) -> QGroupBox:
@@ -221,7 +274,14 @@ class TrainingPage(QWidget):
 
         self._task_combo = QComboBox()
         self._task_combo.addItems(["回归 (异常分数)", "二分类 (正常/异常)"])
+        self._task_combo.currentIndexChanged.connect(self._update_model_desc)
         left.addRow("任务类型", self._task_combo)
+
+        self._model_desc = QLabel("")
+        self._model_desc.setWordWrap(True)
+        self._model_desc.setStyleSheet("color: #8fa3b8;")
+        self._model_desc.setMaximumWidth(320)
+        left.addRow(self._model_desc)
         h.addLayout(left, 0)
 
         self._model_stack = QStackedWidget()
@@ -243,6 +303,16 @@ class TrainingPage(QWidget):
         self._batch = QSpinBox(); self._batch.setRange(1, 1024); self._batch.setValue(32)
         self._val_split = QDoubleSpinBox(); self._val_split.setRange(0.05, 0.5); self._val_split.setSingleStep(0.05); self._val_split.setValue(0.2)
         self._weight_decay = QDoubleSpinBox(); self._weight_decay.setRange(0, 1.0); self._weight_decay.setDecimals(6); self._weight_decay.setValue(0.0)
+        self._epochs.setToolTip("全数据集完整迭代的次数。过多会过拟合"
+                                "（验证 Loss 先降后升即是信号）")
+        self._lr.setToolTip("每步参数更新的幅度，最重要的超参数：过大发散、"
+                            "过小收敛慢。Adam 常用 1e-3 起步")
+        self._batch.setToolTip("每次梯度更新使用的样本数。大→训练稳定但"
+                               "泛化略差；小→噪声大但有正则效果")
+        self._val_split.setToolTip("留出这一比例的数据不参与训练，"
+                                   "仅用于监控过拟合（验证 Loss）")
+        self._weight_decay.setToolTip("L2 正则化强度，抑制过拟合。"
+                                      "常用 0 或 1e-4")
         f.addRow("训练轮数 (Epochs)", self._epochs)
         f.addRow("学习率 (LR)", self._lr)
         f.addRow("批大小 (Batch)", self._batch)
@@ -255,6 +325,14 @@ class TrainingPage(QWidget):
         self._loss_fn = QComboBox(); self._loss_fn.addItems(TRAIN_LOSSES)
         self._scheduler = QComboBox(); self._scheduler.addItems(TRAIN_SCHEDULERS)
         self._seed = QSpinBox(); self._seed.setRange(0, 99999); self._seed.setValue(42)
+        self._optimizer.setToolTip("参数更新算法：Adam 自适应学习率、省心"
+                                   "（默认首选）；SGD 需精调但泛化常更好")
+        self._loss_fn.setToolTip("误差的度量方式：回归用 MSE/MAE；"
+                                 "二分类用交叉熵（BCE）")
+        self._scheduler.setToolTip("训练过程中自动衰减学习率：前期大步快走，"
+                                   "后期小步精调，收敛更稳")
+        self._seed.setToolTip("固定随机初始化/数据打乱的种子，"
+                              "同一种子结果可复现")
         f2.addRow("优化器", self._optimizer)
         f2.addRow("损失函数", self._loss_fn)
         f2.addRow("学习率调度", self._scheduler)
@@ -326,6 +404,14 @@ class TrainingPage(QWidget):
         for w in (self._epochs, self._lr, self._batch, self._weight_decay,
                   self._optimizer, self._loss_fn, self._scheduler, self._val_split):
             w.setEnabled(not is_sk)
+        self._update_model_desc()
+
+    def _update_model_desc(self) -> None:
+        if not hasattr(self, "_model_desc"):
+            return
+        model = _MODEL_DESCS.get(self._model_combo.currentText(), "")
+        task = _TASK_DESCS.get(self._task_combo.currentIndex(), "")
+        self._model_desc.setText(f"{model}\n{task}")
 
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._latest = frame
@@ -350,6 +436,7 @@ class TrainingPage(QWidget):
             return
         self._collecting = False
         self._btn_collect.setText("开始采集")
+        self._refresh_preview()
         logger.log("停止数据采集", f"共 {len(self._raw)} 条")
 
     def _on_import_csv(self) -> None:
@@ -363,6 +450,7 @@ class TrainingPage(QWidget):
                 rows = [list(map(float, r)) for r in reader if r]
             self._raw.extend(rows)
             self._collect_status.setText(f"已采集：{len(self._raw)} 条")
+            self._refresh_preview()
             logger.log("导入 CSV", f"{os.path.basename(path)}  {len(rows)} 行")
         except Exception as e:
             QMessageBox.warning(self, "导入失败", str(e))
