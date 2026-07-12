@@ -10,6 +10,19 @@ from runtime_paths import writable_path
 _LOG_FILE = writable_path("logs", "operation_log.txt")
 
 
+def classify_level(line: str) -> str:
+    """按行文本启发式判定日志级别：error / warn / info。
+
+    不依赖 logger 调用点传级别（那要改几十处），直接看关键词。
+    """
+    low = line
+    if any(k in low for k in ("错误", "失败", "[错误]", "[DRL错误]", "ERROR", "Error")):
+        return "error"
+    if any(k in low for k in ("警告", "告警", "[警告]", "紧急停止", "WARN")):
+        return "warn"
+    return "info"
+
+
 class OperationLogger(QObject):
     newEntry = Signal(str)
 
