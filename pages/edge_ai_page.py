@@ -1,5 +1,6 @@
 """边缘AI页面：本地 ONNX 推理 + 规则检测，实时显示异常分数。"""
 import os
+from collections import deque
 
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
@@ -13,6 +14,7 @@ from config.config import MONITOR_REFRESH_MS
 from edge_ai.engine import EdgeAIEngine
 from logs.operation_logger import logger
 from runtime_paths import resource_path
+from widgets.radar_chart import RadarChart
 
 # 内置模型：数字孪生训练的故障检测器（随包 motor_anomaly.onnx）
 _BUILTIN_MODEL = str(resource_path("motor_anomaly.onnx"))
@@ -25,6 +27,16 @@ _FEATURE_LABELS = [
     ("转子角度", "°"), ("温度", "°C"),
 ]
 
+# 雷达图 6 维：(名称, 满量程) —— 各物理量按量程归一化才能同框比较
+_RADAR_AXES = [
+    ("转速", 3000.0),      # rpm
+    ("电流", 10.0),        # A
+    ("转矩", 5.0),         # N·m
+    ("温度", 100.0),       # °C
+    ("母线电压", 60.0),    # V
+    ("异常分数", 1.0),     # 0~1
+]
+
 
 class EdgeAIPage(QWidget):
     def __init__(self, comm: CommManager) -> None:
@@ -35,6 +47,8 @@ class EdgeAIPage(QWidget):
         self._engine = EdgeAIEngine()   # 占位，_on_model_choice 里正式初始化
         self._hi_streak = 0        # 连续高分帧计数（时间去抖）
         self._confirmed = False    # 去抖后确认的故障态
+        # 雷达图滑动窗口：最近 ~20 帧（约 10s）的 6 维快照，用于算平均值
+        self._radar_win = deque(maxlen=20)
 
         root = QVBoxLayout(self)
         title = QLabel("边缘AI 异常检测")
@@ -152,6 +166,10 @@ class EdgeAIPage(QWidget):
         f.addRow("说明", self._detail_val)
         h.addLayout(f, 1)
 
+        # 中：多维雷达图（当前值 vs 滑动窗口平均值）
+        self._radar = RadarChart(_RADAR_AXES)
+        h.addWidget(self._radar, 1)
+
         # 右：模型的 8 个输入特征原始值（模型此刻在judge什么）
         self._feat_table = QTableWidget(len(_FEATURE_LABELS), 2)
         self._feat_table.setHorizontalHeaderLabels(["模型输入特征", "当前值"])
@@ -235,3 +253,10 @@ class EdgeAIPage(QWidget):
                 f"转速={f.speed_actual:.0f}rpm  电流={f.current_actual:.2f}A  "
                 f"温度={f.temperature:.1f}°C"
             )
+
+        # 六维雷达图：当前值 + 滑动窗口平均值（维度顺序对齐 _RADAR_AXES）
+        radar_cur = [abs(f.speed_actual), abs(f.current_actual),
+                     abs(f.torque_actual), f.temperature, f.vdc, raw_score]
+        self._radar_win.append(radar_cur)
+        radar_avg = [sum(col) / len(self._radar_win) for col in zip(*self._radar_win)]
+        self._radar.set_values(radar_cur, radar_avg)
