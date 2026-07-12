@@ -21,7 +21,7 @@ from widgets.side_nav import SideNav
 from communications.comm_manager import CommManager
 from logs.operation_logger import logger
 
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 
 
 class MainWindow(QMainWindow):
