@@ -65,3 +65,27 @@ def test_索引失效检测(kb, tmp_path):
 def test_格式化引用():
     ctx = format_context([(5.0, "doc§节", "内容片段")])
     assert "【资料1｜doc§节】" in ctx and "内容片段" in ctx
+
+
+def test_pdf按页入索引_出处带页码(tmp_path, monkeypatch):
+    import ai.rag as rag_mod
+    fake = tmp_path / "教材.pdf"
+    fake.write_bytes(b"%PDF-fake")
+    monkeypatch.setattr(rag_mod, "_read_pdf_pages", lambda p: [
+        (f"{p.stem}·P1", "同步电机的电磁转矩由磁场储能对转子角求偏导得到，"
+                         "这是机电能量转换的基本原理。" * 3),
+        (f"{p.stem}·P2", "感应电机的等效电路包含定子电阻漏抗与励磁支路，"
+                         "转差率决定转子侧功率分配。" * 3),
+    ])
+    idx = rag_mod.RAGIndex([fake])
+    assert idx.build() >= 2
+    hits = idx.search("机电能量转换的基本原理是什么")
+    assert hits[0][1] == "教材·P1"
+
+
+def test_pdf损坏或无pypdf时静默跳过(tmp_path):
+    bad = tmp_path / "坏文件.pdf"
+    bad.write_bytes(b"not a pdf at all")
+    from ai.rag import RAGIndex
+    idx = RAGIndex([bad])
+    assert idx.build() == 0   # 不抛异常

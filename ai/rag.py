@@ -1,8 +1,10 @@
-"""轻量 RAG 检索引擎：BM25 + 中文字符二元组分词（零依赖，离线可用）。
+"""轻量 RAG 检索引擎：BM25 + 中文字符二元组分词（离线可用）。
 
-知识来源：项目自带文档 + knowledge/ 目录下用户放置的 md/txt 文件。
+知识来源：项目自带文档 + knowledge/ 目录下用户放置的 md/txt/pdf 文件。
 按标题/段落切块，检索 top-k 片段注入提示词。
+PDF 需要 pypdf（未安装时自动跳过）；提取结果按 mtime 缓存，出处带页码。
 """
+import json
 import math
 import re
 from collections import Counter
@@ -52,11 +54,51 @@ def _split_chunks(text: str, source: str) -> List[Tuple[str, str]]:
         step = _CHUNK_CHARS - _CHUNK_OVERLAP
         for i in range(0, len(body), step):
             piece = body[i:i + _CHUNK_CHARS].strip()
-            if len(piece) >= 30:      # 过短的碎片没有检索价值
+            # 目录页的点线引导符（"标题.......页码"）占比高，无检索价值
+            dots = piece.count(".") + piece.count("…") + piece.count("·")
+            if len(piece) >= 30 and dots < len(piece) * 0.25:
                 chunks.append((label, piece))
             if i + _CHUNK_CHARS >= len(body):
                 break
     return chunks
+
+
+def _read_pdf_pages(p: Path) -> List[Tuple[str, str]]:
+    """提取 PDF 逐页文本，返回 [(出处标签, 页文本)]。
+
+    - 未安装 pypdf 或提取失败返回 []（调用方静默跳过）
+    - 结果缓存到同目录 .pdfcache/，按文件 mtime 失效——
+      大部头教材只在首次或更新后慢一次
+    """
+    cache = p.parent / ".pdfcache" / f"{p.stem}_{int(p.stat().st_mtime)}.json"
+    if cache.exists():
+        try:
+            return [tuple(x) for x in json.loads(
+                cache.read_text(encoding="utf-8"))]
+        except (json.JSONDecodeError, OSError):
+            pass
+    try:
+        from pypdf import PdfReader
+    except ImportError:
+        return []
+    try:
+        reader = PdfReader(str(p))
+        pages = []
+        for i, page in enumerate(reader.pages, 1):
+            text = (page.extract_text() or "").strip()
+            # PDF 数学字体常产生不成对代理字符（U+D800-DFFF），无法编码须剔除
+            text = re.sub(r"[\ud800-\udfff]", "", text)
+            if text:
+                pages.append((f"{p.stem}·P{i}", text))
+    except Exception:
+        return []
+    try:
+        cache.parent.mkdir(exist_ok=True)
+        cache.write_text(json.dumps(pages, ensure_ascii=False),
+                         encoding="utf-8")
+    except OSError:
+        pass
+    return pages
 
 
 class RAGIndex:
@@ -85,6 +127,10 @@ class RAGIndex:
             if not p.exists():
                 continue
             self._mtimes[str(p)] = p.stat().st_mtime
+            if p.suffix.lower() == ".pdf":
+                for label, page_text in _read_pdf_pages(p):
+                    self._chunks.extend(_split_chunks(page_text, label))
+                continue
             try:
                 text = p.read_text(encoding="utf-8", errors="replace")
             except OSError:

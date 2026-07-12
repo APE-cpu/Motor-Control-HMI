@@ -180,6 +180,7 @@ class AIPage(QWidget):
         self._chk_rag.setToolTip(
             "发送前用 BM25 从本地知识库检索相关片段注入提示词，让回答有据可依。\n"
             "知识库 = 项目自带文档（README/使用说明书/软件介绍）+ knowledge/ 目录\n"
+            "（支持 md/txt/pdf——PDF 教材/论文自动提取文本并按页码标注出处）\n"
             "+ reports/ 目录的历史实验报告（AI 因此记得之前的实验结果与异常）。")
         btn_add_doc = QPushButton("添加文档…")
         btn_add_doc.setToolTip(f"把 md/txt 资料复制到知识库目录：\n{_KNOWLEDGE_DIR}")
@@ -202,6 +203,7 @@ class AIPage(QWidget):
         paths = [base / name for name in _BUILTIN_DOCS]
         paths += sorted(_KNOWLEDGE_DIR.glob("*.md"))
         paths += sorted(_KNOWLEDGE_DIR.glob("*.txt"))
+        paths += sorted(_KNOWLEDGE_DIR.glob("*.pdf"))   # 教材/论文，需 pypdf
         # 历史实验报告自动入库：模型因此记得之前的实验结果与异常
         paths += sorted(_REPORT_DIR.glob("*.md"))
         return [p for p in paths if p.exists() and p.name != ".keep"]
@@ -218,7 +220,7 @@ class AIPage(QWidget):
 
     def _on_add_docs(self) -> None:
         files, _ = QFileDialog.getOpenFileNames(
-            self, "添加知识文档", "", "文档 (*.md *.txt)")
+            self, "添加知识文档", "", "文档 (*.md *.txt *.pdf)")
         for src in files:
             try:
                 shutil.copy2(src, _KNOWLEDGE_DIR / Path(src).name)
