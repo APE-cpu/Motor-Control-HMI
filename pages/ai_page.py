@@ -204,11 +204,15 @@ class AIPage(QWidget):
         btn_add_doc.clicked.connect(self._on_add_docs)
         btn_rebuild = QPushButton("重建索引")
         btn_rebuild.clicked.connect(self._on_rebuild_index)
+        btn_help = QPushButton("工作原理")
+        btn_help.setToolTip("RAG 检索增强生成的完整工作流程说明")
+        btn_help.clicked.connect(self._on_rag_help)
         self._rag_status = QLabel("知识库未索引（首次提问时自动构建）")
         self._rag_status.setStyleSheet("color: #90a4ae;")
         h3.addWidget(self._chk_rag)
         h3.addWidget(btn_add_doc)
         h3.addWidget(btn_rebuild)
+        h3.addWidget(btn_help)
         h3.addWidget(self._rag_status, 1)
         v.addLayout(h3)
         return box
@@ -267,6 +271,10 @@ class AIPage(QWidget):
     def _on_rebuild_index(self) -> None:
         self._rag_index = None
         self._ensure_rag_index()
+
+    def _on_rag_help(self) -> None:
+        from widgets.rag_help_dialog import RAGHelpDialog
+        RAGHelpDialog(self).exec()
 
     # -------- 配置持久化 --------
     def _load_config(self) -> None:
