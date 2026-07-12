@@ -19,7 +19,7 @@ exit /b 1
 
 :lite
 set BUILD_NAME=motor-control-hmi-lite
-set ENTRY=main_dist.py
+set ENTRY=main.py
 set MODE=lite
 goto :build
 
@@ -31,6 +31,21 @@ goto :build
 
 :build
 echo.
+echo [0/3] Checking version consistency (APP_VERSION vs git tag)...
+set APP_VERSION=
+for /f "tokens=3" %%v in ('findstr /b /c:"APP_VERSION" main_window.py') do set APP_VERSION=%%~v
+set GIT_TAG=
+for /f "delims=" %%t in ('git describe --tags --abbrev=0 2^>nul') do set GIT_TAG=%%t
+echo   APP_VERSION = v%APP_VERSION%   latest git tag = %GIT_TAG%
+if "v%APP_VERSION%"=="%GIT_TAG%" goto :version_ok
+echo   [!] Version mismatch: window title shows v%APP_VERSION% but latest git tag is %GIT_TAG%.
+echo       Update APP_VERSION in main_window.py or create the tag before a release build.
+set /p cont=Continue anyway (y/N)?
+if /i "%cont%"=="y" goto :version_ok
+exit /b 1
+:version_ok
+set BUILD_NAME=%BUILD_NAME%-v%APP_VERSION%
+
 echo [1/3] Installing PyInstaller...
 python -m pip install pyinstaller
 if errorlevel 1 goto :error

@@ -24,6 +24,9 @@ from logs.operation_logger import logger
 from training.trainer import Trainer
 from training.drl_trainer import DRLTrainer
 
+from .model_panels import DRLPanel, MODEL_PANELS, ModelPanel
+from .model_struct import describe_model
+
 try:
     import pyqtgraph as pg
     _PG_OK = True
@@ -37,7 +40,7 @@ _FEATURE_NAMES = [
     "angle_actual", "temperature",
 ]
 
-_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "training", "data")
+_DATA_DIR = os.path.join(os.path.dirname(__file__), "..", "..", "training", "data")
 
 
 def _frame_to_row(f: TelemetryFrame) -> list:
@@ -45,161 +48,6 @@ def _frame_to_row(f: TelemetryFrame) -> list:
             f.current_actual, f.current_target,
             f.torque_actual, f.torque_target,
             f.angle_actual, f.temperature]
-
-
-# ──────────────────────────────────────────────────────────────
-# 各模型对应的超参数面板
-# ──────────────────────────────────────────────────────────────
-class _ModelPanel(QWidget):
-    def values(self) -> dict:
-        raise NotImplementedError
-
-
-class _MLPPanel(_ModelPanel):
-    def __init__(self) -> None:
-        super().__init__()
-        f = QFormLayout(self)
-        self.hidden = QSpinBox(); self.hidden.setRange(4, 1024); self.hidden.setValue(64)
-        self.layers = QSpinBox(); self.layers.setRange(1, 10); self.layers.setValue(2)
-        self.dropout = QDoubleSpinBox(); self.dropout.setRange(0, 0.9); self.dropout.setSingleStep(0.05); self.dropout.setValue(0.0)
-        f.addRow("隐藏层维度", self.hidden)
-        f.addRow("隐藏层数", self.layers)
-        f.addRow("Dropout", self.dropout)
-
-    def values(self) -> dict:
-        return {"hidden_size": self.hidden.value(),
-                "num_layers": self.layers.value(),
-                "dropout": self.dropout.value()}
-
-
-class _CNNPanel(_ModelPanel):
-    def __init__(self) -> None:
-        super().__init__()
-        f = QFormLayout(self)
-        self.channels = QSpinBox(); self.channels.setRange(4, 256); self.channels.setValue(16)
-        self.kernel = QSpinBox(); self.kernel.setRange(1, 7); self.kernel.setSingleStep(2); self.kernel.setValue(3)
-        self.dropout = QDoubleSpinBox(); self.dropout.setRange(0, 0.9); self.dropout.setSingleStep(0.05); self.dropout.setValue(0.0)
-        f.addRow("通道数", self.channels)
-        f.addRow("卷积核大小", self.kernel)
-        f.addRow("Dropout", self.dropout)
-
-    def values(self) -> dict:
-        return {"hidden_size": self.channels.value(),
-                "kernel_size": self.kernel.value(),
-                "dropout": self.dropout.value()}
-
-
-class _LSTMPanel(_ModelPanel):
-    def __init__(self) -> None:
-        super().__init__()
-        f = QFormLayout(self)
-        self.hidden = QSpinBox(); self.hidden.setRange(4, 512); self.hidden.setValue(32)
-        self.layers = QSpinBox(); self.layers.setRange(1, 6); self.layers.setValue(1)
-        self.dropout = QDoubleSpinBox(); self.dropout.setRange(0, 0.9); self.dropout.setSingleStep(0.05); self.dropout.setValue(0.0)
-        f.addRow("隐藏层维度", self.hidden)
-        f.addRow("LSTM 层数", self.layers)
-        f.addRow("Dropout", self.dropout)
-
-    def values(self) -> dict:
-        return {"hidden_size": self.hidden.value(),
-                "num_layers": self.layers.value(),
-                "dropout": self.dropout.value()}
-
-
-class _TransformerPanel(_ModelPanel):
-    def __init__(self) -> None:
-        super().__init__()
-        f = QFormLayout(self)
-        self.d_model = QSpinBox(); self.d_model.setRange(8, 512); self.d_model.setValue(32)
-        self.nhead = QSpinBox(); self.nhead.setRange(1, 16); self.nhead.setValue(4)
-        self.layers = QSpinBox(); self.layers.setRange(1, 12); self.layers.setValue(2)
-        self.dropout = QDoubleSpinBox(); self.dropout.setRange(0, 0.9); self.dropout.setSingleStep(0.05); self.dropout.setValue(0.0)
-        f.addRow("d_model", self.d_model)
-        f.addRow("注意力头数", self.nhead)
-        f.addRow("Encoder 层数", self.layers)
-        f.addRow("Dropout", self.dropout)
-
-    def values(self) -> dict:
-        return {"hidden_size": self.d_model.value(),
-                "nhead": self.nhead.value(),
-                "num_layers": self.layers.value(),
-                "dropout": self.dropout.value()}
-
-
-class _RFPanel(_ModelPanel):
-    def __init__(self) -> None:
-        super().__init__()
-        f = QFormLayout(self)
-        self.n_est = QSpinBox(); self.n_est.setRange(10, 1000); self.n_est.setValue(100)
-        self.max_depth = QSpinBox(); self.max_depth.setRange(0, 100); self.max_depth.setValue(10)
-        f.addRow("树数量 n_estimators", self.n_est)
-        f.addRow("最大深度 (0=不限)", self.max_depth)
-
-    def values(self) -> dict:
-        return {"n_estimators": self.n_est.value(),
-                "max_depth": self.max_depth.value()}
-
-
-class _SVMPanel(_ModelPanel):
-    def __init__(self) -> None:
-        super().__init__()
-        f = QFormLayout(self)
-        self.C = QDoubleSpinBox(); self.C.setRange(0.001, 1e4); self.C.setDecimals(3); self.C.setValue(1.0)
-        self.kernel = QComboBox(); self.kernel.addItems(["rbf", "linear", "poly", "sigmoid"])
-        self.gamma = QComboBox(); self.gamma.addItems(["scale", "auto"])
-        f.addRow("惩罚系数 C", self.C)
-        f.addRow("核函数", self.kernel)
-        f.addRow("gamma", self.gamma)
-
-    def values(self) -> dict:
-        return {"svm_C": self.C.value(),
-                "svm_kernel": self.kernel.currentText(),
-                "svm_gamma": self.gamma.currentText()}
-
-
-_MODEL_PANELS = {
-    "MLP (多层感知机)": _MLPPanel,
-    "1D-CNN (一维卷积)": _CNNPanel,
-    "LSTM (长短时记忆)": _LSTMPanel,
-    "Transformer": _TransformerPanel,
-    "随机森林 (Random Forest)": _RFPanel,
-    "支持向量机 (SVM)": _SVMPanel,
-}
-
-
-class _DRLPanel(_ModelPanel):
-    def __init__(self) -> None:
-        super().__init__()
-        f = QFormLayout(self)
-        self.algo = QComboBox(); self.algo.addItems(["PPO", "SAC", "TD3"])
-        self.aggregation = QComboBox(); self.aggregation.addItems(["无", "DAgger", "HG-DAgger"])
-        self.env_steps = QSpinBox(); self.env_steps.setRange(1000, 10_000_000); self.env_steps.setValue(100_000); self.env_steps.setSingleStep(10_000)
-        self.gamma = QDoubleSpinBox(); self.gamma.setRange(0.8, 0.9999); self.gamma.setDecimals(4); self.gamma.setValue(0.99)
-        self.actor_lr = QDoubleSpinBox(); self.actor_lr.setRange(1e-6, 1e-2); self.actor_lr.setDecimals(6); self.actor_lr.setValue(3e-4)
-        self.critic_lr = QDoubleSpinBox(); self.critic_lr.setRange(1e-6, 1e-2); self.critic_lr.setDecimals(6); self.critic_lr.setValue(3e-4)
-        self.hidden = QSpinBox(); self.hidden.setRange(32, 1024); self.hidden.setValue(256)
-        self.mpc_ref = QCheckBox("以MPC为参考策略"); self.mpc_ref.setChecked(True)
-        f.addRow("算法", self.algo)
-        f.addRow("数据集聚合", self.aggregation)
-        f.addRow("环境步数", self.env_steps)
-        f.addRow("折扣因子 γ", self.gamma)
-        f.addRow("Actor 学习率", self.actor_lr)
-        f.addRow("Critic 学习率", self.critic_lr)
-        f.addRow("隐藏层维度", self.hidden)
-        f.addRow("", self.mpc_ref)
-
-    def values(self) -> dict:
-        return {"algorithm": self.algo.currentText(),
-                "aggregation": self.aggregation.currentText(),
-                "env_steps": self.env_steps.value(),
-                "gamma": self.gamma.value(),
-                "actor_lr": self.actor_lr.value(),
-                "critic_lr": self.critic_lr.value(),
-                "hidden_size": self.hidden.value(),
-                "mpc_reference": self.mpc_ref.isChecked()}
-
-
-_MODEL_PANELS["深度强化学习(DRL)"] = _DRLPanel
 
 
 class TrainingPage(QWidget):
@@ -310,7 +158,7 @@ class TrainingPage(QWidget):
     def _build_drl_tab(self) -> QWidget:
         w = QWidget()
         v = QVBoxLayout(w)
-        self._drl_panel = _DRLPanel()
+        self._drl_panel = DRLPanel()
         v.addWidget(self._drl_panel)
 
         # MPC 专家信息面板（勾选 mpc_reference 时显示）
@@ -377,9 +225,9 @@ class TrainingPage(QWidget):
         h.addLayout(left, 0)
 
         self._model_stack = QStackedWidget()
-        self._model_panels: dict[str, _ModelPanel] = {}
+        self._model_panels: dict[str, ModelPanel] = {}
         for name in _FAULT_MODELS:
-            panel = _MODEL_PANELS[name]()
+            panel = MODEL_PANELS[name]()
             self._model_panels[name] = panel
             self._model_stack.addWidget(panel)
         h.addWidget(self._model_stack, 1)
@@ -683,53 +531,14 @@ class TrainingPage(QWidget):
 
     def _show_model_structure(self) -> None:
         name = self._model_combo.currentText()
-        hp = self._model_panels[name].values()
-        lines = [f"模型：{name}", ""]
-        if name.startswith(("随机森林", "支持向量机")):
-            lines.append("（scikit-learn 模型，无神经网络层结构）")
-            for k, v in hp.items():
-                lines.append(f"  {k} = {v}")
-        else:
-            try:
-                import torch.nn as nn
-                from training.trainer import _build_torch_model
-                model = _build_torch_model(name, hp)
-                total = 0
-                # 按层分组：把同一层的 weight/bias 合并为一行
-                layer_params: dict[str, dict] = {}
-                for pname, p in model.named_parameters():
-                    parts = pname.rsplit(".", 1)
-                    layer = parts[0] if len(parts) == 2 else pname
-                    kind = parts[1] if len(parts) == 2 else "param"
-                    layer_params.setdefault(layer, {})[kind] = p
-                    total += p.numel()
-                # 找出对应的 nn.Module 类型
-                named_mods = {n: m for n, m in model.named_modules() if n}
-                for layer, params in layer_params.items():
-                    mod = named_mods.get(layer)
-                    mod_type = type(mod).__name__ if mod else "Layer"
-                    w = params.get("weight")
-                    b = params.get("bias")
-                    if w is not None:
-                        in_f = w.shape[1] if w.dim() > 1 else w.shape[0]
-                        out_f = w.shape[0]
-                        w_cnt = w.numel()
-                        b_cnt = b.numel() if b is not None else 0
-                        shape_str = f"[{in_f} → {out_f}]"
-                        param_str = f"{w_cnt:,} + {b_cnt:,} = {w_cnt+b_cnt:,} 参数" if b is not None else f"{w_cnt:,} 参数"
-                        lines.append(f"  {mod_type:15s}  {shape_str:15s}  {param_str}")
-                    else:
-                        for k, p in params.items():
-                            lines.append(f"  {layer}.{k:30s}  {str(list(p.shape)):15s}  {p.numel():,} 参数")
-                lines += ["", f"总参数量：{total:,}"]
-            except Exception as e:
-                lines.append(f"（无法加载模型：{e}）")
+        lines = describe_model(name, self._model_panels[name].values())
         win = QWidget(None, Qt.Window)
         win.setWindowTitle(f"模型结构 — {name}")
         win.resize(500, 350)
-        from PySide6.QtWidgets import QPlainTextEdit as _PTE, QVBoxLayout as _VL
-        txt = _PTE(win); txt.setReadOnly(True); txt.setPlainText("\n".join(lines))
-        _VL(win).addWidget(txt)
+        txt = QPlainTextEdit(win)
+        txt.setReadOnly(True)
+        txt.setPlainText("\n".join(lines))
+        QVBoxLayout(win).addWidget(txt)
         win.show()
         self._struct_win = win
 
@@ -774,4 +583,3 @@ class TrainingPage(QWidget):
             self._mpc_dataset_label.setText(f"回放缓冲区：{n} 条（已从文件加载）")
         except Exception as e:
             QMessageBox.warning(self, "导入失败", str(e))
-

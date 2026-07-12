@@ -1,0 +1,5 @@
+# 模型训练页额外依赖（对应 full 打包）：pip install -r requirements-train.txt
+-r requirements.txt
+torch>=2.0
+scikit-learn>=1.2
+onnx>=1.14
