@@ -67,7 +67,6 @@ if "%MODE%"=="lite" (
       --name "%BUILD_NAME%" ^
       --add-data "config/style.qss;config" ^
       --add-data "motor_anomaly.onnx;." ^
-      --add-data "motor_anomaly.onnx.data;." ^
       %ZLG_DLL% ^
       %ZLG_ZCAN% ^
       --exclude-module torch ^
@@ -86,7 +85,6 @@ if "%MODE%"=="lite" (
       --name "%BUILD_NAME%" ^
       --add-data "config/style.qss;config" ^
       --add-data "motor_anomaly.onnx;." ^
-      --add-data "motor_anomaly.onnx.data;." ^
       --collect-data rapidocr_onnxruntime ^
       %ZLG_DLL% ^
       %ZLG_ZCAN% ^
