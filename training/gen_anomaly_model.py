@@ -28,10 +28,41 @@ CUR_FAULT, CUR_WARN = 7.0, 5.0
 SCALE = [3000.0, 3000.0, 10.0, 10.0, 5.0, 5.0, 360.0, 100.0]
 
 
-def _label(cur: float, temp: float) -> float:
-    if temp >= TEMP_FAULT or abs(cur) >= CUR_FAULT:
+# “已达速/稳态”判定：转速差同时小于固定值和目标的百分比才算达速。
+# 只有达速后的大电流才是过载故障；加速中(转速差大)或超调(实际≥目标)
+# 的大电流都是正常启动动态，不应误判。
+SETTLED_RPM_ABS = 120.0     # 转速差绝对下限
+SETTLED_RPM_PCT = 0.08      # 转速差占目标的比例下限
+
+
+def _settled(spd_act: float, spd_tgt: float) -> bool:
+    """电机是否已稳定在目标转速（可判过载的前提）。
+
+    实际转速≥目标（超调）一定不是稳态过载——超调是启动动态；
+    否则要求转速差同时小于绝对阈值和目标百分比阈值才算达速。
+    """
+    tgt, act = abs(spd_tgt), abs(spd_act)
+    if act >= tgt:                       # 超调：启动动态，非稳态过载
+        return False
+    gap = tgt - act
+    return gap <= max(SETTLED_RPM_ABS, SETTLED_RPM_PCT * tgt)
+
+
+def _label(cur: float, temp: float, spd_act: float = 0.0,
+           spd_tgt: float = 0.0) -> float:
+    """故障判据（仅用模型可见信号：温度、电流、转速差）：
+
+    过温任何时候都算故障；过流只有在“已达速稳态”时才算过载故障——
+    加速中或超调阶段的大电流是正常启动限流，不应误判。
+    """
+    settled = _settled(spd_act, spd_tgt)
+    if temp >= TEMP_FAULT:
         return 1.0
-    if temp >= TEMP_WARN or abs(cur) >= CUR_WARN:
+    if settled and abs(cur) >= CUR_FAULT:
+        return 1.0
+    if temp >= TEMP_WARN:
+        return 0.5
+    if settled and abs(cur) >= CUR_WARN:
         return 0.5
     return 0.0
 
@@ -51,11 +82,18 @@ def _feat(sim: MotorSim, temp: float, noise: bool = True) -> list:
 
 
 def generate(seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
-    """扫 转速×负载×温度 网格，每工况取多帧含噪样本。"""
+    """对每个 (转速, 负载) 跑完整"从零启动→加速→稳态"轨迹，逐帧采样。
+
+    这样电流与转速差在每一帧都是物理上真实配对的：启动阶段(转速差大)
+    自然伴随大电流、稳态(转速差≈0)电流回落。模型据此学到
+    "转速差大+大电流=正常启动"、"转速差≈0+大电流=过载故障"的联合判据，
+    而不是简单的"大电流=故障"。温度作为独立维度叠加，覆盖过温故障。
+    """
     random.seed(seed)
     speeds = list(range(300, 3300, 300))
     loads = [0.0, 0.1, 0.2, 0.3, 0.45, 0.6]
-    temps = [30, 45, 58, 68, 78, 88, 100, 110]
+    # 逐帧轨迹自带温度基线，这里额外抽几档温度让每帧覆盖冷机~过温
+    temps = [25, 40, 55, 68, 78, 88, 100, 110]
     X, y = [], []
     sim = MotorSim(PMSMParams())
     for spd in speeds:
@@ -63,13 +101,15 @@ def generate(seed: int = 42) -> tuple[np.ndarray, np.ndarray]:
             sim.reset()
             sim.start(float(spd))
             sim.set_load(load)
-            sim.step(3.0)                # 电气/机械稳态
-            cur = sim.i_q
-            for temp in temps:
-                for _ in range(4):       # 每点几帧含噪
+            # 完整轨迹 4s @ 0.1s = 40 帧：前段加速大电流、后段稳态
+            for k in range(40):
+                sim.step(0.1)
+                # 每帧在若干温度档上各生成一条样本（温度不影响电/机状态，
+                # 是独立叠加的热维度），让"启动大电流×各温度"组合都被覆盖
+                for temp in temps:
                     row = _feat(sim, float(temp))
                     X.append(row)
-                    y.append(_label(row[2], row[7]))
+                    y.append(_label(row[2], row[7], row[0], row[1]))
     return np.array(X, dtype=np.float32), np.array(y, dtype=np.float32)
 
 
@@ -131,6 +171,33 @@ def evaluate(model: ScaledMLP, X: np.ndarray, y: np.ndarray) -> None:
         if m.any():
             print(f"    {name}(真值{lv}) 预测均值 {pred[m].mean():.3f} "
                   f"(n={int(m.sum())})")
+
+
+def evaluate_trajectory(model: ScaledMLP) -> None:
+    """跑真实启动轨迹逐帧检查——这才是运行时 edge_ai 实际看到的输入。
+
+    冷机正常启动到 1500rpm：加速段大电流应判正常，稳态低电流应判正常，
+    全程不应出现"异常"。这是复现用户误报场景的直接检验。
+    """
+    model.eval()
+    sim = MotorSim(PMSMParams())
+    sim.reset()
+    sim.start(1500.0)
+    sim.set_load(0.15)          # 轻载正常启动
+    print("  冷机正常启动到 1500rpm（温度 25°C），逐帧判定：")
+    worst = 0.0
+    for k in range(30):
+        sim.step(0.1)
+        row = _feat(sim, 25.0, noise=False)
+        with torch.no_grad():
+            s = float(model(torch.tensor([row], dtype=torch.float32)))
+        worst = max(worst, s)
+        if k % 3 == 0 or s >= 0.6:
+            tag = "正常" if s < 0.3 else ("警告" if s < 0.6 else "★异常")
+            print(f"    t={k*0.1:.1f}s  转速={row[0]:6.0f}  "
+                  f"电流={row[2]:5.2f}A  分数={s:.3f}  {tag}")
+    print(f"  → 启动全程最高分数 {worst:.3f}"
+          f"（{'✓ 无误报' if worst < 0.6 else '✗ 仍有误报'}）")
 
 
 def export(model: ScaledMLP, path: str) -> None:
