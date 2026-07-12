@@ -1,8 +1,8 @@
 """电机控制页面：电机信息、位置传感器、控制方式、参数面板、控制按钮。"""
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
-    QComboBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QSpinBox,
+    QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QLineEdit, QMessageBox, QPushButton, QSpinBox,
     QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -216,8 +216,102 @@ class ControlPage(QWidget):
         self._target_speed.setRange(-100000, 100000)
         self._target_speed.setValue(1500)
 
+        v.addWidget(self._build_load_box())
         v.addStretch(1)
         return box
+
+    def _build_load_box(self) -> QGroupBox:
+        """负载与机械：负载类型 + B/Tc/J，可应用到数字孪生（仿真下真实生效）。"""
+        box = QGroupBox("负载与机械")
+        f = QFormLayout(box)
+        sp = self._comm.motor_sim_params()
+
+        self._load_type = QComboBox()
+        self._load_type.addItems([
+            "空载", "恒转矩负载", "风机/泵类 (∝ω²)", "对拖系统 (可正负/回馈)"])
+        self._load_type.currentIndexChanged.connect(self._on_load_type_changed)
+        self._load_value = QDoubleSpinBox()
+        self._load_value.setRange(-100.0, 100.0)
+        self._load_value.setDecimals(3)
+        self._load_value.setSingleStep(0.05)
+        self._load_value.setValue(0.0)
+        self._load_value.setEnabled(False)     # 默认空载
+        self._load_value.setToolTip(
+            "恒转矩/对拖：负载转矩 N·m（对拖可为负=助力/回馈）；\n"
+            "风机泵类：额定转速下的负载系数（实际负载 ∝ 转速²）。")
+
+        self._visc_b = self._mech_spin(sp.B, 6, 0.0005)
+        self._coulomb = self._mech_spin(sp.T_coulomb, 4, 0.01)
+        self._inertia = self._mech_spin(sp.J, 6, 0.0005)
+
+        f.addRow("负载类型", self._load_type)
+        f.addRow("负载转矩/系数", self._load_value)
+        f.addRow("粘滞摩擦 B (N·m·s/rad)", self._visc_b)
+        f.addRow("库仑摩擦 Tc (N·m)", self._coulomb)
+        f.addRow("转动惯量 J (kg·m²)", self._inertia)
+
+        btn_apply = QPushButton("应用到数字孪生")
+        btn_apply.setToolTip("把负载与机械参数写入虚拟电机（仿真运行时立即生效）")
+        btn_apply.clicked.connect(self._on_apply_mechanical)
+        f.addRow("", btn_apply)
+        self._mech_status = QLabel("提示：仿真运行时生效；真机需外接测功机加载")
+        self._mech_status.setWordWrap(True)
+        self._mech_status.setStyleSheet("color: #8fa3b8;")
+        f.addRow(self._mech_status)
+        return box
+
+    @staticmethod
+    def _mech_spin(val: float, decimals: int, step: float) -> QDoubleSpinBox:
+        sp = QDoubleSpinBox()
+        sp.setRange(0.0, 1e4)
+        sp.setDecimals(decimals)
+        sp.setSingleStep(step)
+        sp.setValue(val)
+        return sp
+
+    def _on_load_type_changed(self, idx: int) -> None:
+        self._load_value.setEnabled(idx != 0)   # 空载禁用数值
+        if self.is_sim_running():
+            self._apply_load_to_sim()
+
+    def is_sim_running(self) -> bool:
+        return self._comm.is_sim_running()
+
+    @staticmethod
+    def _compute_load(load_type_idx: int, value: float, rpm: float) -> float:
+        """按负载类型与当前转速算外部负载转矩 N·m。"""
+        if load_type_idx == 0:        # 空载
+            return 0.0
+        if load_type_idx == 2:        # 风机/泵：∝ω²，value=1000rpm 处负载
+            return value * (rpm / 1000.0) ** 2
+        return value                  # 恒转矩 / 对拖（常量，对拖可负）
+
+    def _apply_load_to_sim(self) -> None:
+        if not self.is_sim_running():
+            return
+        load = self._compute_load(self._load_type.currentIndex(),
+                                  self._load_value.value(),
+                                  abs(self._latest_speed()))
+        self._comm.set_sim_load(load)
+
+    def _latest_speed(self) -> float:
+        return getattr(self, "_last_speed_rpm", 0.0)
+
+    def _on_apply_mechanical(self) -> None:
+        sp = self._comm.motor_sim_params()
+        sp.B = self._visc_b.value()
+        sp.T_coulomb = self._coulomb.value()
+        sp.J = self._inertia.value()
+        self._apply_load_to_sim()
+        where = "已写入数字孪生（仿真生效）" if self.is_sim_running() else \
+            "已保存（仿真启动后生效；真机需外接测功机）"
+        self._mech_status.setText(
+            f"{self._load_type.currentText()}：负载 "
+            f"{self._compute_load(self._load_type.currentIndex(), self._load_value.value(), 1000):.3f} N·m"
+            f"@1000rpm，B={sp.B:.4g} Tc={sp.T_coulomb:.4g} J={sp.J:.4g}——{where}")
+        logger.log("应用负载与机械",
+                   f"类型={self._load_type.currentText()} 值={self._load_value.value()} "
+                   f"B={sp.B} Tc={sp.T_coulomb} J={sp.J}")
 
     def _build_param_box(self) -> QGroupBox:
         box = QGroupBox("控制参数调整")
@@ -459,3 +553,8 @@ class ControlPage(QWidget):
 
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._temp_label.set_temperature(frame.temperature)
+        self._last_speed_rpm = frame.speed_actual
+        # 风机/泵类负载随转速平方实时变化，需逐帧刷新
+        if (self.is_sim_running() and hasattr(self, "_load_type")
+                and self._load_type.currentIndex() == 2):
+            self._apply_load_to_sim()
