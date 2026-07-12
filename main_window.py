@@ -21,11 +21,13 @@ from widgets.side_nav import SideNav
 from communications.comm_manager import CommManager
 from logs.operation_logger import logger
 
+APP_VERSION = "1.4.0"
+
 
 class MainWindow(QMainWindow):
     def __init__(self, enable_training: bool = True) -> None:
         super().__init__()
-        self.setWindowTitle("电机控制上位机 v1.0")
+        self.setWindowTitle(f"电机控制上位机 v{APP_VERSION}")
         self.resize(1280, 800)
 
         # 通信管理器：所有页面共享同一个通信会话

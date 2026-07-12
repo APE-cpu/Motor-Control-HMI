@@ -185,8 +185,11 @@ AI 异常检测与边缘 AI 推理的全流程开发与调试需求。
 ## 六、安装与运行
 
 ```bash
-# 安装依赖（Python 3.10+）
+# 安装运行依赖（Python 3.10+）
 pip install -r requirements.txt
+
+# 如需使用模型训练页，再装训练依赖（含 torch，体积较大）
+pip install -r requirements-train.txt
 
 # 启动
 python main.py
@@ -269,3 +272,10 @@ ONNX 导出仅支持 PyTorch 模型（MLP / CNN / LSTM / Transformer）。
   zlgcan.dll（ZCAN_*）两套 CAN 后端，修复 CAN 接收日志乱码；下位机协议移植包
 - **v1.3**：数字孪生 L1 虚拟电机、电机参数辨识（B/Tc/J）、矢量可视化
   （电流圆/磁链圆）、AI 图片理解（波形截图诊断）、操作日志模块化
+- **v1.4**：AI 能力升级——RAG 知识库增强（BM25 本地检索，项目文档 +
+  knowledge/ 资料 + 历史实验报告自动入库）、流式输出、AI 实验报告生成
+  （参数辨识/运行实验一键成文，Markdown 存档）；控制页增强——PI 转速/
+  电流双环参数分离、MPC 替代环节选择、全部控制方式数学模型与参数说明、
+  电机详情（额定/实测/描述持久化）、传感器详情与在线自检；工程化——
+  pytest 测试套件（39 用例）、单入口打包、依赖拆分、训练页拆包、
+  版本号与 git tag 联动校验
