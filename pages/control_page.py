@@ -254,6 +254,51 @@ class ControlPage(QWidget):
         btn_apply.setToolTip("把负载与机械参数写入虚拟电机（仿真运行时立即生效）")
         btn_apply.clicked.connect(self._on_apply_mechanical)
         f.addRow("", btn_apply)
+
+        # ---- 负载扰动：让运行曲线更丰富 ----
+        self._disturb_amp = QDoubleSpinBox()
+        self._disturb_amp.setRange(0.01, 100.0)
+        self._disturb_amp.setDecimals(3)
+        self._disturb_amp.setSingleStep(0.05)
+        self._disturb_amp.setValue(0.3)
+        self._disturb_amp.setToolTip("扰动幅值 N·m：叠加在当前负载之上的转矩变化量")
+        self._disturb_dur = QDoubleSpinBox()
+        self._disturb_dur.setRange(0.1, 60.0)
+        self._disturb_dur.setDecimals(1)
+        self._disturb_dur.setSingleStep(0.5)
+        self._disturb_dur.setValue(1.0)
+        self._disturb_dur.setToolTip("突加/突卸持续时间 s：到时自动撤除")
+        self._disturb_period = QDoubleSpinBox()
+        self._disturb_period.setRange(0.2, 60.0)
+        self._disturb_period.setDecimals(1)
+        self._disturb_period.setSingleStep(0.5)
+        self._disturb_period.setValue(2.0)
+        self._disturb_period.setToolTip("周期扰动的方波周期 s")
+        f.addRow("扰动幅值 (N·m)", self._disturb_amp)
+
+        db = QHBoxLayout()
+        self._btn_pulse_add = QPushButton("突加负载")
+        self._btn_pulse_add.setToolTip("在当前负载上瞬间叠加 +幅值，持续设定秒数后撤除")
+        self._btn_pulse_add.clicked.connect(lambda: self._on_pulse(+1))
+        self._btn_pulse_shed = QPushButton("突卸负载")
+        self._btn_pulse_shed.setToolTip("瞬间叠加 −幅值（减载/助力），持续设定秒数后恢复")
+        self._btn_pulse_shed.clicked.connect(lambda: self._on_pulse(-1))
+        db.addWidget(self._btn_pulse_add)
+        db.addWidget(self._btn_pulse_shed)
+        db.addWidget(QLabel("持续(s)"))
+        db.addWidget(self._disturb_dur)
+        f.addRow("一次性扰动", db)
+
+        pb = QHBoxLayout()
+        self._btn_disturb = QPushButton("开启周期扰动")
+        self._btn_disturb.setCheckable(True)
+        self._btn_disturb.setToolTip("周期方波负载：在 ±幅值间来回突变，持续激励，曲线一直起伏")
+        self._btn_disturb.toggled.connect(self._on_toggle_disturb)
+        pb.addWidget(self._btn_disturb)
+        pb.addWidget(QLabel("周期(s)"))
+        pb.addWidget(self._disturb_period)
+        f.addRow("周期扰动", pb)
+
         self._mech_status = QLabel("提示：仿真运行时生效；真机需外接测功机加载")
         self._mech_status.setWordWrap(True)
         self._mech_status.setStyleSheet("color: #8fa3b8;")
@@ -312,6 +357,39 @@ class ControlPage(QWidget):
         logger.log("应用负载与机械",
                    f"类型={self._load_type.currentText()} 值={self._load_value.value()} "
                    f"B={sp.B} Tc={sp.T_coulomb} J={sp.J}")
+
+    def _on_pulse(self, sign: int) -> None:
+        """突加(+1)/突卸(-1)负载：一次性阶跃扰动。"""
+        if not self.is_sim_running():
+            self._mech_status.setText("负载扰动仅在仿真运行时有效，请先启动仿真")
+            return
+        amp = sign * self._disturb_amp.value()
+        dur = self._disturb_dur.value()
+        self._comm.pulse_sim_load(amp, dur)
+        kind = "突加" if sign > 0 else "突卸"
+        self._mech_status.setText(
+            f"{kind}负载 {abs(amp):.3f} N·m，持续 {dur:.1f}s——观察转速跌落与恢复")
+        logger.log("负载扰动", f"{kind} {amp:+.3f}N·m {dur:.1f}s")
+
+    def _on_toggle_disturb(self, on: bool) -> None:
+        """开/关周期方波负载扰动。"""
+        if on and not self.is_sim_running():
+            self._btn_disturb.setChecked(False)
+            self._mech_status.setText("负载扰动仅在仿真运行时有效，请先启动仿真")
+            return
+        if on:
+            amp = self._disturb_amp.value()
+            period = self._disturb_period.value()
+            self._comm.set_sim_load_disturbance(amp, period)
+            self._btn_disturb.setText("停止周期扰动")
+            self._mech_status.setText(
+                f"周期扰动开启：±{amp:.3f} N·m 方波，周期 {period:.1f}s")
+            logger.log("负载扰动", f"周期方波 ±{amp:.3f}N·m 周期{period:.1f}s")
+        else:
+            self._comm.set_sim_load_disturbance(0.0, 0.0)
+            self._btn_disturb.setText("开启周期扰动")
+            self._mech_status.setText("周期扰动已停止")
+            logger.log("负载扰动", "周期方波停止")
 
     def _build_param_box(self) -> QGroupBox:
         box = QGroupBox("控制参数调整")

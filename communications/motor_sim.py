@@ -83,6 +83,12 @@ class MotorSim:
         self.speed_ref_rpm = 0.0
         self.iq_ref = 0.0
         self.load_ext = 0.0       # 外部负载转矩 N·m（测功机/扫频注入）
+        # 负载扰动：在 load_ext 之上叠加，用于突加/突卸测试与周期扰动
+        self._pulse_amp = 0.0     # 一次性阶跃扰动幅值 N·m
+        self._pulse_left = 0.0    # 一次性阶跃剩余时间 s（>0 时生效）
+        self._disturb_amp = 0.0   # 周期方波扰动幅值 N·m（0=关闭）
+        self._disturb_period = 0.0  # 周期方波周期 s
+        self._disturb_phase = 0.0   # 周期方波相位累加器 s
         self._int_spd = 0.0       # PI 积分器
         self._int_d = 0.0
         self._int_q = 0.0
@@ -97,6 +103,38 @@ class MotorSim:
     def set_load(self, torque_nm: float) -> None:
         """设置外部负载转矩（数字孪生 L2：模拟测功机加载）。"""
         self.load_ext = float(torque_nm)
+
+    def pulse_load(self, delta_nm: float, duration_s: float = 1.0) -> None:
+        """一次性负载阶跃：在 load_ext 之上叠加 delta_nm，持续 duration_s 秒后自动撤除。
+
+        经典的负载突加/突卸扰动测试——观察转速跌落深度与恢复时间，
+        直接反映控制器的抗扰能力。delta_nm 可正（突加）可负（突卸）。
+        """
+        self._pulse_amp = float(delta_nm)
+        self._pulse_left = max(0.0, float(duration_s))
+
+    def set_load_disturbance(self, amplitude_nm: float, period_s: float = 2.0) -> None:
+        """周期方波负载扰动：每半周期在 +/-amplitude 之间翻转，持续叠加。
+
+        让运行曲线保持丰富（转速/电流随扰动持续起伏）。amplitude=0 关闭。
+        """
+        self._disturb_amp = float(amplitude_nm)
+        self._disturb_period = max(0.0, float(period_s))
+        self._disturb_phase = 0.0
+
+    def _disturbance_torque(self, dt: float) -> float:
+        """计算当前帧的扰动转矩（一次性阶跃 + 周期方波之和），并推进计时器。"""
+        extra = 0.0
+        # 一次性阶跃
+        if self._pulse_left > 0.0:
+            extra += self._pulse_amp
+            self._pulse_left -= dt
+        # 周期方波：前半周期 +amp，后半周期 -amp
+        if self._disturb_amp != 0.0 and self._disturb_period > 0.0:
+            self._disturb_phase = (self._disturb_phase + dt) % self._disturb_period
+            extra += (self._disturb_amp if self._disturb_phase < self._disturb_period / 2.0
+                      else -self._disturb_amp)
+        return extra
 
     def stop(self) -> None:
         """封管停机：切断驱动，靠负载转矩自然滑行到零。"""
@@ -162,11 +200,14 @@ class MotorSim:
         te = 1.5 * p.pole_pairs * (p.psi_f * self.i_q
                                    + (p.Ld - p.Lq) * self.i_d * self.i_q)
         te += p.T_cogging * math.sin(6.0 * theta_e)
+        # 有效外部负载 = 恒定负载 + 扰动（阶跃/周期方波），带符号（正=阻转，负=助力/回馈）
+        load_eff = self.load_ext + self._disturbance_torque(dt)
         t_load = p.B * self.omega
         if abs(self.omega) > 0.5:
             t_load += math.copysign(p.T_coulomb, self.omega)
-            # 外部负载：转动时按转向阻转（测功机加载）
-            t_load += math.copysign(self.load_ext, self.omega)
+            # 外部负载按转向叠加：正值阻转（测功机加载），负值助力（对拖回馈）
+            spin = 1.0 if self.omega > 0.0 else -1.0
+            t_load += spin * load_eff
         elif not self.enabled:
             self.omega = 0.0     # 低速滑行时库仑摩擦直接锁死，避免过零抖动
         domega = (te - t_load) / p.J

@@ -169,6 +169,15 @@ class CommManager(QObject):
         """给虚拟电机注入外部负载转矩（扫频/测功机加载，仅仿真有效）。"""
         self._motor_sim.set_load(torque_nm)
 
+    def pulse_sim_load(self, delta_nm: float, duration_s: float = 1.0) -> None:
+        """一次性负载阶跃扰动（突加/突卸测试，仅仿真有效）。"""
+        self._motor_sim.pulse_load(delta_nm, duration_s)
+
+    def set_sim_load_disturbance(self, amplitude_nm: float,
+                                 period_s: float = 2.0) -> None:
+        """周期方波负载扰动（持续起伏，仅仿真有效）。amplitude=0 关闭。"""
+        self._motor_sim.set_load_disturbance(amplitude_nm, period_s)
+
     def motor_sim_trace(self) -> list:
         """取走虚拟电机的高速轨迹缓冲 [(θe, id, iq), ...]（1 kHz）。"""
         pts = list(self._motor_sim.trace)
