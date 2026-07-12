@@ -21,6 +21,7 @@ from config.config import CMD_START, CMD_STOP
 from controllers.param_identify import fit_inertia, solve_friction, torque_constant
 from logs.operation_logger import logger
 from widgets.report_dialog import ExperimentReportDialog
+from widgets.identify_help_dialog import IdentifyHelpDialog
 
 
 class IdentifyPage(QWidget):
@@ -67,10 +68,14 @@ class IdentifyPage(QWidget):
         self._btn_report.setEnabled(False)
         self._btn_report.setToolTip("实验完成后，由 AI 生成格式化实验报告（可保存 Markdown）")
         self._btn_report.clicked.connect(self._on_report)
+        self._btn_help = QPushButton("算法说明")
+        self._btn_help.setToolTip("辨识用到的物理模型与最小二乘拟合原理")
+        self._btn_help.clicked.connect(self._on_help)
         self._status = QLabel("就绪（请先启动仿真或连接真机）")
         h.addWidget(self._btn_run)
         h.addWidget(self._btn_apply)
         h.addWidget(self._btn_report)
+        h.addWidget(self._btn_help)
         h.addWidget(self._status, 1)
         root.addLayout(h)
 
@@ -211,6 +216,9 @@ class IdentifyPage(QWidget):
         ctx = (getattr(self, "_report_ctx_head", "")
                + "\n实验数据与结果：\n" + self._report.toPlainText())
         ExperimentReportDialog("参数辨识实验", ctx, parent=self).exec()
+
+    def _on_help(self) -> None:
+        IdentifyHelpDialog(parent=self).exec()
 
     def _on_apply(self) -> None:
         if not self._result:
