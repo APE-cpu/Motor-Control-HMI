@@ -6,8 +6,8 @@ echo ============================================
 echo   Motor Control HMI - Build Tool
 echo ============================================
 echo.
-echo [1] Lite version  (no training, ~50MB)
-echo [2] Full version  (with training+DRL, ~500MB+)
+echo [1] Lite version  (no training, no scanned-PDF OCR, smaller)
+echo [2] Full version  (training+DRL + scanned-PDF OCR, ~500MB+)
 echo.
 set /p choice=Enter option (1 or 2):
 
@@ -76,13 +76,18 @@ if "%MODE%"=="lite" (
       --exclude-module sklearn ^
       --exclude-module scikit-learn ^
       --exclude-module onnx ^
+      --exclude-module rapidocr_onnxruntime ^
+      --exclude-module cv2 ^
       %ENTRY%
 ) else (
+    rem --collect-data: rapidocr 的 ONNX 模型/配置是包内数据文件，
+    rem PyInstaller 默认不收，缺了它 exe 里扫描版 PDF OCR 会静默失效
     pyinstaller --noconfirm --clean --onefile --windowed ^
       --name "%BUILD_NAME%" ^
       --add-data "config/style.qss;config" ^
       --add-data "motor_anomaly.onnx;." ^
       --add-data "motor_anomaly.onnx.data;." ^
+      --collect-data rapidocr_onnxruntime ^
       %ZLG_DLL% ^
       %ZLG_ZCAN% ^
       %ENTRY%
