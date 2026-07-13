@@ -17,7 +17,8 @@ class SideNav(QListWidget):
     def __init__(self, sections: List[Tuple[str, List[Tuple[str, int]]]]) -> None:
         super().__init__()
         self.setObjectName("SideNav")
-        self.setFixedWidth(170)
+        self.setMinimumWidth(130)
+        self.setMaximumWidth(170)
         self.setFocusPolicy(Qt.NoFocus)
         for title, entries in sections:
             header = QListWidgetItem(title)

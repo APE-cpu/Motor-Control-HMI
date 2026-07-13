@@ -37,7 +37,8 @@ class TCPComm(BaseComm):
     def send(self, data: bytes, **_) -> int:
         if not self.is_open():
             raise RuntimeError("TCP未连接")
-        return self._conn.send(data)
+        self._conn.sendall(data)
+        return len(data)
 
     def recv(self, size: int = 64, timeout: Optional[float] = None) -> bytes:
         if not self.is_open():

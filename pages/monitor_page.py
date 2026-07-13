@@ -14,6 +14,8 @@ from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import encode_frame
 from config.config import CMD_START, MONITOR_REFRESH_MS
 from widgets.trend_curve import TrendCurve
+from widgets.temperature_label import TemperatureLabel
+from config.config import TEMP_HIGH_THRESHOLD, TEMP_NORMAL_THRESHOLD
 
 
 def _make_curve_panel(curve: TrendCurve, title: str) -> QWidget:
@@ -79,6 +81,44 @@ class _DataItem(QWidget):
         self._value.setText(f"{v:.2f} {self._unit}".strip())
 
 
+class _TemperaturePanel(QWidget):
+    """将实时温度与额定工作点放在同一语境中。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        layout = QGridLayout(self)
+        layout.setContentsMargins(4, 2, 4, 2)
+        self.actual = TemperatureLabel()
+        self.actual.setAlignment(Qt.AlignCenter)
+        self.actual.setStyleSheet("font-size: 22px; font-weight: 600;")
+        self.rated = QLabel("额定工作点：未设置")
+        self.delta = QLabel("与额定点偏差：—")
+        self.status = QLabel("状态：等待数据")
+        self.status.setAlignment(Qt.AlignCenter)
+        layout.addWidget(self.actual, 0, 0, 1, 2)
+        layout.addWidget(self.rated, 1, 0)
+        layout.addWidget(self.delta, 1, 1)
+        layout.addWidget(self.status, 2, 0, 1, 2)
+
+    def set_values(self, actual_c: float, rated_c: float = 0.0) -> None:
+        self.actual.set_temperature(actual_c)
+        if rated_c > 0.0:
+            self.rated.setText(f"额定工作点：{rated_c:.1f} °C")
+            delta = actual_c - rated_c
+            self.delta.setText(f"与额定点偏差：{delta:+.1f} °C")
+        else:
+            self.rated.setText("额定工作点：未设置")
+            self.delta.setText("与额定点偏差：—")
+        if actual_c >= TEMP_HIGH_THRESHOLD:
+            text, color = "高温：请检查负载与散热", "#ff5252"
+        elif actual_c >= TEMP_NORMAL_THRESHOLD:
+            text, color = "温度偏高", "#ffb74d"
+        else:
+            text, color = "温度正常", "#69f0ae"
+        self.status.setText("状态：" + text)
+        self.status.setStyleSheet(f"color: {color}; font-weight: 600;")
+
+
 class _AngleDial(QWidget):
     """机械角度表盘。
 
@@ -111,6 +151,11 @@ class _AngleDial(QWidget):
         self._last_feed = now
         self._true = angle_deg % 360.0
         self._rpm = rpm
+
+    def reset(self) -> None:
+        self._disp = self._true = self._rpm = self._revs = 0.0
+        self._last_feed = None
+        self.update()
 
     def _tick(self) -> None:
         if abs(self._rpm) < self.SLOW_RPM:
@@ -210,31 +255,42 @@ class MonitorPage(QWidget):
         btn_report.setToolTip("汇总本次运行的统计数据并附波形截图，由 AI 生成格式化实验报告")
         btn_report.clicked.connect(self._on_ai_report)
         title_row.addWidget(btn_report)
+        root.addLayout(title_row)
+
+        # 窄屏下将运行控制拆成独立一行，避免与标题/报告按钮互相挤压。
+        control_row = QHBoxLayout()
         self._btn_start = QPushButton("启动"); self._btn_start.setObjectName("PrimaryButton")
         self._btn_stop = QPushButton("停止")
         self._btn_emerg = QPushButton("紧急停止"); self._btn_emerg.setObjectName("EmergencyButton")
-        self._btn_sim = QPushButton("启动仿真")
+        self._btn_sim = QPushButton("启动仿真环境")
+        self._btn_quick_sim = QPushButton("快速仿真演示")
+        self._btn_quick_sim.setToolTip(
+            "仅用于无功率级数字孪生：自动建立仿真环境并启动电机；"
+            "正式实验请使用实验页预检。")
         self._btn_start.clicked.connect(self._on_start)
         self._btn_stop.clicked.connect(self._on_stop)
         self._btn_emerg.clicked.connect(self._on_emergency)
         self._btn_sim.clicked.connect(self._on_toggle_sim)
+        self._btn_quick_sim.clicked.connect(self._on_quick_sim)
         self._sim_running = False
         # 在线调速：运行中直接改目标转速，无需切换页面
-        title_row.addWidget(QLabel("目标转速"))
+        control_row.addWidget(QLabel("目标转速"))
         self._speed_spin = QSpinBox()
         self._speed_spin.setRange(0, 20000)
         self._speed_spin.setValue(1500)
         self._speed_spin.setSuffix(" rpm")
-        title_row.addWidget(self._speed_spin)
+        control_row.addWidget(self._speed_spin)
         # 目标转速全局唯一入口：控制页启动电机时读取的也是这个框
         if self._ctrl is not None:
             self._ctrl._target_speed = self._speed_spin
         btn_set_speed = QPushButton("设定")
         btn_set_speed.clicked.connect(self._on_set_speed)
-        title_row.addWidget(btn_set_speed)
-        for b in (self._btn_sim, self._btn_start, self._btn_stop, self._btn_emerg):
-            title_row.addWidget(b)
-        root.addLayout(title_row)
+        control_row.addWidget(btn_set_speed)
+        control_row.addStretch(1)
+        for b in (self._btn_sim, self._btn_quick_sim, self._btn_start,
+                  self._btn_stop, self._btn_emerg):
+            control_row.addWidget(b)
+        root.addLayout(control_row)
 
         # ---------- 实时数据：按物理量分类分框，2 行 × 3 框 ----------
         self._speed_actual = _DataItem("实际", "rpm")
@@ -244,8 +300,12 @@ class MonitorPage(QWidget):
         self._torque_actual = _DataItem("实际", "Nm")
         self._torque_target = _DataItem("给定", "Nm")
         self._angle_dial = _AngleDial()
-        self._angle_raw = _DataItem("原始/计数", "")
+        self._electrical_frequency = _DataItem("电频率", "Hz")
+        self._electrical_frequency.setToolTip(
+            "f_e = |转速| × 极对数 / 60。10 Hz遥测下电角度容易发生"
+            "采样混叠（频闪静止），因此主监控显示不混叠的电频率。")
         self._vdc_item = _DataItem("电压", "V")
+        self._temperature = _TemperaturePanel()
         self._bus_state = QLabel("状态：--")
         self._bus_state.setAlignment(Qt.AlignCenter)
 
@@ -266,7 +326,7 @@ class MonitorPage(QWidget):
         rt_grid.addWidget(_category_box("转矩", self._torque_actual,
                                         self._torque_target), 1, 0)
         rt_grid.addWidget(_category_box("角度", self._angle_dial,
-                                        self._angle_raw), 1, 1)
+                                        self._electrical_frequency), 1, 1)
 
         # ---------- 传感器状态 ----------
         sensor_box = QGroupBox("传感器状态（悬停指标看说明）")
@@ -296,7 +356,8 @@ class MonitorPage(QWidget):
         sensor_grid.addWidget(self._sensor_quality, 0, 1)
         sensor_grid.addWidget(self._sensor_convergence, 1, 0)
         sensor_grid.addWidget(self._sensor_warn, 1, 1)
-        rt_grid.addWidget(sensor_box, 1, 2)
+        rt_grid.addWidget(_category_box("电机实际温度", self._temperature), 1, 2)
+        rt_grid.addWidget(sensor_box, 2, 0, 1, 3)
         root.addLayout(rt_grid)
 
         # ---------- 统计 ----------
@@ -346,6 +407,9 @@ class MonitorPage(QWidget):
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._latest = frame
         self._last_telemetry_time = datetime.datetime.now().timestamp()
+        if (not self._comm.is_sim_running() and not self._comm.is_connected() and
+                abs(frame.speed_actual) < 1e-9 and abs(frame.angle_actual) < 1e-9):
+            self._angle_dial.reset()
 
     def _refresh(self) -> None:
         import time
@@ -361,8 +425,14 @@ class MonitorPage(QWidget):
         self._torque_actual.set_value(f.torque_actual)
         self._torque_target.set_value(f.torque_target)
         self._angle_dial.feed(f.angle_actual, f.speed_actual)
-        self._angle_raw.set_value(f.angle_raw)
+        pole_pairs = (self._ctrl._pole_pairs.value()
+                      if self._ctrl is not None else 1)
+        self._electrical_frequency.set_value(
+            abs(f.speed_actual) * pole_pairs / 60.0)
         self._vdc_item.set_value(f.vdc)
+        rated_temperature = (self._ctrl._rated_temperature.value()
+                             if self._ctrl is not None else 0.0)
+        self._temperature.set_values(f.temperature, rated_temperature)
         state_text, style = {
             "brake": ("回馈泵升\n制动斩波中", "color: #ffb74d; font-weight: bold;"),
             "uv": ("欠压告警", "color: #ffd740; font-weight: bold;"),
@@ -507,6 +577,12 @@ class MonitorPage(QWidget):
         if not (self._comm.is_connected() or self._comm.is_sim_running()):
             QMessageBox.warning(self, "无法设定", "请先启动仿真或连接通信。")
             return
+        state_machine = getattr(self._ctrl, "_state_machine", None)
+        if (state_machine is not None and
+                state_machine.state.value != "running"):
+            QMessageBox.warning(self, "状态不允许设定",
+                                "只有状态机处于 RUNNING 时才能修改目标转速。")
+            return
         target = float(self._speed_spin.value())
         payload = f"target={target}".encode("utf-8")
         self._comm.send_frame(encode_frame(CMD_START, payload))
@@ -524,11 +600,50 @@ class MonitorPage(QWidget):
             self._ctrl._on_emergency()
 
     def _on_toggle_sim(self) -> None:
+        state_machine = getattr(self._ctrl, "_state_machine", None)
         if not self._sim_running:
             self._comm.start_simulation()
             self._sim_running = True
-            self._btn_sim.setText("停止仿真")
+            if state_machine is not None:
+                state_machine.connection_changed(True, "数字孪生已连接")
+            self._btn_sim.setText("停止仿真环境")
         else:
+            if (state_machine is not None and state_machine.state.value in
+                    ("running", "stopping")):
+                QMessageBox.warning(self, "不能停止仿真",
+                                    "电机仍在运行，请先执行正常停机或紧急停止。")
+                return
             self._comm.stop_simulation()
             self._sim_running = False
-            self._btn_sim.setText("启动仿真")
+            if state_machine is not None:
+                state_machine.connection_changed(False, "数字孪生已断开")
+            self._btn_sim.setText("启动仿真环境")
+
+    def _on_quick_sim(self) -> None:
+        """一键启动数字孪生演示，但不伪装成完整实验预检。"""
+        if self._comm.is_connected():
+            QMessageBox.warning(self, "不可用",
+                                "已连接真实设备，快速仿真演示已禁用。")
+            return
+        state_machine = getattr(self._ctrl, "_state_machine", None)
+        if state_machine is not None and state_machine.state.value == "fault_locked":
+            QMessageBox.warning(self, "故障锁定",
+                                "请先确认并复位故障，不能用演示模式绕过锁定。")
+            return
+        if not self._sim_running:
+            self._on_toggle_sim()
+        if state_machine is not None and state_machine.state.value == "connected":
+            try:
+                state_machine.begin_precheck("快速仿真基础检查")
+                if self._ctrl._current_limit.value() <= 0:
+                    raise ValueError("电流限幅必须大于0")
+                if abs(self._speed_spin.value()) > self._ctrl._max_rpm.value():
+                    raise ValueError("目标转速超过电机最高转速")
+                state_machine.pass_precheck("快速仿真基础检查通过（非实验预检）")
+            except Exception as exc:
+                if state_machine.state.value == "precheck":
+                    state_machine.fail_precheck(str(exc))
+                QMessageBox.warning(self, "快速仿真失败", str(exc))
+                return
+        if state_machine is None or state_machine.state.value == "ready":
+            self._on_start()

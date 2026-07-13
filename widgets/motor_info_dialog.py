@@ -22,6 +22,7 @@ _RATED_FIELDS = [
     ("power_W",    "额定功率",  "W",    1, 1e6),
     ("speed_rpm",  "额定转速",  "rpm",  0, 100000.0),
     ("torque_Nm",  "额定转矩",  "N·m",  3, 10000.0),
+    ("temperature_C", "额定工作点温度", "°C", 1, 250.0),
     ("psi_f_Wb",   "磁链 ψf",   "Wb",   4, 10.0),
 ]
 _MEASURED_FIELDS = [

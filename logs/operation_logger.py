@@ -25,9 +25,12 @@ def classify_level(line: str) -> str:
 
 class OperationLogger(QObject):
     newEntry = Signal(str)
+    # 结构化记录供实验归档等后台消费者使用；保留 newEntry 兼容现有日志页。
+    newRecord = Signal(str, str, str)  # timestamp_iso, action, detail
 
     def log(self, action: str, detail: str = "") -> None:
-        ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        now = datetime.now().astimezone()
+        ts = now.strftime("%Y-%m-%d %H:%M:%S")
         line = f"[{ts}] {action}" + (f"  {detail}" if detail else "")
         try:
             with open(_LOG_FILE, "a", encoding="utf-8") as f:
@@ -35,6 +38,7 @@ class OperationLogger(QObject):
         except OSError:
             pass
         self.newEntry.emit(line)
+        self.newRecord.emit(now.isoformat(timespec="milliseconds"), action, detail)
 
     def load_recent(self, limit: int = 500) -> list[str]:
         try:

@@ -21,6 +21,9 @@ knowledge/
 # AI 生成的实验报告输出
 reports/
 
+# 实验会话运行数据（元数据、遥测、事件与报告）
+experiment_records/
+
 # IDE
 .vscode/
 .idea/

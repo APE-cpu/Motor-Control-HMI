@@ -8,6 +8,7 @@ from PySide6.QtWidgets import (
 
 from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import encode_frame
+from core import RuntimeState, RuntimeStateMachine, TransitionError
 from config.config import (
     CMD_EMERGENCY_STOP, CMD_SET_PARAMS, CMD_SET_SENSOR, CMD_START, CMD_STOP,
     CONTROL_MODES_BY_MOTOR, MOTOR_TYPES, POSITION_SENSORS, SENSOR_REGISTRY,
@@ -26,7 +27,6 @@ from pages.control_param_panels import (
 )
 from widgets.motor_info_dialog import MotorInfoDialog, load_motor_info
 from widgets.sensor_detail_dialog import SensorDetailDialog
-from widgets.temperature_label import TemperatureLabel
 from logs.operation_logger import logger
 
 
@@ -82,9 +82,11 @@ _MODE_DESCRIPTIONS = {
 
 
 class ControlPage(QWidget):
-    def __init__(self, comm: CommManager) -> None:
+    def __init__(self, comm: CommManager,
+                 state_machine: RuntimeStateMachine | None = None) -> None:
         super().__init__()
         self._comm = comm
+        self._state_machine = state_machine
         self._current_sensor_name = POSITION_SENSORS[1]
 
         # 为所有可能的控制方式各建一份控制器和面板（懒加载亦可，这里为简洁全建）
@@ -124,13 +126,29 @@ class ControlPage(QWidget):
         self._pole_pairs = QSpinBox(); self._pole_pairs.setRange(1, 64)
         self._pole_pairs.setValue(int(saved.get("pole_pairs", 4)))
         self._max_rpm = QSpinBox(); self._max_rpm.setRange(1, 100000); self._max_rpm.setValue(3000)
-        self._temp_label = TemperatureLabel()
+        self._current_limit = QDoubleSpinBox()
+        self._current_limit.setRange(0.1, 10_000.0)
+        self._current_limit.setDecimals(2)
+        self._current_limit.setSuffix(" A")
+        self._current_limit.setValue(float(
+            saved.get("rated", {}).get("current_A") or
+            self._comm.motor_sim_params().i_max))
+        self._current_limit.setToolTip(
+            "限制速度环输出的q轴电流给定；真机仍必须由下位机和硬件独立限流。")
+        self._rated_temperature = QDoubleSpinBox()
+        self._rated_temperature.setRange(0.0, 250.0)
+        self._rated_temperature.setDecimals(1)
+        self._rated_temperature.setSuffix(" °C")
+        self._rated_temperature.setSpecialValueText("未设置")
+        self._rated_temperature.setValue(float(
+            saved.get("rated", {}).get("temperature_C", 0.0)))
 
         f.addRow("电机类型", self._motor_type)
         f.addRow("电机型号", self._motor_model)
         f.addRow("极对数", self._pole_pairs)
         f.addRow("最高转速 (rpm)", self._max_rpm)
-        f.addRow("实际温度", self._temp_label)
+        f.addRow("电流限幅", self._current_limit)
+        f.addRow("额定工作点温度", self._rated_temperature)
 
         btn_detail = QPushButton("电机详情（额定/实测/描述）…")
         btn_detail.clicked.connect(self._on_motor_detail)
@@ -149,6 +167,10 @@ class ControlPage(QWidget):
                 self._motor_model.setText(info["model"])
             if info.get("pole_pairs"):
                 self._pole_pairs.setValue(int(info["pole_pairs"]))
+            rated = info.get("rated", {})
+            if rated.get("current_A"):
+                self._current_limit.setValue(float(rated["current_A"]))
+            self._rated_temperature.setValue(float(rated.get("temperature_C", 0.0)))
 
     def _build_sensor_box(self) -> QGroupBox:
         """位置传感器树形列表：有传感器 / 无位置传感器 两组。"""
@@ -524,11 +546,73 @@ class ControlPage(QWidget):
     def _current_mode(self) -> str:
         return self._mode_text_to_mode(self._mode_combo.currentText())
 
+    def experiment_snapshot(self) -> dict:
+        """导出当前控制配置的只读实验快照，不下发参数也不改变 UI 状态。"""
+        motor_info = load_motor_info()
+        rated = dict(motor_info.get("rated", {}))
+        measured = dict(motor_info.get("measured", {}))
+        mode = self._current_mode()
+        mode_params = dict(self._panels[mode].values()) if mode in self._panels else {}
+        sensors = self._selected_sensors()
+        sensor_params = {
+            name: dict(self._sensor_panels[name].values())
+            for name in sensors if name in self._sensor_panels
+        }
+        mechanical = {
+            "load_type": self._load_type.currentText(),
+            "load_value": self._load_value.value(),
+            "viscous_friction_B": self._visc_b.value(),
+            "coulomb_friction_Tc": self._coulomb.value(),
+            "inertia_J": self._inertia.value(),
+            "disturbance_amplitude_Nm": self._disturb_amp.value(),
+            "disturbance_duration_s": self._disturb_dur.value(),
+            "disturbance_period_s": self._disturb_period.value(),
+            "periodic_disturbance_enabled": self._btn_disturb.isChecked(),
+        }
+        protection_keys = {
+            "iq_max", "current_upper", "current_limit", "voltage_limit",
+            "u_min", "u_max", "delta_u_max", "x_min", "x_max",
+        }
+        protection = {key: value for key, value in mode_params.items()
+                      if key in protection_keys}
+        protection["max_rpm"] = self._max_rpm.value()
+        protection["max_current_a"] = self._current_limit.value()
+        return {
+            "device": {
+                "name": self._motor_model.text().strip() or "未命名电机",
+                "motor_type": self._motor_type.currentText(),
+                "rated_power_w": rated.get("power_W") or None,
+                "sensors": sensors,
+                "extra": {
+                    "model": self._motor_model.text().strip(),
+                    "pole_pairs": self._pole_pairs.value(),
+                    "max_rpm": self._max_rpm.value(),
+                    "current_limit_a": self._current_limit.value(),
+                    "rated_operating_temperature_c": (
+                        self._rated_temperature.value() or None),
+                    "rated": rated,
+                    "measured": measured,
+                    "description": motor_info.get("description", ""),
+                },
+            },
+            "controller_params": {
+                "motor_type": self._motor_type.currentText(),
+                "control_mode": mode,
+                "target_speed_rpm": self._target_speed.value(),
+                "mode_params": mode_params,
+                "sensor_params": sensor_params,
+                "mechanical_load": mechanical,
+            },
+            "protection_params": protection,
+        }
+
     def _on_apply(self) -> None:
         mode = self._current_mode()
         if not mode:
             return
         params = self._panels[mode].values()
+        current_limit = self._current_limit.value()
+        self._comm.configure_motor_current_limit(current_limit)
         try:
             self._controllers[mode].set_params(**params)
         except Exception as exc:
@@ -554,18 +638,20 @@ class ControlPage(QWidget):
         meta = {"motor": self._motor_type.currentText(),
                 "mode": mode,
                 "sensors": "|".join(sensors)}
-        payload_parts = [f"{k}={v}" for k, v in {**meta, **params}.items()]
+        payload_parts = [f"{k}={v}" for k, v in {
+            **meta, **params, "max_current_a": current_limit}.items()]
         payload = ";".join(payload_parts).encode("utf-8")
         self._comm.send_frame(encode_frame(CMD_SET_PARAMS, payload))
 
         logger.log("保存/应用参数",
                    f"电机={meta['motor']} 控制方式={mode} "
-                   f"传感器={meta['sensors'] or '无'}")
+                   f"传感器={meta['sensors'] or '无'} 电流限幅={current_limit:.2f}A")
         QMessageBox.information(
             self, "已应用",
             f"电机：{meta['motor']}\n"
             f"控制方式：{mode}\n"
             f"位置传感器：{meta['sensors'] or '无'}\n"
+            f"电流限幅：{current_limit:.2f} A（真机仍需硬件独立保护）\n"
             f"参数：{params}",
         )
 
@@ -586,6 +672,13 @@ class ControlPage(QWidget):
                 self, "无法启动",
                 "通信未连接，请先在「通信设置」页面建立连接，或启动仿真（虚拟电机）。")
             return
+        if (self._state_machine is not None and
+                self._state_machine.state is not RuntimeState.READY):
+            QMessageBox.warning(
+                self, "状态不允许启动",
+                "设备尚未进入 READY。请先在「实验管理」页面执行运行预检。\n"
+                f"当前状态：{self._state_machine.state.value}")
+            return
         if not self._selected_sensors():
             ans = QMessageBox.question(
                 self, "未选择位置传感器",
@@ -601,19 +694,46 @@ class ControlPage(QWidget):
                                 f"目标转速 {target} rpm 超过最高转速 {max_rpm} rpm，请修改后重试。")
             return
         payload = f"target={target}".encode("utf-8")
-        self._comm.send_frame(encode_frame(CMD_START, payload))
+        sent = self._comm.send_frame(encode_frame(CMD_START, payload))
+        if not sent:
+            return
+        if self._state_machine is not None:
+            # v2 ACK 信号可能已在 send_frame 内同步推进状态；legacy-v1 仍在此确认。
+            if self._state_machine.state is RuntimeState.READY:
+                try:
+                    self._state_machine.confirm_started("启动命令本地发送成功")
+                except TransitionError as exc:
+                    QMessageBox.warning(self, "状态转换失败", str(exc))
+                    return
         logger.log("启动电机",
                    f"目标转速={target} rpm 控制方式={self._current_mode()} "
                    f"传感器={'|'.join(self._selected_sensors()) or '无'}")
 
     def _on_stop(self) -> None:
-        self._comm.send_frame(encode_frame(CMD_STOP))
+        if self._state_machine is not None:
+            try:
+                self._state_machine.request_stop("用户请求正常停机")
+            except TransitionError as exc:
+                QMessageBox.warning(self, "状态不允许停机", str(exc))
+                return
+        sent = self._comm.send_frame(encode_frame(CMD_STOP))
+        if self._state_machine is not None:
+            # v2 ACK/NACK 可能已通过 commandResult 同步改变状态。
+            if sent and self._state_machine.state is RuntimeState.STOPPING:
+                self._state_machine.confirm_stopped("停止命令本地发送成功")
+            elif not sent and self._state_machine.state is RuntimeState.STOPPING:
+                protocol = self._comm.protocol_status()
+                if not (protocol["mode"] in ("virtual-v2", "negotiated-v2") and
+                        protocol["pending_ack"] > 0):
+                    self._state_machine.lock_fault("停止命令发送失败，设备状态未知")
         logger.log("停止电机")
 
     def _on_emergency(self) -> None:
         for c in self._controllers.values():
             c.reset()
         self._comm.send_frame(encode_frame(CMD_EMERGENCY_STOP))
+        if self._state_machine is not None:
+            self._state_machine.lock_fault("用户触发紧急停止")
         logger.log("紧急停止")
         QMessageBox.critical(self, "紧急停止", "已发送紧急停止指令！")
 
@@ -621,16 +741,25 @@ class ControlPage(QWidget):
         if not self._sim_running:
             self._comm.start_simulation()
             self._sim_running = True
+            if self._state_machine is not None:
+                self._state_machine.connection_changed(True, "数字孪生已连接")
             self._btn_sim.setText("停止仿真")
             logger.log("启动仿真")
         else:
+            if (self._state_machine is not None and
+                    self._state_machine.state in
+                    (RuntimeState.RUNNING, RuntimeState.STOPPING)):
+                QMessageBox.warning(self, "不能停止仿真",
+                                    "电机仍在运行，请先执行正常停机或紧急停止。")
+                return
             self._comm.stop_simulation()
             self._sim_running = False
+            if self._state_machine is not None:
+                self._state_machine.connection_changed(False, "数字孪生已断开")
             self._btn_sim.setText("启动仿真")
             logger.log("停止仿真")
 
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
-        self._temp_label.set_temperature(frame.temperature)
         self._last_speed_rpm = frame.speed_actual
         # 风机/泵类负载随转速平方实时变化，需逐帧刷新
         if (self.is_sim_running() and hasattr(self, "_load_type")

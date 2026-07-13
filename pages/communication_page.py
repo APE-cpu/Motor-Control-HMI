@@ -70,7 +70,7 @@ def _protocol_doc() -> str:
   10    int8    temperature     °C，偏置 -{TELEM_TEMP_OFFSET:.0f}（上位机 +{TELEM_TEMP_OFFSET:.0f} 还原）
   11    uint8   sensor_quality  0~255 → 0~1
   12    uint8   convergence     0~255 → 0~1
-  13    uint8   flags           bit0 = 低速警告
+  13    uint8   flags           bit0=低速警告，bit1=过流故障，bit2=驱动故障，bit3=急停/保护锁定
   （末尾 1 字节 padding，payload 共 {TELEM_LEN} 字节）
 
   下位机建议发送频率 ≥10 Hz（上位机以 10 Hz 轮询显示）。
@@ -93,6 +93,13 @@ def _protocol_doc() -> str:
     protocol_portable.c/h        —— 串口帧编解码（与本页协议同源）
     can_protocol_portable.c/h    —— CAN 版
     platforms/                   —— STM32 HAL / TI C2000 / Arduino / FPGA 适配示例
+
+【七、v2 协议迁移状态】
+
+  本页可选择 virtual-v2 完成纯内存联调，或选择 negotiated-v2 在真实串口/TCP
+  上执行严格握手；握手失败不会降级v1。经典CAN尚未定义v2分片协议。
+  v2 增加：CRC16、设备地址、16位消息序号、ACK/NACK、HELLO/CAPABILITIES 握手。
+  详细格式见：下位机适配/PROTOCOL_V2.md。下位机适配完成前请勿在真实端口假定v2已生效。
 """
 
 
@@ -243,9 +250,16 @@ class CommunicationPage(QWidget):
         mh = QHBoxLayout(mode_box)
         self._kind = QComboBox(); self._kind.addItems(COMM_TYPES)
         self._kind.currentIndexChanged.connect(self._on_kind_changed)
+        self._protocol_mode = QComboBox()
+        self._protocol_mode.addItem("legacy-v1（默认真实链路）", "legacy-v1")
+        self._protocol_mode.addItem("virtual-v2（协议联调）", "virtual-v2")
+        self._protocol_mode.addItem("negotiated-v2（真实握手）", "negotiated-v2")
+        self._protocol_mode.currentIndexChanged.connect(self._on_protocol_mode_changed)
         self._status_label = QLabel("未连接")
         mh.addWidget(QLabel("通信类型："))
         mh.addWidget(self._kind)
+        mh.addWidget(QLabel("协议模式："))
+        mh.addWidget(self._protocol_mode)
         mh.addStretch(1)
         mh.addWidget(QLabel("状态："))
         mh.addWidget(self._status_label)
@@ -288,6 +302,32 @@ class CommunicationPage(QWidget):
         ctrl_h.addStretch(1)
         root.addLayout(ctrl_h)
 
+        # ---- 协议会话 ----
+        session_box = QGroupBox("协议会话")
+        sf = QFormLayout(session_box)
+        self._session_state = QLabel("未激活")
+        self._session_device = QLabel("—")
+        self._session_version = QLabel("—")
+        self._session_expected_identity = QLabel("未配置")
+        self._session_expected_identity.setWordWrap(True)
+        self._session_identity_verdict = QLabel("未启用白名单")
+        self._session_identity_verdict.setWordWrap(True)
+        self._session_pending = QLabel("0")
+        self._session_result = QLabel("—")
+        self._session_loss = QLabel("—")
+        self._session_stats = QLabel("TX 0 / RX 0")
+        self._session_stats.setWordWrap(True)
+        sf.addRow("会话状态", self._session_state)
+        sf.addRow("设备身份", self._session_device)
+        sf.addRow("协议/固件", self._session_version)
+        sf.addRow("期望身份白名单", self._session_expected_identity)
+        sf.addRow("身份验证", self._session_identity_verdict)
+        sf.addRow("待ACK命令", self._session_pending)
+        sf.addRow("最后命令结果", self._session_result)
+        sf.addRow("会话丢失原因", self._session_loss)
+        sf.addRow("协议统计", self._session_stats)
+        root.addWidget(session_box)
+
         # ---- 收发测试 ----
         test_box = QGroupBox("数据收发测试")
         tv = QVBoxLayout(test_box)
@@ -322,6 +362,7 @@ class CommunicationPage(QWidget):
         comm.statusChanged.connect(self._on_status)
         comm.logMessage.connect(self._append_log)
         comm.rawReceived.connect(self._on_raw_received)
+        comm.protocolSessionChanged.connect(self._on_protocol_session)
 
         # 初始页面 + 自动加载配置
         self._on_kind_changed(0)
@@ -331,6 +372,19 @@ class CommunicationPage(QWidget):
     def _on_kind_changed(self, idx: int) -> None:
         # idx: 0=RS-232, 1=RS-485, 2=CAN, 3=TCP
         self._stack.setCurrentIndex(idx)
+
+    def _on_protocol_mode_changed(self, _idx: int) -> None:
+        mode = self._protocol_mode.currentData()
+        virtual = mode == "virtual-v2"
+        self._kind.setEnabled(not virtual)
+        self._stack.setEnabled(not virtual)
+        if virtual:
+            self._status_label.setToolTip("virtual-v2 不打开真实端口，仅用于协议联调")
+        elif mode == "negotiated-v2":
+            self._status_label.setToolTip(
+                "真实串口/TCP必须完成v2握手；经典CAN尚未定义分片协议")
+        else:
+            self._status_label.setToolTip("")
 
     def _current_cfg(self) -> dict:
         idx = self._kind.currentIndex()
@@ -343,17 +397,28 @@ class CommunicationPage(QWidget):
         return self._tcp_panel.cfg()
 
     def _on_connect(self) -> None:
+        if self._protocol_mode.currentData() == "virtual-v2":
+            ok = self._comm.connect_virtual_v2()
+            if not ok:
+                QMessageBox.warning(self, "连接失败", "virtual-v2 握手失败，请查看日志。")
+            return
         kind = self._kind.currentText()
         cfg = self._current_cfg()
-        ok = self._comm.connect(kind, **cfg)
+        if self._protocol_mode.currentData() == "negotiated-v2":
+            ok = self._comm.connect_negotiated_v2(kind, **cfg)
+        else:
+            ok = self._comm.connect(kind, **cfg)
         if not ok:
-            QMessageBox.warning(self, "连接失败", "请检查参数或查看日志。")
+            QMessageBox.warning(
+                self, "连接失败",
+                "请检查参数、v2固件握手能力或查看日志；程序不会自动降级到v1。")
 
     def _on_disconnect(self) -> None:
         self._comm.disconnect()
 
     def _on_save_cfg(self) -> None:
-        cfg = {"kind": self._kind.currentText(), "params": self._current_cfg()}
+        cfg = {"kind": self._kind.currentText(), "params": self._current_cfg(),
+               "protocol_mode": self._protocol_mode.currentData()}
         try:
             with open(_COMM_CFG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -365,6 +430,10 @@ class CommunicationPage(QWidget):
         try:
             with open(_COMM_CFG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
+            protocol_mode = cfg.get("protocol_mode", "legacy-v1")
+            mode_idx = self._protocol_mode.findData(protocol_mode)
+            if mode_idx >= 0:
+                self._protocol_mode.setCurrentIndex(mode_idx)
             kind = cfg.get("kind", "")
             idx = self._kind.findText(kind)
             if idx >= 0:
@@ -419,6 +488,66 @@ class CommunicationPage(QWidget):
             self._append_log(f"[接收] ID=0x{arb_id:03X}  ({data.hex(' ').upper()})")
         else:
             self._append_log(f"[接收]   ({data.hex(' ').upper()})")
+
+    def _on_protocol_session(self, status: dict) -> None:
+        state = status.get("session_state", "not_active")
+        self._session_state.setText({
+            "ready": "READY（握手完成）",
+            "hello_sent": "HELLO_SENT",
+            "incompatible": "INCOMPATIBLE",
+            "not_active": "未激活",
+        }.get(state, state))
+        device = status.get("device_id") or "—"
+        hardware = status.get("hardware_version") or ""
+        self._session_device.setText(device + (f" / {hardware}" if hardware else ""))
+        version = status.get("protocol_version")
+        firmware = status.get("firmware_version") or "—"
+        self._session_version.setText(
+            f"v{version} / 固件 {firmware}" if version is not None else "—")
+        expected = status.get("expected_identity", {})
+        policy_active = bool(status.get("identity_policy_active"))
+        if policy_active:
+            parts = []
+            if expected.get("device_id"):
+                parts.append(f"ID={expected['device_id']}")
+            if expected.get("hardware_version"):
+                parts.append(f"HW={expected['hardware_version']}")
+            if expected.get("firmware_prefix"):
+                parts.append(f"FW前缀={expected['firmware_prefix']}")
+            self._session_expected_identity.setText("　".join(parts))
+            mismatch = status.get("identity_mismatch_reason") or ""
+            if mismatch:
+                self._session_identity_verdict.setText("失败：" + mismatch)
+                self._session_identity_verdict.setStyleSheet("color: #ef5350;")
+            elif status.get("identity_verified"):
+                self._session_identity_verdict.setText("通过（真实v2握手身份一致）")
+                self._session_identity_verdict.setStyleSheet("color: #66bb6a;")
+            else:
+                self._session_identity_verdict.setText("等待真实v2握手验证")
+                self._session_identity_verdict.setStyleSheet("color: #ffa726;")
+        else:
+            self._session_expected_identity.setText("未配置")
+            self._session_identity_verdict.setText(
+                "未启用（仅验证v2协议兼容性，不验证具体板卡）")
+            self._session_identity_verdict.setStyleSheet("color: #8fa3b8;")
+        self._session_pending.setText(str(status.get("pending_ack", 0)))
+        result = status.get("last_result")
+        if result is None:
+            self._session_result.setText("—")
+        else:
+            verdict = "ACK" if result.success else f"NACK/超时({result.error_code})"
+            self._session_result.setText(
+                f"{verdict} SEQ={result.sequence} CMD=0x{result.command:02X} "
+                f"{result.message}".strip())
+        self._session_loss.setText(status.get("session_lost_reason") or "—")
+        stats = status.get("statistics", {})
+        self._session_stats.setText(
+            f"TX {stats.get('tx_frames', 0)} / RX {stats.get('rx_frames', 0)}　"
+            f"遥测 {stats.get('telemetry_frames', 0)}　"
+            f"ACK {stats.get('acks', 0)} / NACK {stats.get('nacks', 0)}　"
+            f"超时 {stats.get('timeouts', 0)}　CRC/帧错 {stats.get('crc_or_frame_errors', 0)}　"
+            f"迟到/重复ACK {stats.get('late_or_duplicate_acks', 0)}　"
+            f"会话丢失 {stats.get('session_restarts_or_losses', 0)}")
 
     def _append_log(self, line: str) -> None:
         self._log_lines.append(line)

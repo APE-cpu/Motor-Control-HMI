@@ -12,7 +12,9 @@ import math
 
 from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
-from PySide6.QtWidgets import QGroupBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget
+from PySide6.QtWidgets import (
+    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+)
 
 from communications.comm_manager import CommManager, TelemetryFrame
 from widgets.trend_curve import TrendCurve
@@ -23,6 +25,122 @@ _TEXT = QColor("#eceff1")
 _FWD = QColor("#ffb74d")     # 正向功率（电→机械）
 _REV = QColor("#4fc3f7")     # 回馈功率（机械→电）
 _LOSS = QColor("#ef9a9a")    # 损耗支路
+
+
+class _CalculationPanel(QGroupBox):
+    """能量链旁的公式、实时数值和守恒诊断。"""
+
+    _FORMULAS = (
+        ("逆变器电气输入", "P_inv = 3/2 · (v_d · i_d + v_q · i_q)"),
+        ("定子铜损", "P_Cu = 3/2 · R_s · (i_d² + i_q²)"),
+        ("电磁功率", "P_em = T_e · ω_m"),
+        ("转轴动能", "P_kin = P_em − P_fric/load"),
+        ("电源与制动", "P_src = V_src · I_src    P_brake = V_dc² / R_brake"),
+    )
+    _VALUES = (
+        ("supply", "电源输入"), ("inv", "逆变器输入"),
+        ("em", "电磁功率"), ("kinetic", "动能变化"),
+        ("loss_src", "电源内阻"), ("cu", "定子铜损"),
+        ("fric", "摩擦/负载"), ("brake", "制动泄放"),
+    )
+
+    def __init__(self) -> None:
+        super().__init__("实时计算")
+        self.setMinimumWidth(350)
+        root = QVBoxLayout(self)
+        root.setSpacing(7)
+
+        for title, equation in self._FORMULAS:
+            card = QFrame()
+            card.setStyleSheet(
+                "QFrame { background: #171d27; border: 1px solid #2f3b4d; "
+                "border-radius: 5px; }")
+            layout = QVBoxLayout(card)
+            layout.setContentsMargins(9, 5, 9, 6)
+            layout.setSpacing(2)
+            heading = QLabel(title)
+            heading.setStyleSheet("color: #b8c6d8; font-weight: 600; border: none;")
+            formula = QLabel(equation)
+            formula.setTextFormat(Qt.PlainText)
+            formula.setStyleSheet(
+                "color: #80cbc4; font-family: Consolas, 'Courier New', monospace; "
+                "font-size: 12px; border: none;")
+            formula.setWordWrap(True)
+            layout.addWidget(heading)
+            layout.addWidget(formula)
+            root.addWidget(card)
+
+        values_title = QLabel("当前功率")
+        values_title.setStyleSheet("font-weight: 600; color: #dfe6ee;")
+        root.addWidget(values_title)
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(14)
+        grid.setVerticalSpacing(3)
+        self._value_labels: dict[str, QLabel] = {}
+        for index, (key, title) in enumerate(self._VALUES):
+            row, column = divmod(index, 2)
+            label = QLabel(f"{title}  -- W")
+            label.setStyleSheet("color: #b8c6d8;")
+            self._value_labels[key] = label
+            grid.addWidget(label, row, column)
+        root.addLayout(grid)
+
+        self._direction = QLabel("能量方向：—")
+        self._direction.setStyleSheet("font-weight: 600; color: #90a4ae;")
+        self._bus_balance = QLabel("母线储能变化率：—")
+        self._mech_balance = QLabel("机械平衡误差：—")
+        self._motor_balance = QLabel("电机储能/未建模项：—")
+        for label in (self._direction, self._bus_balance,
+                      self._mech_balance, self._motor_balance):
+            label.setWordWrap(True)
+            root.addWidget(label)
+
+        note = QLabel(
+            "橙色：电源→转轴　蓝色：回馈　红色：损耗/制动\n"
+            "当前忽略开关损耗、铁耗和杂散损耗；瞬态差值可进入母线电容或电机储能。")
+        note.setWordWrap(True)
+        note.setStyleSheet("color: #ffcc80; font-size: 11px;")
+        root.addWidget(note)
+        root.addStretch(1)
+
+    def set_data(self, powers: dict) -> None:
+        if not powers:
+            for key, title in self._VALUES:
+                self._value_labels[key].setText(f"{title}  -- W")
+            self._direction.setText("能量方向：—")
+            self._bus_balance.setText("母线储能变化率：—")
+            self._mech_balance.setText("机械平衡误差：—")
+            self._motor_balance.setText("电机储能/未建模项：—")
+            return
+        p = powers
+        for key, title in self._VALUES:
+            value = float(p.get(key, 0.0))
+            self._value_labels[key].setText(f"{title}  {value:+.1f} W")
+        inv = float(p.get("inv", 0.0))
+        if inv < -0.5:
+            direction, color = "回馈：转轴 → 母线", "#4fc3f7"
+        elif inv > 0.5:
+            direction, color = "驱动：电源 → 转轴", "#ffb74d"
+        else:
+            direction, color = "近似零功率", "#90a4ae"
+        self._direction.setText("能量方向：" + direction)
+        self._direction.setStyleSheet(f"font-weight: 600; color: {color};")
+
+        bus_storage = (float(p.get("supply", 0.0)) -
+                       float(p.get("loss_src", 0.0)) - inv -
+                       float(p.get("brake", 0.0)))
+        mech_error = (float(p.get("em", 0.0)) -
+                      float(p.get("fric", 0.0)) -
+                      float(p.get("kinetic", 0.0)))
+        motor_storage = (inv - float(p.get("cu", 0.0)) -
+                         float(p.get("em", 0.0)))
+        self._bus_balance.setText(
+            f"母线储能变化率 ≈ {bus_storage:+.2f} W "
+            "（+充电 / −放电）")
+        self._mech_balance.setText(
+            f"机械平衡误差 = {mech_error:+.3f} W")
+        self._motor_balance.setText(
+            f"电机储能/未建模项 ≈ {motor_storage:+.2f} W")
 
 
 class _FlowDiagram(QWidget):
@@ -205,10 +323,12 @@ class PowerFlowPage(QWidget):
         hint.setStyleSheet("color: #90a4ae;")
         root.addWidget(hint)
 
-        diag_box = QGroupBox("能量链路")
-        dv = QVBoxLayout(diag_box)
+        diag_box = QGroupBox("能量链路与功率守恒")
+        dv = QHBoxLayout(diag_box)
         self._diagram = _FlowDiagram()
-        dv.addWidget(self._diagram)
+        self._calculation = _CalculationPanel()
+        dv.addWidget(self._diagram, 3)
+        dv.addWidget(self._calculation, 2)
         root.addWidget(diag_box, 3)
 
         curve_box = QGroupBox("功率趋势")
@@ -233,6 +353,7 @@ class PowerFlowPage(QWidget):
         f = self._latest
         p = f.powers or {}
         self._diagram.set_data(p, f.vdc, f.bus_state)
+        self._calculation.set_data(p)
         if not p:
             self._eff_label.setText("效率 η = --")
             return

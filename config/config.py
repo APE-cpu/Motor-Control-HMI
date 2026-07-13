@@ -180,8 +180,15 @@ CMD_TELEMETRY = CMD_READ_STATUS   # 上行遥测帧（语义命名）
 CMD_START = 0x10
 CMD_STOP = 0x11
 CMD_EMERGENCY_STOP = 0x12
+CMD_RESET_FAULT = 0x13       # v2：下位机确认保护条件后执行故障复位
 CMD_SET_PARAMS = 0x20
 CMD_SET_SENSOR = 0x21        # 单独下发位置传感器配置
+
+# 遥测 flags：bit0 仅告警；bit1~3 表示下位机已经锁定的硬故障。
+TELEM_FLAG_LOW_SPEED_WARN = 0x01
+TELEM_FLAG_OVERCURRENT_FAULT = 0x02
+TELEM_FLAG_DRIVER_FAULT = 0x04
+TELEM_FLAG_EMERGENCY_FAULT = 0x08
 
 
 # ============ 上行遥测 payload 格式 ============

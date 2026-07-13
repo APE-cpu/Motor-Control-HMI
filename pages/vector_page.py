@@ -170,15 +170,28 @@ class VectorPage(QWidget):
         self._append_point(theta_e, 0.0, frame.current_actual)   # id ≈ 0
 
     def _refresh(self) -> None:
+        active = self._comm.is_sim_running() or self._comm.is_connected()
+        if not active:
+            self._latest = TelemetryFrame()
+            self._spin = 0.0
+            self._i_plot.clear()
+            self._psi_plot.clear()
+            self._update_limits()
+            self._i_plot.refresh(self._chk_persist.isChecked(), None)
+            self._psi_plot.refresh(self._chk_persist.isChecked(), None)
+            return
         if self._comm.is_sim_running():
             for theta_e, i_d, i_q in self._comm.motor_sim_trace():
                 self._append_point(theta_e, i_d, i_q)
-        # 演示旋转角：每帧 0.35 rad，约 1.8 s 扫一圈（慢放，幅值取真实采样点）
-        self._spin = (getattr(self, "_spin", 0.0) + 0.35) % (2.0 * math.pi)
+        # 仅在转子确实旋转时慢放；停机后矢量停在最后一个真实采样点。
+        spin_angle = None
+        if abs(self._latest.speed_actual) >= 1.0:
+            self._spin = (getattr(self, "_spin", 0.0) + 0.35) % (2.0 * math.pi)
+            spin_angle = self._spin
         self._update_limits()
         unlimited = self._chk_persist.isChecked()
-        self._i_plot.refresh(unlimited, self._spin)
-        self._psi_plot.refresh(unlimited, self._spin)
+        self._i_plot.refresh(unlimited, spin_angle)
+        self._psi_plot.refresh(unlimited, spin_angle)
 
     def _update_limits(self) -> None:
         """极限圆：电流圆画 i_max；磁链圆画电压极限 |ψ|≤Vdc/√3/ωe（忽略 Rs）。

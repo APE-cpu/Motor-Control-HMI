@@ -5,6 +5,7 @@
 - 在后台线程上轮询数据，通过 Qt 信号通知上层
 - 当未连接时，提供模拟数据源，便于在没有真实下位机时进行 UI 演示
 """
+import json
 import math
 import random
 import struct
@@ -19,6 +20,8 @@ from config.config import (
     FRAME_HEADER, FRAME_TAIL,
     TELEM_ANGLE_SCALE, TELEM_CURRENT_SCALE, TELEM_FMT, TELEM_FMT_CAN,
     TELEM_LEN, TELEM_LEN_CAN, TELEM_TEMP_OFFSET, TELEM_TORQUE_FROM_CURRENT,
+    TELEM_FLAG_DRIVER_FAULT, TELEM_FLAG_EMERGENCY_FAULT,
+    TELEM_FLAG_LOW_SPEED_WARN, TELEM_FLAG_OVERCURRENT_FAULT,
 )
 
 from .base_comm import BaseComm
@@ -29,6 +32,14 @@ from .serial_comm import SerialComm
 from .tcp_comm import TCPComm
 from .zlgcan_comm import ZlgCanComm
 from .zlgcan_zcan_comm import ZlgCanZcanComm
+from .protocol_session import (
+    CommandResult, ProtocolSession, ProtocolSessionState,
+)
+from .protocol_v2 import (
+    MessageType, ProtocolV2Error, V2Frame, V2StreamDecoder,
+    decode_v2_frame, encode_v2_frame,
+)
+from .v2_virtual_device import V2VirtualDevice
 
 
 class TelemetryFrame:
@@ -49,6 +60,8 @@ class TelemetryFrame:
         "angle_raw",       # 传感器原始量（Hall=离散步、QEP=脉冲计数、其它=估算值）
         "convergence",     # 无传感器观测器收敛度 0-1；有传感器时恒为 1.0
         "low_speed_warn",  # 低速段是否进入不可用区
+        "fault_code",      # 下位机故障位掩码；0 表示无锁定故障
+        "fault_text",      # 可读故障原因
         "data_source",     # "sim" / "real" / "real_partial"
     )
 
@@ -69,6 +82,8 @@ class TelemetryFrame:
         self.angle_raw = 0.0
         self.convergence = 1.0
         self.low_speed_warn = False
+        self.fault_code = 0
+        self.fault_text = ""
         self.data_source = "sim"
 
 
@@ -79,6 +94,9 @@ class CommManager(QObject):
     telemetryReceived = Signal(object)        # TelemetryFrame
     logMessage = Signal(str)                  # 日志/错误信息
     rawReceived = Signal(int, bytes)          # CAN原始帧 (arbitration_id, data)
+    faultDetected = Signal(str)               # 需要进入 FAULT_LOCKED 的故障
+    protocolSessionChanged = Signal(object)   # 会话状态快照 dict
+    commandResult = Signal(object)            # v2 CommandResult
 
     def __init__(self) -> None:
         super().__init__()
@@ -93,6 +111,24 @@ class CommManager(QObject):
         self._active_sensor_name: str = "增量式编码器(QEP)"
         self._rx_buf = bytearray()
         self._latest_frame = TelemetryFrame()
+        self._consecutive_read_errors = 0
+        self._poll_started_at = 0.0
+        self._last_valid_at = 0.0
+        self._reported_faults: set[str] = set()
+        self._protocol_mode = "legacy-v1"
+        self._v2_session: ProtocolSession | None = None
+        self._v2_device: V2VirtualDevice | None = None
+        self._v2_now = 0.0
+        self._v2_lock = threading.RLock()
+        self._last_command_result: CommandResult | None = None
+        self._v2_pending_legacy: dict[int, bytes] = {}
+        self._v2_last_heartbeat_at = 0.0
+        self._v2_connection_lost_reported = False
+        self._v2_stream_decoder: V2StreamDecoder | None = None
+        self._protocol_stats = self._new_protocol_stats()
+        self._expected_device_identity = {
+            "device_id": "", "hardware_version": "", "firmware_prefix": "",
+        }
         # 数字孪生 L1：PMSM 物理模型（虚拟下位机）
         self._motor_sim = MotorSim()
 
@@ -101,29 +137,10 @@ class CommManager(QObject):
         """kind: "RS-232" / "RS-485" / "CAN总线"。"""
         self.disconnect()
         try:
-            if kind in ("RS-232", "RS-485"):
-                self._driver = SerialComm()
-                self._driver.open(**cfg)
-            elif kind == "CAN总线":
-                # interface 决定后端：
-                #   zlgcan       -> 创芯 ControlCAN.dll（VCI_* 老接口）
-                #   zlgcan-zcan  -> 致远原厂 zlgcan.dll（ZCAN_* 新接口）
-                #   其余          -> python-can
-                iface = str(cfg.get("interface", "")).lower()
-                if iface == "zlgcan":
-                    self._driver = ZlgCanComm()
-                elif iface == "zlgcan-zcan":
-                    self._driver = ZlgCanZcanComm()
-                else:
-                    self._driver = CANComm()
-                self._driver.open(**cfg)
-            elif kind == "以太网TCP":
-                self._driver = TCPComm()
-                self._driver.open(**cfg)
-            else:
-                raise ValueError(f"未知通信方式: {kind}")
+            self._driver = self._open_driver(kind, cfg)
             self._kind = kind
             self._cfg = cfg
+            self._protocol_mode = "legacy-v1"
             self._start_poll()
             self.statusChanged.emit(True, f"{kind} 已连接")
             self.logMessage.emit(f"[通信] {kind} 已连接，参数={cfg}")
@@ -132,6 +149,128 @@ class CommManager(QObject):
             self.logMessage.emit(f"[错误] 连接失败：{exc}")
             self.statusChanged.emit(False, str(exc))
             self._driver = None
+            return False
+
+    def connect_negotiated_v2(
+            self, kind: str, *, address: int = 1,
+            handshake_timeout_s: float = 1.5,
+            driver: BaseComm | None = None, **cfg) -> bool:
+        """在真实字节流驱动上建立v2会话；握手失败绝不降级到v1。
+
+        ``driver`` 仅用于驱动级测试或外部适配器注入。经典CAN在定义分片协议前
+        不允许承载v2，以免超过8字节的帧被底层静默截断。
+        """
+        self.disconnect()
+        self._protocol_mode = "negotiated-v2"
+        self._kind = kind
+        self._cfg = dict(cfg)
+        self._protocol_stats = self._new_protocol_stats()
+        session = ProtocolSession(address=address)
+        self._v2_session = session
+        self._v2_stream_decoder = V2StreamDecoder()
+        try:
+            if kind == "CAN总线":
+                raise ProtocolV2Error(
+                    "经典CAN暂不支持v2：必须先定义8字节分片与重组协议")
+            self._driver = driver or self._open_driver(kind, cfg)
+            if driver is not None and not driver.is_open():
+                driver.open(**cfg)
+
+            hello = encode_v2_frame(session.build_hello())
+            self._send_real_v2_wire(hello)
+            deadline = time.monotonic() + max(0.05, float(handshake_timeout_s))
+            capabilities = None
+            while time.monotonic() < deadline:
+                chunk = self._driver.recv(size=512, timeout=0.05)
+                if not chunk:
+                    continue
+                frames = self._decode_real_v2_chunk(chunk)
+                for frame in frames:
+                    self._protocol_stats["rx_frames"] += 1
+                    self.rawReceived.emit(0, encode_v2_frame(frame))
+                    if frame.message_type is not MessageType.CAPABILITIES:
+                        continue
+                    capabilities = session.handle_frame(frame)
+                    break
+                if capabilities is not None:
+                    break
+            if session.state is not ProtocolSessionState.READY:
+                raise ProtocolV2Error(
+                    session.incompatible_reason or "v2握手超时或未收到CAPABILITIES")
+            identity_error = self._identity_mismatch_reason(capabilities)
+            if identity_error:
+                raise ProtocolV2Error(identity_error)
+
+            self._v2_last_heartbeat_at = time.monotonic()
+            self._v2_connection_lost_reported = False
+            self._protocol_stats["handshakes"] += 1
+            self._stop.clear()
+            self._thread = threading.Thread(
+                target=self._real_v2_poll_loop, daemon=True)
+            self._thread.start()
+            self._emit_protocol_snapshot()
+            self.statusChanged.emit(
+                True, f"{kind} v2已握手：{capabilities.device_id}")
+            self.logMessage.emit(
+                f"[状态] 真实v2握手成功 设备={capabilities.device_id} "
+                f"固件={capabilities.firmware_version} 协议={session.negotiated_version}")
+            return True
+        except Exception as exc:
+            if session.state is not ProtocolSessionState.INCOMPATIBLE:
+                session.invalidate(str(exc))
+            if self._driver is not None:
+                try:
+                    self._driver.close()
+                except Exception:
+                    pass
+            self._driver = None
+            self.logMessage.emit(f"[错误] negotiated-v2连接失败：{exc}；未降级到v1")
+            self.statusChanged.emit(False, str(exc))
+            self._emit_protocol_snapshot()
+            return False
+
+    def connect_virtual_v2(self, device: V2VirtualDevice | None = None) -> bool:
+        """连接纯内存v2虚拟下位机；不会打开任何真实端口。"""
+        self.disconnect()
+        try:
+            self._protocol_stats = self._new_protocol_stats()
+            session = ProtocolSession(address=(device.address if device else 1))
+            virtual = device or V2VirtualDevice(address=session.address)
+            hello = encode_v2_frame(session.build_hello())
+            self._protocol_stats["tx_frames"] += 1
+            responses = virtual.receive_bytes(hello, now_s=0.0)
+            if len(responses) != 1:
+                raise ProtocolV2Error("虚拟设备握手无响应")
+            self._protocol_stats["rx_frames"] += 1
+            capabilities = session.handle_frame(decode_v2_frame(responses[0]))
+            if session.state is not ProtocolSessionState.READY:
+                raise ProtocolV2Error(session.incompatible_reason or "v2握手失败")
+            self._protocol_mode = "virtual-v2"
+            self._kind = "virtual-v2"
+            self._cfg = {"device_id": capabilities.device_id}
+            self._v2_session = session
+            self._v2_device = virtual
+            self._v2_now = 0.0
+            self._v2_last_heartbeat_at = 0.0
+            self._v2_connection_lost_reported = False
+            self._protocol_stats["handshakes"] += 1
+            self._motor_sim.reset()
+            self._stop.clear()
+            self._thread = threading.Thread(target=self._v2_poll_loop, daemon=True)
+            self._thread.start()
+            self._emit_protocol_snapshot()
+            self.statusChanged.emit(True, f"virtual-v2 已握手：{capabilities.device_id}")
+            self.logMessage.emit(
+                f"[状态] v2握手成功 设备={capabilities.device_id} "
+                f"固件={capabilities.firmware_version} 协议={session.negotiated_version}")
+            return True
+        except Exception as exc:
+            self._v2_session = None
+            self._v2_device = None
+            self._protocol_mode = "legacy-v1"
+            self.logMessage.emit(f"[错误] virtual-v2 连接失败：{exc}")
+            self.statusChanged.emit(False, str(exc))
+            self._emit_protocol_snapshot()
             return False
 
     def disconnect(self) -> None:
@@ -145,10 +284,20 @@ class CommManager(QObject):
             except Exception as exc:
                 self.logMessage.emit(f"[错误] 关闭失败：{exc}")
         self._driver = None
+        self._v2_session = None
+        self._v2_device = None
+        self._v2_stream_decoder = None
+        self._protocol_mode = "legacy-v1"
+        self._last_command_result = None
+        self._v2_pending_legacy.clear()
         self._rx_buf.clear()
+        self._emit_protocol_snapshot()
         self.statusChanged.emit(False, "已断开")
 
     def is_connected(self) -> bool:
+        if (self._protocol_mode in ("virtual-v2", "negotiated-v2") and
+                self._v2_session is not None):
+            return self._v2_session.state is ProtocolSessionState.READY
         return self._driver is not None and self._driver.is_open()
 
     def set_active_sensor(self, sensor_id: int, sensor_name: str = "") -> None:
@@ -158,12 +307,72 @@ class CommManager(QObject):
 
     def is_sim_running(self) -> bool:
         """仿真数据流是否在跑（未连接真机、后台线程存活）。"""
+        if self._protocol_mode == "virtual-v2":
+            return self._thread is not None and self._thread.is_alive()
         return (not self.is_connected()
                 and self._thread is not None and self._thread.is_alive())
+
+    def protocol_status(self) -> dict:
+        session = self._v2_session
+        caps = session.capabilities if session else None
+        policy_active = any(self._expected_device_identity.values())
+        identity_error = self._identity_mismatch_reason(caps) if caps else ""
+        return {
+            "mode": self._protocol_mode,
+            "session_state": session.state.value if session else "not_active",
+            "device_id": caps.device_id if caps else "",
+            "firmware_version": caps.firmware_version if caps else "",
+            "hardware_version": caps.hardware_version if caps else "",
+            "protocol_version": session.negotiated_version if session else None,
+            "pending_ack": len(session.pending_sequences) if session else 0,
+            "last_result": self._last_command_result,
+            "session_lost_reason": session.session_lost_reason if session else "",
+            "statistics": dict(self._protocol_stats),
+            "expected_identity": dict(self._expected_device_identity),
+            "identity_policy_active": policy_active,
+            "identity_verified": (
+                self._protocol_mode == "negotiated-v2" and caps is not None and
+                policy_active and not identity_error),
+            "identity_mismatch_reason": identity_error,
+        }
+
+    def configure_expected_device_identity(
+            self, device_id: str = "", hardware_version: str = "",
+            firmware_prefix: str = "") -> bool:
+        """配置真实v2身份白名单；空字段表示该维度不限制。"""
+        self._expected_device_identity = {
+            "device_id": str(device_id).strip(),
+            "hardware_version": str(hardware_version).strip(),
+            "firmware_prefix": str(firmware_prefix).strip(),
+        }
+        session = self._v2_session
+        mismatch = ""
+        if (self._protocol_mode == "negotiated-v2" and session is not None and
+                session.capabilities is not None):
+            mismatch = self._identity_mismatch_reason(session.capabilities)
+            if mismatch and session.state is ProtocolSessionState.READY:
+                self._handle_v2_session_loss(mismatch)
+        self._emit_protocol_snapshot()
+        return not mismatch
+
+    def virtual_v2_device(self) -> V2VirtualDevice | None:
+        """测试/故障注入入口；真实协议模式下返回None。"""
+        return self._v2_device
 
     def motor_sim_params(self):
         """数字孪生的 PMSM 参数对象（参数辨识页可读写）。"""
         return self._motor_sim.p
+
+    def configure_motor_current_limit(self, current_a: float) -> None:
+        """设置数字孪生电流给定限幅；真机值同时由控制页参数帧下发。"""
+        value = float(current_a)
+        if not math.isfinite(value) or value <= 0.0:
+            raise ValueError("电流限幅必须为大于0的有限数值")
+        self._motor_sim.p.i_max = value
+
+    def latest_frame(self) -> TelemetryFrame:
+        """返回最近遥测对象；调用方只读使用。"""
+        return self._latest_frame
 
     def set_sim_load(self, torque_nm: float) -> None:
         """给虚拟电机注入外部负载转矩（扫频/测功机加载，仅仿真有效）。"""
@@ -214,6 +423,10 @@ class CommManager(QObject):
         return True
 
     def send_frame(self, data: bytes) -> bool:
+        if self._protocol_mode == "virtual-v2":
+            return self._send_virtual_v2(data)
+        if self._protocol_mode == "negotiated-v2":
+            return self._send_negotiated_v2(data)
         if not self.is_connected():
             if self.is_sim_running():
                 return self._dispatch_to_sim(data)
@@ -228,6 +441,10 @@ class CommManager(QObject):
             return False
 
     def send_frame_with_id(self, data: bytes, can_id: int = 0x100) -> bool:
+        if self._protocol_mode == "virtual-v2":
+            return self._send_virtual_v2(data)
+        if self._protocol_mode == "negotiated-v2":
+            return self._send_negotiated_v2(data)
         if not self.is_connected():
             if self.is_sim_running():
                 return self._dispatch_to_sim(data)
@@ -245,27 +462,373 @@ class CommManager(QObject):
             self.logMessage.emit(f"[错误] 发送失败：{exc}")
             return False
 
+    def _send_virtual_v2(self, legacy_frame: bytes) -> bool:
+        decoded = decode_frame(legacy_frame)
+        if decoded is None:
+            self.logMessage.emit("[错误] v2迁移层收到非法v1语义帧")
+            return False
+        command, payload = decoded
+        with self._v2_lock:
+            if self._v2_session is None or self._v2_device is None:
+                return False
+            try:
+                request = self._v2_session.build_command(command, payload)
+                self._v2_pending_legacy[request.sequence] = legacy_frame
+                wire = encode_v2_frame(request)
+                self._protocol_stats["tx_frames"] += 1
+                self.logMessage.emit(
+                    f"[发送] v2 SEQ={request.sequence} CMD=0x{command:02X} {wire.hex(' ')}")
+                responses = self._v2_device.receive_bytes(wire, self._v2_now)
+                results = self._process_v2_responses(responses)
+            except Exception as exc:
+                self.logMessage.emit(f"[错误] v2命令发送失败：{exc}")
+                return False
+        result = next((item for item in results if isinstance(item, CommandResult)), None)
+        if result is None:
+            self._emit_protocol_snapshot()
+            self.logMessage.emit(f"[警告] v2命令等待ACK SEQ={request.sequence}")
+            return False
+        if result.success:
+            return True
+        self.logMessage.emit(
+            f"[错误] v2 NACK CMD=0x{command:02X} CODE={result.error_code} {result.message}")
+        return False
+
+    def _send_negotiated_v2(self, legacy_frame: bytes) -> bool:
+        """把现有页面的v1语义命令封装为真实v2 COMMAND。
+
+        返回False表示尚未得到ACK，而不是回退或发送v1；最终结果由
+        commandResult异步推进运行状态机。
+        """
+        decoded = decode_frame(legacy_frame)
+        if decoded is None:
+            self.logMessage.emit("[错误] v2迁移层收到非法v1语义帧")
+            return False
+        command, payload = decoded
+        with self._v2_lock:
+            if (self._v2_session is None or self._driver is None or
+                    self._v2_session.state is not ProtocolSessionState.READY):
+                self.logMessage.emit("[警告] negotiated-v2会话未就绪，命令被拒绝")
+                return False
+            try:
+                request = self._v2_session.build_command(command, payload)
+                self._v2_pending_legacy[request.sequence] = legacy_frame
+                wire = encode_v2_frame(request)
+                self._send_real_v2_wire(wire)
+                self.logMessage.emit(
+                    f"[发送] 真实v2 SEQ={request.sequence} "
+                    f"CMD=0x{command:02X} {wire.hex(' ')}")
+            except Exception as exc:
+                self._handle_v2_session_loss(f"v2命令发送失败：{exc}")
+                return False
+        self._emit_protocol_snapshot()
+        self.logMessage.emit(f"[状态] 真实v2命令等待ACK SEQ={request.sequence}")
+        return False
+
+    def _process_v2_responses(self, responses: list[bytes]) -> list[object]:
+        outputs: list[object] = []
+        for raw in responses:
+            self._protocol_stats["rx_frames"] += 1
+            self.rawReceived.emit(0, raw)
+            try:
+                frame = decode_v2_frame(raw)
+            except ProtocolV2Error as exc:
+                self._protocol_stats["crc_or_frame_errors"] += 1
+                self.logMessage.emit(f"[错误] v2响应无效：{exc}")
+                continue
+            if frame.message_type is MessageType.TELEMETRY:
+                self._protocol_stats["telemetry_frames"] += 1
+                try:
+                    telemetry = self._parse_v2_telemetry(frame)
+                except ProtocolV2Error as exc:
+                    self._protocol_stats["crc_or_frame_errors"] += 1
+                    self.logMessage.emit(f"[错误] v2遥测无效：{exc}")
+                    continue
+                self._latest_frame = telemetry
+                self._inspect_frame_fault(telemetry)
+                self.telemetryReceived.emit(telemetry)
+                outputs.append(telemetry)
+                continue
+            if self._v2_session is None:
+                continue
+            try:
+                result = self._v2_session.handle_frame(frame)
+            except ProtocolV2Error as exc:
+                self._protocol_stats["crc_or_frame_errors"] += 1
+                self.logMessage.emit(f"[错误] v2会话帧无效：{exc}")
+                continue
+            if isinstance(result, CommandResult):
+                if result.success:
+                    self._protocol_stats["acks"] += 1
+                else:
+                    self._protocol_stats["nacks"] += 1
+                if result.command == 0:  # HEARTBEAT
+                    if not result.success:
+                        self._handle_v2_session_loss(
+                            result.message or "设备心跳拒绝，可能已经重启")
+                    outputs.append(result)
+                    continue
+                self._last_command_result = result
+                legacy_frame = self._v2_pending_legacy.pop(result.sequence, None)
+                if (result.success and legacy_frame is not None and
+                        self._protocol_mode == "virtual-v2"):
+                    self._dispatch_to_sim(legacy_frame)
+                self.commandResult.emit(result)
+                self.logMessage.emit(
+                    f"[状态] v2 {'ACK' if result.success else 'NACK'} "
+                    f"SEQ={result.sequence} CMD=0x{result.command:02X}")
+                outputs.append(result)
+            elif frame.message_type in (MessageType.ACK, MessageType.NACK):
+                self._protocol_stats["late_or_duplicate_acks"] += 1
+        self._emit_protocol_snapshot()
+        return outputs
+
+    def _parse_v2_telemetry(self, frame: V2Frame) -> TelemetryFrame:
+        try:
+            values = json.loads(frame.payload.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise ProtocolV2Error("v2遥测payload无效") from exc
+        telemetry = TelemetryFrame()
+        for field in TelemetryFrame.__slots__:
+            if field in values:
+                setattr(telemetry, field, values[field])
+        telemetry.data_source = (
+            "sim" if self._protocol_mode == "virtual-v2" else "real")
+        return telemetry
+
+    def _v2_poll_loop(self) -> None:
+        while not self._stop.is_set():
+            with self._v2_lock:
+                self._v2_now += 0.1
+                if self._v2_device is None:
+                    break
+                sim_frame = self._make_simulated_frame()
+                values = {
+                    field: getattr(sim_frame, field)
+                    for field in TelemetryFrame.__slots__ if field != "powers"
+                }
+                responses = self._v2_device.emit_telemetry(values, self._v2_now)
+                if (self._v2_session is not None and
+                        self._v2_session.state is ProtocolSessionState.READY and
+                        self._v2_now - self._v2_last_heartbeat_at >= 0.5 and
+                        not self._v2_session.has_pending_command(0)):
+                    heartbeat = self._v2_session.build_heartbeat()
+                    self._protocol_stats["tx_frames"] += 1
+                    responses += self._v2_device.receive_bytes(
+                        encode_v2_frame(heartbeat), self._v2_now)
+                    self._v2_last_heartbeat_at = self._v2_now
+                responses += self._v2_device.poll(self._v2_now)
+                self._process_v2_responses(responses)
+                if self._v2_session is not None:
+                    expired = self._v2_session.expire_commands(1.0)
+                    for result in expired:
+                        self._v2_pending_legacy.pop(result.sequence, None)
+                        self._protocol_stats["timeouts"] += 1
+                        if result.command == 0:
+                            self._handle_v2_session_loss("设备心跳ACK超时，会话已失效")
+                            continue
+                        self._last_command_result = result
+                        self.commandResult.emit(result)
+                        self.logMessage.emit(
+                            f"[错误] v2 ACK超时 SEQ={result.sequence} "
+                            f"CMD=0x{result.command:02X}")
+                    if expired:
+                        self._emit_protocol_snapshot()
+            time.sleep(0.1)
+
+    def _emit_protocol_snapshot(self) -> None:
+        self.protocolSessionChanged.emit(self.protocol_status())
+
+    def _handle_v2_session_loss(self, reason: str) -> None:
+        if self._v2_connection_lost_reported or self._v2_session is None:
+            return
+        self._v2_connection_lost_reported = True
+        self._protocol_stats["session_restarts_or_losses"] += 1
+        invalidated = self._v2_session.invalidate(reason)
+        for result in invalidated:
+            self._v2_pending_legacy.pop(result.sequence, None)
+            if result.command != 0:
+                self.commandResult.emit(result)
+        self.logMessage.emit(f"[错误] v2会话失效：{reason}，必须重新握手")
+        self.statusChanged.emit(False, f"v2会话失效：{reason}")
+        self._emit_protocol_snapshot()
+
+    @staticmethod
+    def _new_protocol_stats() -> dict:
+        return {
+            "tx_frames": 0,
+            "rx_frames": 0,
+            "telemetry_frames": 0,
+            "crc_or_frame_errors": 0,
+            "acks": 0,
+            "nacks": 0,
+            "timeouts": 0,
+            "late_or_duplicate_acks": 0,
+            "handshakes": 0,
+            "session_restarts_or_losses": 0,
+        }
+
+    def _identity_mismatch_reason(self, capabilities) -> str:
+        if capabilities is None:
+            return ""
+        expected = self._expected_device_identity
+        if (expected["device_id"] and
+                capabilities.device_id != expected["device_id"]):
+            return (f"设备身份不匹配：期望{expected['device_id']}，"
+                    f"实际{capabilities.device_id}")
+        if (expected["hardware_version"] and
+                capabilities.hardware_version != expected["hardware_version"]):
+            return (f"硬件版本不匹配：期望{expected['hardware_version']}，"
+                    f"实际{capabilities.hardware_version}")
+        if (expected["firmware_prefix"] and
+                not capabilities.firmware_version.startswith(
+                    expected["firmware_prefix"])):
+            return (f"固件版本不匹配：期望前缀{expected['firmware_prefix']}，"
+                    f"实际{capabilities.firmware_version}")
+        return ""
+
+    @staticmethod
+    def _open_driver(kind: str, cfg: dict) -> BaseComm:
+        if kind in ("RS-232", "RS-485"):
+            driver: BaseComm = SerialComm()
+        elif kind == "CAN总线":
+            iface = str(cfg.get("interface", "")).lower()
+            if iface == "zlgcan":
+                driver = ZlgCanComm()
+            elif iface == "zlgcan-zcan":
+                driver = ZlgCanZcanComm()
+            else:
+                driver = CANComm()
+        elif kind == "以太网TCP":
+            driver = TCPComm()
+        else:
+            raise ValueError(f"未知通信方式: {kind}")
+        driver.open(**cfg)
+        return driver
+
+    def _send_real_v2_wire(self, wire: bytes) -> None:
+        if self._driver is None or not self._driver.is_open():
+            raise RuntimeError("真实通信驱动未打开")
+        sent = int(self._driver.send(wire))
+        if sent != len(wire):
+            raise RuntimeError(f"v2帧未完整发送：{sent}/{len(wire)}字节")
+        self._protocol_stats["tx_frames"] += 1
+
+    def _decode_real_v2_chunk(self, chunk: bytes) -> list[V2Frame]:
+        if self._v2_stream_decoder is None:
+            return []
+        before = self._v2_stream_decoder.error_count
+        frames = self._v2_stream_decoder.feed(chunk)
+        errors = self._v2_stream_decoder.error_count - before
+        if errors:
+            self._protocol_stats["crc_or_frame_errors"] += errors
+            self.logMessage.emit(f"[错误] 真实v2字节流丢弃{errors}个损坏帧")
+        return frames
+
+    def _real_v2_poll_loop(self) -> None:
+        """真实串口/TCP v2轮询；所有状态推进只依据有效帧和ACK。"""
+        while not self._stop.is_set():
+            with self._v2_lock:
+                if self._driver is None or not self._driver.is_open():
+                    self._handle_v2_session_loss("真实通信链路已关闭")
+                    break
+                try:
+                    chunk = self._driver.recv(size=512, timeout=0.05)
+                except Exception as exc:
+                    self._handle_v2_session_loss(f"真实v2读取失败：{exc}")
+                    break
+                if chunk:
+                    frames = self._decode_real_v2_chunk(chunk)
+                    if frames:
+                        self._process_v2_responses(
+                            [encode_v2_frame(frame) for frame in frames])
+
+                now = time.monotonic()
+                session = self._v2_session
+                if (session is not None and
+                        session.state is ProtocolSessionState.READY and
+                        now - self._v2_last_heartbeat_at >= 0.5 and
+                        not session.has_pending_command(0)):
+                    try:
+                        self._send_real_v2_wire(
+                            encode_v2_frame(session.build_heartbeat()))
+                        self._v2_last_heartbeat_at = now
+                    except Exception as exc:
+                        self._handle_v2_session_loss(f"心跳发送失败：{exc}")
+                        break
+
+                if session is not None:
+                    expired = session.expire_commands(1.0, now=now)
+                    for result in expired:
+                        self._v2_pending_legacy.pop(result.sequence, None)
+                        self._protocol_stats["timeouts"] += 1
+                        if result.command == 0:
+                            self._handle_v2_session_loss(
+                                "设备心跳ACK超时，会话已失效")
+                            continue
+                        self._last_command_result = result
+                        self.commandResult.emit(result)
+                        self.logMessage.emit(
+                            f"[错误] 真实v2 ACK超时 SEQ={result.sequence} "
+                            f"CMD=0x{result.command:02X}")
+                    if expired:
+                        self._emit_protocol_snapshot()
+            time.sleep(0.02)
+
     # ------------------ 内部 ------------------
     def _start_poll(self) -> None:
         self._stop.clear()
+        now = time.monotonic()
+        self._poll_started_at = now
+        self._last_valid_at = now
+        self._consecutive_read_errors = 0
+        self._reported_faults.clear()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
 
     def _poll_loop(self) -> None:
         while not self._stop.is_set():
+            real_link = self._driver is not None and self._driver.is_open()
+            read_failed = False
             try:
-                if self._driver is not None and self._driver.is_open():
+                if real_link:
                     frame = self._read_real_frame()
                 else:
                     frame = self._make_simulated_frame()
                     frame.data_source = "sim"
+                self._consecutive_read_errors = 0
             except Exception as exc:
+                read_failed = True
                 self.logMessage.emit(f"[警告] 读取异常：{exc}")
+                self._consecutive_read_errors += 1
+                if self._consecutive_read_errors >= 3:
+                    self._report_fault_once(
+                        "read_errors", f"通信连续读取异常（{self._consecutive_read_errors} 次）：{exc}")
                 frame = None
             if frame is not None:
+                self._last_valid_at = time.monotonic()
                 self._latest_frame = frame
+                self._inspect_frame_fault(frame)
                 self.telemetryReceived.emit(frame)
+            elif (not read_failed and real_link and self._kind != "以太网TCP" and
+                  time.monotonic() - self._last_valid_at >= 2.0):
+                self._report_fault_once("telemetry_timeout", "真实设备遥测连续 2 秒超时")
             time.sleep(0.1)
+
+    def _inspect_frame_fault(self, frame: TelemetryFrame) -> None:
+        if frame.bus_state == "ov":
+            self._report_fault_once("bus_overvoltage", "直流母线过压跳闸")
+        if frame.fault_code:
+            self._report_fault_once(
+                f"device_{frame.fault_code:02x}", frame.fault_text or
+                f"下位机故障位 0x{frame.fault_code:02X}")
+
+    def _report_fault_once(self, key: str, message: str) -> None:
+        if key in self._reported_faults:
+            return
+        self._reported_faults.add(key)
+        self.logMessage.emit(f"[错误] {message}")
+        self.faultDetected.emit(message)
 
     def _read_real_frame(self) -> Optional[TelemetryFrame]:
         """从真实驱动读取并解析一帧遥测；解析不到则返回 None（保留上一帧）。"""
@@ -330,7 +893,18 @@ class CommManager(QObject):
         f.temperature = float(temp_b) + TELEM_TEMP_OFFSET
         f.sensor_quality = q / 255.0
         f.convergence = conv / 255.0
-        f.low_speed_warn = bool(flags & 0x01)
+        f.low_speed_warn = bool(flags & TELEM_FLAG_LOW_SPEED_WARN)
+        fault_names = []
+        if flags & TELEM_FLAG_OVERCURRENT_FAULT:
+            fault_names.append("下位机过流保护")
+        if flags & TELEM_FLAG_DRIVER_FAULT:
+            fault_names.append("栅极驱动器故障")
+        if flags & TELEM_FLAG_EMERGENCY_FAULT:
+            fault_names.append("下位机急停/保护锁定")
+        f.fault_code = flags & (
+            TELEM_FLAG_OVERCURRENT_FAULT | TELEM_FLAG_DRIVER_FAULT |
+            TELEM_FLAG_EMERGENCY_FAULT)
+        f.fault_text = "；".join(fault_names)
         f.torque_actual = f.current_actual * TELEM_TORQUE_FROM_CURRENT
         f.torque_target = self._latest_frame.torque_target
         # 真机协议暂无母线字段，沿用上一帧（待协议扩展 CMD 后替换）
@@ -351,6 +925,8 @@ class CommManager(QObject):
         f.sensor_quality = prev.sensor_quality
         f.convergence = prev.convergence
         f.low_speed_warn = prev.low_speed_warn
+        f.fault_code = prev.fault_code
+        f.fault_text = prev.fault_text
         f.torque_target = prev.torque_target
         f.current_target = prev.current_target
         f.vdc = prev.vdc
@@ -365,23 +941,27 @@ class CommManager(QObject):
         return f
 
     def start_simulation(self) -> None:
-        """启动模拟数据流（虚拟电机默认上电并运行到 1500 rpm）。"""
+        """启动模拟数据流；电机保持静止，直到收到显式启动命令。"""
         if self._thread is not None and self._thread.is_alive():
             return
         self._motor_sim.reset()
-        self._motor_sim.start(1500.0)
         self._stop.clear()
         self._thread = threading.Thread(target=self._poll_loop, daemon=True)
         self._thread.start()
 
     def stop_simulation(self) -> None:
-        """停止模拟数据流（不影响真实连接）。"""
+        """停止并复位模拟对象，向所有可视化页面发布静止初始帧。"""
         if self._driver is not None and self._driver.is_open():
             return  # 真实连接时不允许停止轮询
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout=1.0)
             self._thread = None
+        self._motor_sim.reset()
+        self._sim_t = 0.0
+        self._bus_state_prev = "normal"
+        self._latest_frame = TelemetryFrame()
+        self.telemetryReceived.emit(self._latest_frame)
 
     def _make_simulated_frame(self) -> TelemetryFrame:
         """步进 PMSM 物理模型 0.1 s，采样为一帧遥测（数字孪生 L1）。"""
@@ -390,14 +970,18 @@ class CommManager(QObject):
         sim.step(0.1)
         f = TelemetryFrame()
         f.speed_target = sim.speed_ref_rpm if sim.enabled else 0.0
-        f.speed_actual = sim.speed_rpm + random.uniform(-2.0, 2.0)   # 测量噪声
+        moving = sim.enabled or abs(sim.speed_rpm) >= 0.1
+        f.speed_actual = sim.speed_rpm + (random.uniform(-2.0, 2.0) if moving else 0.0)
         f.current_target = sim.iq_ref
-        f.current_actual = sim.i_q + random.uniform(-0.03, 0.03)
+        f.current_actual = sim.i_q + (random.uniform(-0.03, 0.03) if moving else 0.0)
         f.torque_target = sim.torque_ref
         f.torque_actual = sim.torque
         f.temperature = sim.temp
         f.vdc = sim.vdc
         f.bus_state = sim.bus_state
+        if sim.bus_state == "ov":
+            f.fault_code = 0x100
+            f.fault_text = "数字孪生直流母线过压跳闸"
         f.powers = {
             "supply": sim.p_supply, "loss_src": sim.p_loss_src,
             "brake": sim.p_brake, "inv": sim.p_inv, "cu": sim.p_cu,
