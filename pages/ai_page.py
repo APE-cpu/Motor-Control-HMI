@@ -22,7 +22,7 @@ from ai.rag import RAGIndex, format_context
 from communications.comm_manager import CommManager, TelemetryFrame
 from config.config import AI_DEFAULT_BASE_URL, AI_DEFAULT_MODEL, AI_REQUEST_TIMEOUT
 from logs.operation_logger import logger
-from runtime_paths import app_base_dir, writable_path
+from runtime_paths import resource_path, writable_path
 
 _CONFIG_FILE = writable_path("config", "ai_config.json")
 _KNOWLEDGE_DIR = writable_path("knowledge", ".keep").parent
@@ -222,8 +222,7 @@ class AIPage(QWidget):
     # -------- RAG --------
     @staticmethod
     def _gather_rag_paths() -> list:
-        base = app_base_dir()
-        paths = [base / name for name in _BUILTIN_DOCS]
+        paths = [resource_path(name) for name in _BUILTIN_DOCS]
         paths += sorted(_KNOWLEDGE_DIR.glob("*.md"))
         paths += sorted(_KNOWLEDGE_DIR.glob("*.txt"))
         paths += sorted(_KNOWLEDGE_DIR.glob("*.pdf"))   # 教材/论文，需 pypdf

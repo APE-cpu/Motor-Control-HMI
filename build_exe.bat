@@ -66,6 +66,9 @@ if "%MODE%"=="lite" (
     pyinstaller --noconfirm --clean --onefile --windowed ^
       --name "%BUILD_NAME%" ^
       --add-data "config/style.qss;config" ^
+      --add-data "README.md;." ^
+      --add-data "使用说明书.md;." ^
+      --add-data "软件介绍.md;." ^
       --add-data "motor_anomaly.onnx;." ^
       %ZLG_DLL% ^
       %ZLG_ZCAN% ^
@@ -84,6 +87,9 @@ if "%MODE%"=="lite" (
     pyinstaller --noconfirm --clean --onefile --windowed ^
       --name "%BUILD_NAME%" ^
       --add-data "config/style.qss;config" ^
+      --add-data "README.md;." ^
+      --add-data "使用说明书.md;." ^
+      --add-data "软件介绍.md;." ^
       --add-data "motor_anomaly.onnx;." ^
       --collect-data rapidocr_onnxruntime ^
       %ZLG_DLL% ^

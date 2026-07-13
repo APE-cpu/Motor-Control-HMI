@@ -1,15 +1,16 @@
 """系统内置使用说明书页面。"""
-from pathlib import Path
 
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QPushButton, QTextBrowser, QVBoxLayout, QWidget,
 )
 
+from runtime_paths import resource_path
+
 
 class ManualPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self._path = Path(__file__).resolve().parent.parent / "使用说明书.md"
+        self._path = resource_path("使用说明书.md")
         root = QVBoxLayout(self)
         header = QHBoxLayout()
         title = QLabel("使用说明书")
