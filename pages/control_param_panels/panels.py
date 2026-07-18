@@ -131,25 +131,29 @@ _PI_FORMULA = (
 class PIPanel(_FormulaPanel):
     def __init__(self) -> None:
         super().__init__()
-        self.kp_spd = _dspin(0, 1e4, 0.06)
-        self.ki_spd = _dspin(0, 1e4, 1.0)
+        self.kp_spd = _dspin(0, 1e4, 1752, 0)
+        self.ki_spd = _dspin(0, 1e4, 121, 0)
         self.kd_spd = _dspin(0, 1e4, 0.0)
-        self.iq_max = _dspin(0, 1000, 8.0, 2)
-        self.dt_spd = _dspin(1e-6, 1.0, 0.001, 6)
+        self.iq_max = _dspin(0, 4.49, 1.887, 3)
+        self.dt_spd = _dspin(1e-6, 1.0, 0.002, 6)
+        self.dt_spd.setReadOnly(True)
+        self.dt_spd.setToolTip("下位机固定500 Hz；界面不可修改")
         self.left_v.insertWidget(0, _loop_group("转速环（外环）", [
-            ("比例 Kpω", self.kp_spd),
-            ("积分 Kiω", self.ki_spd),
+            ("比例 Kpω（下位机整数）", self.kp_spd),
+            ("积分 Kiω（下位机整数）", self.ki_spd),
             ("微分 Kdω", self.kd_spd),
             ("输出限幅 iq_max (A)", self.iq_max),
             ("采样时间 (s)", self.dt_spd),
         ]))
-        self.kp_cur = _dspin(0, 1e4, 1.2)
-        self.ki_cur = _dspin(0, 1e6, 300.0)
-        self.dt_cur = _dspin(1e-7, 1.0, 0.0001, 7)
+        self.kp_cur = _dspin(0, 1e4, 2323, 0)
+        self.ki_cur = _dspin(0, 1e6, 2077, 0)
+        self.dt_cur = _dspin(1e-7, 1.0, 0.0000625, 7)
+        self.dt_cur.setReadOnly(True)
+        self.dt_cur.setToolTip("下位机固定16 kHz；每个PWM周期执行一次")
         self.left_v.insertWidget(1, _loop_group("电流环（内环）", [
-            ("比例 Kpi", self.kp_cur),
-            ("积分 Kii", self.ki_cur),
-            ("采样时间 (s)", self.dt_cur),
+            ("比例 Kpi（下位机整数）", self.kp_cur),
+            ("积分 Kii（下位机整数）", self.ki_cur),
+            ("控制周期 (s，16 kHz固定)", self.dt_cur),
         ]))
         self.set_formula(_PI_FORMULA)
 
@@ -168,39 +172,46 @@ class PIPanel(_FormulaPanel):
         }
 
 
-# ─── 开环控制 ───────────────────────────────────────────────
+# ─── 速度开环 / 电流闭环调试 ───────────────────────────────
 _OPENLOOP_FORMULA = (
-    _txt("<b>替代环节：转速环与电流环均不闭环</b>（无任何反馈）。")
-    + _sec("V/f 恒压频比给定")
-    + _fx("V = V<sub>rated</sub> · f / f<sub>rated</sub>"
-          "&nbsp;&nbsp;（磁链近似恒定）",
-          "θ<sub>e</sub> = 2π ∫f dt&nbsp;&nbsp;（同步坐标强制推进）",
-          "n = 60·f / p&nbsp;&nbsp;（稳态转速由频率唯一决定）")
-    + _txt("本软件当前实现：v(t) = A·[D + (1−D)·sin(2πft)]")
+    _txt("<b>速度环旁路，d/q 电流环保持闭环</b>。直接给定 Iqref，"
+         "用于电流环 PI 整定；这不是 V/f 开环运行。")
+    + _sec("电流闭环")
+    + _fx("e<sub>q</sub> = I<sub>qref</sub> − I<sub>q</sub>",
+          "V<sub>q</sub> = K<sub>pi</sub>e<sub>q</sub> + "
+          "K<sub>ii</sub>∫e<sub>q</sub>dt",
+          "I<sub>dref</sub> = 0")
     + _sec("参数说明")
     + _note(
-        "幅值 A：输出电压/电流幅值。过小带不动负载失步，过大空载电流大、发热",
-        "频率 f：决定同步转速；升速应缓慢斜坡，突加频率会失步",
-        "占空比 D：直流偏置与交流分量的比例")
-    + _txt("<b style='color:#ff8a65'>⚠ 电流不受控</b>：无电流环保护，"
-           "务必依靠硬件限流；仅用于调试与低要求场合。"))
+        "Iqref：q轴转矩电流给定；空载电机会向任一方向加速，不能把它当速度给定",
+        "Kpi/Kii：电流内环整数增益；运行中每次只允许修改 ±10%",
+        "斜坡时间：改变 Iqref 时的过渡时间，避免电流阶跃过猛")
+    + _txt("<b style='color:#ff8a65'>⚠ 禁止空载长时间运行</b>：本模式仅允许固定转子测试或"
+           "极短低电流脉冲；超过 100 rpm 下位机将独立切断功率级。"))
 
 
 class OpenLoopPanel(_FormulaPanel):
     def __init__(self) -> None:
         super().__init__()
-        self.amp = _dspin(0, 1000, 24.0, 2)
-        self.freq = _dspin(0, 1000, 50.0, 2)
-        self.duty = _dspin(0, 1, 0.5, 2, 0.05)
-        self.form.addRow("电压/电流幅值", self.amp)
-        self.form.addRow("频率 (Hz)", self.freq)
-        self.form.addRow("占空比 (0-1)", self.duty)
+        self.iq_ref = _dspin(-0.5, 0.5, 0.00, 3, 0.01)
+        self.kp_cur = _dspin(0, 10000, 2323, 0)
+        self.ki_cur = _dspin(0, 10000, 2077, 0)
+        self.ramp_ms = _dspin(100, 5000, 500, 0, 100)
+        self.form.addRow("Iqref (A)", self.iq_ref)
+        self.form.addRow("电流环 Kpi（下位机整数）", self.kp_cur)
+        self.form.addRow("电流环 Kii（下位机整数）", self.ki_cur)
+        period = QLabel("62.5 µs（16 kHz，每个PWM周期执行一次）")
+        period.setStyleSheet("color: #4fc3f7; font-weight: bold;")
+        self.form.addRow("电流环控制周期", period)
+        self.form.addRow("Iq 斜坡时间 (ms)", self.ramp_ms)
         self.set_formula(_OPENLOOP_FORMULA)
 
     def values(self) -> dict:
-        return {"amplitude": self.amp.value(),
-                "frequency": self.freq.value(),
-                "duty": self.duty.value()}
+        return {"control_mode": "current_loop_test",
+                "iq_ref_a": self.iq_ref.value(),
+                "kp_cur": self.kp_cur.value(),
+                "ki_cur": self.ki_cur.value(),
+                "iq_ramp_ms": self.ramp_ms.value()}
 
 
 # ─── MPC ───────────────────────────────────────────────────
@@ -487,9 +498,10 @@ class QEPPanel(_Panel):
     def __init__(self) -> None:
         super().__init__()
         f = QFormLayout(self)
-        self.lines = QSpinBox(); self.lines.setRange(100, 65535); self.lines.setValue(2500)
+        self.lines = QSpinBox(); self.lines.setRange(100, 65535); self.lines.setValue(1000)
         self.dir = QComboBox(); self.dir.addItems(["+1 (正向)", "-1 (反向)"])
-        self.idx = QCheckBox("使用 Z 相索引脉冲"); self.idx.setChecked(True)
+        self.dir.setCurrentIndex(1)
+        self.idx = QCheckBox("使用 Z 相索引脉冲"); self.idx.setChecked(False)
         f.addRow("线数 / 圈", self.lines)
         f.addRow("计数方向", self.dir)
         f.addRow("索引脉冲", self.idx)

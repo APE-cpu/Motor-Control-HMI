@@ -1,8 +1,10 @@
 """监控页面：实时数据、统计、趋势曲线。"""
+import csv
 import datetime
 import math
 import os
 import time
+from collections import deque
 from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
@@ -12,8 +14,9 @@ from PySide6.QtWidgets import (
 
 from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import encode_frame
-from config.config import CMD_START, MONITOR_REFRESH_MS
+from config.config import CMD_SET_PARAMS, MONITOR_REFRESH_MS
 from widgets.trend_curve import TrendCurve
+from runtime_paths import writable_path
 from widgets.temperature_label import TemperatureLabel
 from config.config import TEMP_HIGH_THRESHOLD, TEMP_NORMAL_THRESHOLD
 
@@ -30,7 +33,8 @@ def _make_curve_panel(curve: TrendCurve, title: str) -> QWidget:
         win = QWidget(None, Qt.Window)
         win.setWindowTitle(title)
         win.resize(600, 350)
-        pop_curve = TrendCurve(curve._title, curve._series, curve._y_label)
+        pop_curve = TrendCurve(curve._title, curve._series, curve._y_label,
+                               curve._buffer_size)
         # 同步历史数据（含时间轴）
         pop_curve._times.extend(curve._times)
         for name, buf in curve._buffers.items():
@@ -117,6 +121,13 @@ class _TemperaturePanel(QWidget):
             text, color = "温度正常", "#69f0ae"
         self.status.setText("状态：" + text)
         self.status.setStyleSheet(f"color: {color}; font-weight: 600;")
+
+    def set_unavailable(self) -> None:
+        self.actual.setText("不可用")
+        self.rated.setText("额定工作点：未设置")
+        self.delta.setText("与额定点偏差：—")
+        self.status.setText("状态：温度采样电路未供电")
+        self.status.setStyleSheet("color: #ffd740; font-weight: 600;")
 
 
 class _AngleDial(QWidget):
@@ -235,6 +246,8 @@ class MonitorPage(QWidget):
         self._comm = comm
         self._ctrl = control_page
         self._latest: TelemetryFrame = TelemetryFrame()
+        self._high_rate_samples = deque(maxlen=2000)
+        self._last_high_angle_time = 0.0
         self._last_telemetry_time: float = 0.0
 
         root = QVBoxLayout(self)
@@ -262,7 +275,7 @@ class MonitorPage(QWidget):
         self._btn_start = QPushButton("启动"); self._btn_start.setObjectName("PrimaryButton")
         self._btn_stop = QPushButton("停止")
         self._btn_emerg = QPushButton("紧急停止"); self._btn_emerg.setObjectName("EmergencyButton")
-        self._btn_sim = QPushButton("启动仿真环境")
+        self._btn_sim = QPushButton("启动数字孪生")
         self._btn_quick_sim = QPushButton("快速仿真演示")
         self._btn_quick_sim.setToolTip(
             "仅用于无功率级数字孪生：自动建立仿真环境并启动电机；"
@@ -277,7 +290,7 @@ class MonitorPage(QWidget):
         control_row.addWidget(QLabel("目标转速"))
         self._speed_spin = QSpinBox()
         self._speed_spin.setRange(0, 20000)
-        self._speed_spin.setValue(1500)
+        self._speed_spin.setValue(1000)
         self._speed_spin.setSuffix(" rpm")
         control_row.addWidget(self._speed_spin)
         # 目标转速全局唯一入口：控制页启动电机时读取的也是这个框
@@ -295,10 +308,10 @@ class MonitorPage(QWidget):
         # ---------- 实时数据：按物理量分类分框，2 行 × 3 框 ----------
         self._speed_actual = _DataItem("实际", "rpm")
         self._speed_target = _DataItem("给定", "rpm")
-        self._current_actual = _DataItem("实际", "A")
-        self._current_target = _DataItem("给定", "A")
-        self._torque_actual = _DataItem("实际", "Nm")
-        self._torque_target = _DataItem("给定", "Nm")
+        self._current_actual = _DataItem("实际 Iq", "A")
+        self._current_target = _DataItem("给定 Iq", "A")
+        self._torque_actual = _DataItem("估算", "Nm")
+        self._torque_target = _DataItem("估算给定", "Nm")
         self._angle_dial = _AngleDial()
         self._electrical_frequency = _DataItem("电频率", "Hz")
         self._electrical_frequency.setToolTip(
@@ -323,7 +336,7 @@ class MonitorPage(QWidget):
                                         self._current_target), 0, 1)
         rt_grid.addWidget(_category_box("直流母线", self._vdc_item,
                                         self._bus_state), 0, 2)
-        rt_grid.addWidget(_category_box("转矩", self._torque_actual,
+        rt_grid.addWidget(_category_box("估算电磁转矩", self._torque_actual,
                                         self._torque_target), 1, 0)
         rt_grid.addWidget(_category_box("角度", self._angle_dial,
                                         self._electrical_frequency), 1, 1)
@@ -372,9 +385,14 @@ class MonitorPage(QWidget):
 
         # ---------- 曲线标签页（同屏只显示一排，高度翻倍）----------
         self._c_speed = TrendCurve("转速 rpm", {"实际": "#4fc3f7", "给定": "#ffb74d"}, y_label="rpm")
-        self._c_current = TrendCurve("电流 A", {"实际": "#81c784"}, y_label="A")
+        self._c_current = TrendCurve(
+            "Iq / 相电流 A", {"实际 Iq": "#81c784", "给定 Iq": "#ffb74d",
+                              "Ia": "#4fc3f7", "Ib": "#f48fb1"},
+            y_label="A", buffer_size=2000)
         self._c_torque = TrendCurve("转矩 Nm", {"实际": "#ba68c8"}, y_label="Nm")
-        self._c_angle = TrendCurve("角度 °", {"估算/实际": "#f48fb1", "原始": "#80cbc4"}, y_label="°")
+        self._c_angle = TrendCurve(
+            "高速电角度 200Hz", {"高速电角度": "#f48fb1"}, y_label="°",
+            buffer_size=2000)
         self._c_sensor_q = TrendCurve("传感器诊断 (0-1)", {"质量": "#ffcc80", "收敛度": "#ce93d8"}, y_label="")
 
         trend_tab = QWidget()
@@ -390,12 +408,13 @@ class MonitorPage(QWidget):
 
         tabs = QTabWidget()
         tabs.setObjectName("CurveTabs")
-        tabs.addTab(trend_tab, "📈 趋势曲线（最近 100 点）")
+        tabs.addTab(trend_tab, "📈 趋势曲线（最近 1000 点）")
         tabs.addTab(sensor_tab, "🧭 传感器波形")
         root.addWidget(tabs, 1)
 
         # ---------- 连接信号 ----------
         comm.telemetryReceived.connect(self._on_telemetry)
+        comm.highRateTelemetryReceived.connect(self._on_high_rate_telemetry)
 
         # ---------- 刷新定时器 ----------
         self._timer = QTimer(self)
@@ -411,6 +430,16 @@ class MonitorPage(QWidget):
                 abs(frame.speed_actual) < 1e-9 and abs(frame.angle_actual) < 1e-9):
             self._angle_dial.reset()
 
+    def _on_high_rate_telemetry(self, sample: dict) -> None:
+        self._high_rate_samples.append({
+            "angle_deg": float(sample["angle_deg"]),
+            "iq_a": float(sample["iq_a"]),
+            "iqref_a": float(sample["iqref_a"]),
+            "ia_a": float(sample.get("ia_a", 0.0)),
+            "ib_a": float(sample.get("ib_a", 0.0)),
+        })
+        self._last_high_angle_time = time.time()
+
     def _refresh(self) -> None:
         import time
         idle = (time.time() - self._last_telemetry_time) > 1.0
@@ -418,6 +447,8 @@ class MonitorPage(QWidget):
             self._refresh_datasource_label("idle")
             return
         f = self._latest
+        high_rate = list(self._high_rate_samples)
+        self._high_rate_samples.clear()
         self._speed_actual.set_value(f.speed_actual)
         self._speed_target.set_value(f.speed_target)
         self._current_actual.set_value(f.current_actual)
@@ -432,7 +463,10 @@ class MonitorPage(QWidget):
         self._vdc_item.set_value(f.vdc)
         rated_temperature = (self._ctrl._rated_temperature.value()
                              if self._ctrl is not None else 0.0)
-        self._temperature.set_values(f.temperature, rated_temperature)
+        if f.bus_state == "uv" or f.vdc < 1.0:
+            self._temperature.set_unavailable()
+        else:
+            self._temperature.set_values(f.temperature, rated_temperature)
         state_text, style = {
             "brake": ("回馈泵升\n制动斩波中", "color: #ffb74d; font-weight: bold;"),
             "uv": ("欠压告警", "color: #ffd740; font-weight: bold;"),
@@ -456,11 +490,23 @@ class MonitorPage(QWidget):
         self._stat_torque.feed(f.torque_actual)
 
         self._c_speed.append({"实际": f.speed_actual, "给定": f.speed_target})
-        self._c_current.append({"实际": f.current_actual})
+        if high_rate:
+            self._c_current.append_batch(
+                [{"实际 Iq": sample["iq_a"],
+                  "给定 Iq": sample["iqref_a"],
+                  "Ia": sample["ia_a"], "Ib": sample["ib_a"]}
+                 for sample in high_rate], 0.005)
+        else:
+            self._c_current.append(
+                {"实际 Iq": f.current_actual, "给定 Iq": f.current_target})
         self._c_torque.append({"实际": f.torque_actual})
 
-        raw_norm = self._normalize_angle_raw(f.sensor_source, f.angle_raw)
-        self._c_angle.append({"估算/实际": f.angle_actual, "原始": raw_norm})
+        if high_rate:
+            self._c_angle.append_batch(
+                [{"高速电角度": sample["angle_deg"]}
+                 for sample in high_rate], 0.005)
+        elif time.time() - self._last_high_angle_time > 1.0:
+            self._c_angle.append({"高速电角度": f.angle_actual})
         self._c_sensor_q.append({"质量": f.sensor_quality, "收敛度": f.convergence})
         self._refresh_datasource_label(getattr(f, "data_source", "sim"))
 
@@ -534,13 +580,43 @@ class MonitorPage(QWidget):
             return
         path, _ = QFileDialog.getSaveFileName(
             self, "保存所有波形",
-            f"波形_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png",
+            str(writable_path(
+                "波形记录",
+                f"波形_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.png")),
             "PNG (*.png)"
         )
         if not path:
             return
         with open(path, "wb") as f:
             f.write(png)
+        csv_path = os.path.splitext(path)[0] + ".csv"
+        self._write_curves_csv(csv_path)
+        QMessageBox.information(
+            self, "保存成功",
+            f"已保存波形图和原始数据：\n{path}\n{csv_path}")
+
+    def _write_curves_csv(self, path: str) -> None:
+        """按原始采样时间导出所有曲线，不对不同采样率做伪对齐。"""
+        curves = [
+            (self._c_speed, "speed"),
+            (self._c_current, "iq_current"),
+            (self._c_torque, "torque"),
+            (self._c_angle, "electrical_angle"),
+            (self._c_sensor_q, "sensor_diagnostics"),
+        ]
+        with open(path, "w", newline="", encoding="utf-8-sig") as stream:
+            writer = csv.writer(stream)
+            writer.writerow(["channel", "time_s", "series", "value"])
+            for curve, channel in curves:
+                times = list(curve._times)
+                for series, values in curve._buffers.items():
+                    samples = list(values)
+                    sample_times = times[-len(samples):] if samples else []
+                    for timestamp, value in zip(sample_times, samples):
+                        writer.writerow([
+                            channel, f"{timestamp:.6f}", series,
+                            f"{float(value):.9g}",
+                        ])
 
     def _on_ai_report(self) -> None:
         """汇总运行数据 + 波形截图，交给 AI 生成实验报告。"""
@@ -573,19 +649,19 @@ class MonitorPage(QWidget):
         ExperimentReportDialog("电机运行实验", ctx, images, parent=self).exec()
 
     def _on_set_speed(self) -> None:
-        """把新目标转速下发给下位机/虚拟电机（运行中即时生效）。"""
+        """在 READY 预设目标，或在 RUNNING 在线修改目标。"""
         if not (self._comm.is_connected() or self._comm.is_sim_running()):
             QMessageBox.warning(self, "无法设定", "请先启动仿真或连接通信。")
             return
         state_machine = getattr(self._ctrl, "_state_machine", None)
         if (state_machine is not None and
-                state_machine.state.value != "running"):
+                state_machine.state.value not in ("ready", "running")):
             QMessageBox.warning(self, "状态不允许设定",
-                                "只有状态机处于 RUNNING 时才能修改目标转速。")
+                                "只有状态机处于 READY 或 RUNNING 时才能设定目标转速。")
             return
         target = float(self._speed_spin.value())
         payload = f"target={target}".encode("utf-8")
-        self._comm.send_frame(encode_frame(CMD_START, payload))
+        self._comm.send_frame(encode_frame(CMD_SET_PARAMS, payload))
 
     def _on_start(self) -> None:
         if self._ctrl is not None:
@@ -602,11 +678,16 @@ class MonitorPage(QWidget):
     def _on_toggle_sim(self) -> None:
         state_machine = getattr(self._ctrl, "_state_machine", None)
         if not self._sim_running:
+            if self._comm.is_connected():
+                QMessageBox.warning(
+                    self, "不可用",
+                    "真实设备已连接。请先断开真机通信，再启动数字孪生。")
+                return
             self._comm.start_simulation()
             self._sim_running = True
             if state_machine is not None:
                 state_machine.connection_changed(True, "数字孪生已连接")
-            self._btn_sim.setText("停止仿真环境")
+            self._btn_sim.setText("停止数字孪生")
         else:
             if (state_machine is not None and state_machine.state.value in
                     ("running", "stopping")):
@@ -617,7 +698,7 @@ class MonitorPage(QWidget):
             self._sim_running = False
             if state_machine is not None:
                 state_machine.connection_changed(False, "数字孪生已断开")
-            self._btn_sim.setText("启动仿真环境")
+            self._btn_sim.setText("启动数字孪生")
 
     def _on_quick_sim(self) -> None:
         """一键启动数字孪生演示，但不伪装成完整实验预检。"""

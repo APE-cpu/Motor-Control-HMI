@@ -5,6 +5,7 @@ import pytest
 
 import ai.ai_client as mod
 from ai.ai_client import AIClient
+from pages.ai_page import _normalize_url
 
 
 class _FakeResp:
@@ -26,6 +27,13 @@ class _FakeResp:
 def _sse(content: str) -> str:
     return "data: " + json.dumps(
         {"choices": [{"delta": {"content": content}}]}, ensure_ascii=False)
+
+
+def test_base_url只对主机根路径补v1():
+    assert _normalize_url("https://example.com") == "https://example.com/v1"
+    assert _normalize_url("https://example.com/v1") == "https://example.com/v1"
+    assert (_normalize_url("https://api.z.ai/api/paas/v4") ==
+            "https://api.z.ai/api/paas/v4")
 
 
 def test_流式解析与回调(monkeypatch):

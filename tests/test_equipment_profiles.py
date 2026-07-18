@@ -31,7 +31,8 @@ def test_设备档案以新修订保存且不覆盖历史(tmp_path):
     assert revision2.profile_id == "DEV-BUILTIN-78W-R002"
     assert revision3.profile_id == "DEV-BUILTIN-78W-R003"
     assert repository.load(revision2.profile_id).expected_device_id == "BOARD-001"
-    assert repository.load(built_in.profile_id).expected_device_id == ""
+    assert (repository.load(built_in.profile_id).expected_device_id ==
+            "EBF-F407-JIAOYANG-PMSM-001")
 
 
 def test_实验开始时冻结设备档案修订和期望身份(tmp_path):

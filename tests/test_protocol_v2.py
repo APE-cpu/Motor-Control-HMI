@@ -146,6 +146,25 @@ def test_迟到或重复ACK不会误配其它命令():
     assert session.handle_frame(make_ack(command)) is None
 
 
+def test_心跳超时可独立放宽(monkeypatch):
+    session = ProtocolSession()
+    session.state = ProtocolSessionState.READY
+    session.negotiated_version = 2
+    monkeypatch.setattr(
+        "communications.protocol_session.time.monotonic", lambda: 10.0)
+    command = session.build_command(0x10)
+    heartbeat = session.build_heartbeat()
+
+    expired = session.expire_commands(
+        1.0, now=11.1, heartbeat_timeout_s=3.0)
+    assert [item.sequence for item in expired] == [command.sequence]
+    assert heartbeat.sequence in session.pending_sequences
+
+    expired = session.expire_commands(
+        1.0, now=13.1, heartbeat_timeout_s=3.0)
+    assert [item.sequence for item in expired] == [heartbeat.sequence]
+
+
 def test_心跳和会话失效清理全部待命令(monkeypatch):
     monkeypatch.setattr("communications.protocol_session.time.monotonic", lambda: 10.0)
     session = ProtocolSession()

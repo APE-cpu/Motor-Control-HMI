@@ -113,7 +113,7 @@ def test_功率页显示计算式且系统导航提供说明书(tmp_path, monkey
         "pages.experiment_page.writable_path",
         lambda *parts: tmp_path.joinpath(*parts))
     window = MainWindow(enable_training=False)
-    assert window.stack.indexOf(window.manual_page) == 10
+    assert window.stack.indexOf(window.manual_page) == 11
     assert "数字孪生实验标准流程" in window.manual_page._browser.toPlainText()
     window.close()
     window.deleteLater()

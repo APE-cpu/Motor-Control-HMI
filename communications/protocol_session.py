@@ -136,16 +136,22 @@ class ProtocolSession:
         error_code, message = decode_nack_payload(frame.payload)
         return CommandResult(frame.sequence, command, False, error_code, message)
 
-    def expire_commands(self, timeout_s: float, now: float | None = None) -> list[CommandResult]:
+    def expire_commands(self, timeout_s: float, now: float | None = None,
+                        heartbeat_timeout_s: float | None = None) -> list[CommandResult]:
         if timeout_s <= 0:
             raise ValueError("timeout_s 必须大于 0")
+        if heartbeat_timeout_s is not None and heartbeat_timeout_s <= 0:
+            raise ValueError("heartbeat_timeout_s 必须大于 0")
         current = time.monotonic() if now is None else now
         expired = []
         for sequence, (command, sent_at) in list(self._pending.items()):
-            if current - sent_at >= timeout_s:
+            deadline = (heartbeat_timeout_s
+                        if command == 0 and heartbeat_timeout_s is not None
+                        else timeout_s)
+            if current - sent_at >= deadline:
                 del self._pending[sequence]
                 expired.append(CommandResult(
-                    sequence, command, False, -1, f"命令应答超时（{timeout_s:g}s）"))
+                    sequence, command, False, -1, f"命令应答超时（{deadline:g}s）"))
         return expired
 
     def _handle_capabilities(self, frame: V2Frame) -> DeviceCapabilities:

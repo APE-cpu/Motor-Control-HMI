@@ -1,4 +1,5 @@
 import os
+import struct
 import threading
 import time
 
@@ -8,9 +9,12 @@ from PySide6.QtWidgets import QApplication
 
 from communications.comm_manager import CommManager
 from communications.protocol import encode_frame
+from communications.protocol_session import (
+    DeviceCapabilities, ProtocolSession, ProtocolSessionState,
+)
 from communications.v2_virtual_device import V2VirtualDevice
 from communications.protocol_v2 import MessageType, V2Frame, encode_v2_frame, make_ack
-from config.config import CMD_START
+from config.config import CMD_SET_SENSOR, CMD_START, CMD_STOP
 from pages.communication_page import CommunicationPage
 from main_window import MainWindow
 from core import RuntimeState
@@ -30,6 +34,52 @@ def _wait_until(predicate, timeout=1.0):
         time.sleep(0.01)
     app.processEvents()
     return bool(predicate())
+
+
+def test_真实v2不支持普通命令不会销毁会话():
+    comm = CommManager()
+    session = ProtocolSession()
+    session.state = ProtocolSessionState.READY
+    session.negotiated_version = 2
+    session.capabilities = DeviceCapabilities(
+        "DEVICE", "1.0", commands=[CMD_START])
+    comm._protocol_mode = "negotiated-v2"
+    comm._v2_session = session
+    class OpenDriver:
+        @staticmethod
+        def is_open():
+            return True
+    comm._driver = OpenDriver()  # build_command 本地拒绝，不应触碰传输层
+    disconnected = []
+    comm.statusChanged.connect(lambda ok, msg: disconnected.append((ok, msg)))
+
+    assert comm._send_negotiated_v2(
+        encode_frame(CMD_SET_SENSOR, bytes([1]))) is False
+    assert session.state is ProtocolSessionState.READY
+    assert disconnected == []
+
+
+def test_真实v2会话失效但物理链路仍可发送停止():
+    comm = CommManager()
+    sent = []
+
+    class OpenDriver:
+        @staticmethod
+        def is_open():
+            return True
+
+        @staticmethod
+        def send(data):
+            sent.append(data)
+            return len(data)
+
+    session = ProtocolSession()  # IDLE，模拟心跳超时后的会话
+    comm._protocol_mode = "negotiated-v2"
+    comm._v2_session = session
+    comm._driver = OpenDriver()
+
+    assert comm._send_negotiated_v2(encode_frame(CMD_STOP)) is True
+    assert sent
 
 
 def test_CommManager_v2握手命令ACK和遥测闭环():
@@ -52,6 +102,22 @@ def test_CommManager_v2握手命令ACK和遥测闭环():
     assert _wait_until(telemetry_event.is_set)
     assert frames[-1].data_source == "sim"
     comm.disconnect()
+
+
+def test_200Hz高速通道解码Iq和两相电流():
+    comm = CommManager()
+    payload = struct.pack("<IHhhhhh", 1234, 32768, 100,
+                          200, 80, 300, -150)
+    raw = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF1, payload=payload))
+
+    samples = comm._process_v2_responses([raw])
+
+    assert len(samples) == 1
+    assert samples[0]["iq_a"] == 200 * 0.000629
+    assert samples[0]["iqref_a"] == 80 * 0.000629
+    assert samples[0]["ia_a"] == 300 * 0.000629
+    assert samples[0]["ib_a"] == -150 * 0.000629
 
 
 def test_v2_NACK成为明确命令失败():

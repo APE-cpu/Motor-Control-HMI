@@ -8,12 +8,15 @@ import json
 import os
 import shutil
 import threading
+import statistics
+from urllib.parse import urlsplit
+from collections import deque
 from pathlib import Path
 
 from PySide6.QtCore import QObject, Signal
 from PySide6.QtGui import QTextCursor
 from PySide6.QtWidgets import (
-    QCheckBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
+    QCheckBox, QComboBox, QFileDialog, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
 )
 
@@ -28,15 +31,33 @@ _CONFIG_FILE = writable_path("config", "ai_config.json")
 _KNOWLEDGE_DIR = writable_path("knowledge", ".keep").parent
 _REPORT_DIR = writable_path("reports", ".keep").parent
 
+_AI_PRESETS = {
+    "DeepSeek": {
+        "base_url": "https://api.deepseek.com", "model": "deepseek-v4-pro"},
+    "Kimi": {
+        "base_url": "https://api.moonshot.cn/v1", "model": "kimi-k2.6"},
+    "Qwen": {
+        "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+        "model": "qwen3.7-plus"},
+    "GLM-5.2": {
+        "base_url": "https://api.z.ai/api/paas/v4", "model": "GLM-5.2"},
+    "自定义": {"base_url": AI_DEFAULT_BASE_URL, "model": AI_DEFAULT_MODEL},
+}
+
 # 随包自带的知识文档（项目根目录）
 _BUILTIN_DOCS = ["README.md", "使用说明书.md", "软件介绍.md"]
 
 _SYS_PROMPT = """你是一名电机控制专家。当前电机遥测数据如下：
 {snapshot}
+若用户提供了带目标值和样本数的历史诊断窗口，该窗口即使在停机后生成仍然有效；
+不要因当前快照已停机而否定历史窗口。必须区分“当前状态”和“采样窗口”。
 请根据以上数据回答用户的问题，重点关注异常状态和故障诊断。回答简洁专业。"""
 
 _SYS_PROMPT_RAG = """你是一名电机控制专家。当前电机遥测数据如下：
 {snapshot}
+
+若用户提供了带目标值和样本数的历史诊断窗口，该窗口即使在停机后生成仍然有效；
+不要因当前快照已停机而否定历史窗口。必须区分“当前状态”和“采样窗口”。
 
 以下是从本地知识库检索到的参考资料。回答时优先依据资料内容，引用处标注来源
 （如“据资料1”）；资料未覆盖的部分再用你的通用知识并注明：
@@ -46,9 +67,9 @@ _SYS_PROMPT_RAG = """你是一名电机控制专家。当前电机遥测数据�
 
 
 def _normalize_url(url: str) -> str:
-    """确保 base_url 以 /v1 结尾。"""
+    """补全只有主机名的地址，同时保留服务商明确给出的版本路径。"""
     url = url.rstrip("/")
-    if not url.endswith("/v1"):
+    if url and urlsplit(url).path in ("", "/"):
         url += "/v1"
     return url
 
@@ -105,6 +126,8 @@ class AIPage(QWidget):
         self._comm = comm
         self._monitor = monitor_page
         self._latest: TelemetryFrame = TelemetryFrame()
+        self._history = deque(maxlen=300)
+        self._high_history = deque(maxlen=2000)
         self._worker = None  # 持有引用，防止 GC
         self._attachments: list = []  # [(文件名, mime, 原始字节)]
         self._rag_index: RAGIndex | None = None
@@ -122,6 +145,7 @@ class AIPage(QWidget):
         root.addWidget(self._build_chat_box(), 1)
 
         comm.telemetryReceived.connect(self._on_telemetry)
+        comm.highRateTelemetryReceived.connect(self._on_high_rate)
         self._load_config()
         # 启动即后台构建索引：有缓存时 <1s 就绪，首个问题不再错过检索
         self._ensure_rag_index()
@@ -130,13 +154,17 @@ class AIPage(QWidget):
     def _build_config_box(self) -> QGroupBox:
         box = QGroupBox("API 配置")
         f = QFormLayout(box)
+        self._profile = QComboBox()
+        self._profile.addItems(_AI_PRESETS)
         self._base_url = QLineEdit(AI_DEFAULT_BASE_URL)
         self._api_key = QLineEdit()
         self._api_key.setEchoMode(QLineEdit.Password)
         self._api_key.setPlaceholderText("sk-...")
         self._model = QLineEdit(AI_DEFAULT_MODEL)
+        self._profile.currentTextChanged.connect(self._on_profile_changed)
         btn_save = QPushButton("保存配置")
         btn_save.clicked.connect(self._on_save_config)
+        f.addRow("已保存模型", self._profile)
         f.addRow("Base URL", self._base_url)
         f.addRow("API Key", self._api_key)
         f.addRow("模型名称", self._model)
@@ -182,12 +210,16 @@ class AIPage(QWidget):
         btn_img.clicked.connect(self._on_add_images)
         self._btn_wave = QPushButton("分析当前波形")
         self._btn_wave.clicked.connect(self._on_analyze_waveform)
+        self._btn_pi = QPushButton("PI调参建议")
+        self._btn_pi.setToolTip("分析最近运行窗口的转速误差、超调和Iq振荡，并生成可执行调参建议")
+        self._btn_pi.clicked.connect(self._on_pi_tuning)
         self._attach_label = QLabel("")
         self._attach_label.setStyleSheet("color: #90a4ae;")
         btn_attach_clear = QPushButton("移除图片")
         btn_attach_clear.clicked.connect(self._clear_attachments)
         h2.addWidget(btn_img)
         h2.addWidget(self._btn_wave)
+        h2.addWidget(self._btn_pi)
         h2.addWidget(btn_attach_clear)
         h2.addWidget(self._attach_label, 1)
         v.addLayout(h2)
@@ -278,22 +310,43 @@ class AIPage(QWidget):
         RAGHelpDialog(self).exec()
 
     # -------- 配置持久化 --------
+    def _on_profile_changed(self, name: str) -> None:
+        profiles = getattr(self, "_saved_profiles", {})
+        cfg = profiles.get(name) or _AI_PRESETS.get(name, {})
+        self._base_url.setText(cfg.get("base_url", AI_DEFAULT_BASE_URL))
+        self._api_key.setText(cfg.get("api_key", ""))
+        self._model.setText(cfg.get("model", AI_DEFAULT_MODEL))
+        self._apply_config()
+        key_state = "密钥已保存" if cfg.get("api_key") else "请填写该模型的密钥"
+        self._config_status.setText(f"已选择 {name}（{key_state}）")
+
     def _load_config(self) -> None:
         try:
             with open(_CONFIG_FILE, "r", encoding="utf-8") as f:
                 cfg = json.load(f)
-            self._base_url.setText(cfg.get("base_url", AI_DEFAULT_BASE_URL))
-            self._api_key.setText(cfg.get("api_key", ""))
-            self._model.setText(cfg.get("model", AI_DEFAULT_MODEL))
-            self._apply_config()
-            self._config_status.setText("已从文件加载")
+            self._saved_profiles = dict(cfg.get("profiles", {}))
+            if not self._saved_profiles and (cfg.get("base_url") or cfg.get("model")):
+                # 兼容旧版单模型配置；当前实验室配置默认归入 DeepSeek。
+                self._saved_profiles["DeepSeek"] = {
+                    "base_url": cfg.get("base_url", _AI_PRESETS["DeepSeek"]["base_url"]),
+                    "api_key": cfg.get("api_key", ""),
+                    "model": cfg.get("model", _AI_PRESETS["DeepSeek"]["model"]),
+                }
+            selected = cfg.get("selected_profile", "DeepSeek")
+            index = self._profile.findText(selected)
+            self._profile.setCurrentIndex(index if index >= 0 else 0)
+            self._on_profile_changed(self._profile.currentText())
         except FileNotFoundError:
             pass
         except Exception as e:
             self._config_status.setText(f"加载失败：{e}")
 
     def _save_config_file(self, url: str, key: str, model: str) -> None:
-        cfg = {"base_url": url, "api_key": key, "model": model}
+        name = self._profile.currentText()
+        self._saved_profiles = getattr(self, "_saved_profiles", {})
+        self._saved_profiles[name] = {
+            "base_url": url, "api_key": key, "model": model}
+        cfg = {"selected_profile": name, "profiles": self._saved_profiles}
         with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
 
@@ -314,20 +367,131 @@ class AIPage(QWidget):
         self._apply_config()
         try:
             self._save_config_file(url, key, model)
-            self._config_status.setText(f"已保存到文件（模型：{model}）")
+            self._config_status.setText(
+                f"已保存 {self._profile.currentText()}（模型：{model}，密钥已保存）")
             logger.log("保存AI配置", f"模型={model}")
         except Exception as e:
             self._config_status.setText(f"内存已保存，文件写入失败：{e}")
 
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._latest = frame
+        if abs(frame.speed_target) > 1.0:
+            self._history.append((
+                float(frame.speed_actual), float(frame.speed_target),
+                float(frame.current_actual), float(frame.current_target)))
         snap = (
             f"实际转速={frame.speed_actual:.1f} rpm  给定转速={frame.speed_target:.1f} rpm\n"
             f"实际电流={frame.current_actual:.2f} A   给定电流={frame.current_target:.2f} A\n"
             f"实际转矩={frame.torque_actual:.2f} Nm  给定转矩={frame.torque_target:.2f} Nm\n"
-            f"实际角度={frame.angle_actual:.1f}°  温度={frame.temperature:.1f}°C"
+            f"实际角度={frame.angle_actual:.1f}°  温度={frame.temperature:.1f}°C\n"
+            f"速度PI：Kp={frame.speed_kp} Ki={frame.speed_ki}  "
+            f"Iq限流={frame.current_limit_a:.3f} A"
         )
         self._snapshot_label.setPlainText(snap)
+
+    def _on_high_rate(self, sample: dict) -> None:
+        target = float(self._latest.speed_target)
+        # 把采样时的目标冻结进样本；停机后分析不能使用已归零的最新目标。
+        if abs(target) > 1.0:
+            frozen = dict(sample)
+            frozen["target_rpm"] = target
+            self._high_history.append(frozen)
+
+    def _pi_report(self) -> str:
+        if len(self._high_history) >= 400:
+            hs = list(self._high_history)[-2000:]
+            samples = [(x["speed_rpm"], x["target_rpm"], x["iq_a"], x["iqref_a"])
+                       for x in hs]
+            source = "200Hz高速诊断通道"
+        else:
+            samples = list(self._history)
+            source = "10Hz常规遥测"
+        if len(samples) < 20:
+            return "有效运行数据不足20帧，请稳定运行至少3秒后再分析。"
+        # 先保留最近窗口，再自动切出进入目标带后的稳态段。
+        samples = samples[-2000:] if source.startswith("200Hz") else samples[-100:]
+        raw_samples = samples
+        rate_hz = 200 if source.startswith("200Hz") else 10
+        final_target = raw_samples[-1][1]
+        # 只分析最后一次相同目标的连续区段，避免阶跃前数据污染。
+        target_start = 0
+        for index in range(len(raw_samples) - 1, -1, -1):
+            if abs(raw_samples[index][1] - final_target) > 0.5:
+                target_start = index + 1
+                break
+        target_segment = raw_samples[target_start:]
+        settle_required = max(5, int(rate_hz * 0.5))
+        settle_index = None
+        band = max(abs(final_target) * 0.10, 20.0)
+        for index in range(0, len(target_segment) - settle_required + 1):
+            window = target_segment[index:index + settle_required]
+            if all(abs(speed - target) <= band for speed, target, _, _ in window):
+                settle_index = index
+                break
+        if settle_index is not None:
+            samples = target_segment[settle_index:]
+            settle_text = f"进入目标±10%用时约{settle_index / rate_hz:.2f}s"
+        else:
+            samples = target_segment[-max(20, rate_hz * 3):]
+            settle_text = "未检测到连续0.5s进入目标±10%，以下为末段统计"
+        speeds = [x[0] for x in samples]
+        targets = [x[1] for x in samples]
+        iqs = [x[2] for x in samples]
+        iqrefs = [x[3] for x in samples]
+        target = statistics.mean(targets)
+        if abs(target) <= 1.0:
+            return "目标转速无效，无法进行PI分析；请重新运行并采集数据。"
+        errors = [t - s for s, t, _, _ in samples]
+        mae = statistics.mean(abs(x) for x in errors)
+        speed_std = statistics.pstdev(speeds)
+        iq_std = statistics.pstdev(iqs)
+        overshoot = max(0.0, (max(speeds) - target) / max(abs(target), 1.0) * 100.0)
+        reversals = sum(1 for a, b in zip(iqs, iqs[1:]) if a * b < 0)
+        reversal_rate = reversals / max(len(iqs) - 1, 1) * 100.0
+        iqref_std = statistics.pstdev(iqrefs)
+        ref_reversals = sum(1 for a, b in zip(iqrefs, iqrefs[1:]) if a * b < 0)
+        ref_reversal_rate = ref_reversals / max(len(iqrefs) - 1, 1) * 100.0
+        kp, ki = int(self._latest.speed_kp), int(self._latest.speed_ki)
+        advice = []
+        if speed_std > max(0.02 * abs(target), 15.0) or overshoot > 10.0:
+            advice.append("速度存在明显振荡/超调：Kp先降低10%～20%，Ki降低20%～35%。")
+        elif mae > 0.05 * abs(target):
+            advice.append("稳态误差偏大且未明显振荡：Ki可提高10%～15%。")
+        else:
+            advice.append("转速跟踪已较稳定，不建议大幅修改Kp。")
+        change_kp = speed_std > max(0.02 * abs(target), 15.0) or overshoot > 10.0
+        change_ki = ref_reversal_rate > 10.0 or iqref_std > 0.15
+        if change_ki:
+            advice.append("Iqref本身波动明显：优先降低速度Ki约20%，并检查速度反馈滤波；不要先提高限流。")
+        elif reversal_rate > 10.0 or iq_std > 0.25:
+            advice.append("实际Iq波动但Iqref相对平稳：先检查电流采样/电流环，不应仅凭实际Iq降低速度PI。")
+        if kp > 0 and ki > 0:
+            next_kp = max(1, round(kp * 0.9)) if change_kp else kp
+            next_ki = max(1, round(ki * 0.8)) if change_ki else ki
+            advice.append(
+                f"建议首轮试值：Kp≈{next_kp}，Ki≈{next_ki}；"
+                "只修改被诊断为异常的参数并复测。")
+        return (
+            f"采集窗口：{len(raw_samples)}帧；稳态分析：{len(samples)}帧（{source}，{settle_text}）\n"
+            f"目标均值={target:.1f} rpm，速度均值={statistics.mean(speeds):.1f} rpm，"
+            f"MAE={mae:.1f} rpm，速度标准差={speed_std:.1f} rpm，超调={overshoot:.1f}%\n"
+            f"Iq均值={statistics.mean(iqs):.3f} A，Iq标准差={iq_std:.3f} A，"
+            f"正负切换率={reversal_rate:.1f}%\n"
+            f"Iqref均值={statistics.mean(iqrefs):.3f} A，Iqref标准差={iqref_std:.3f} A，"
+            f"Iqref正负切换率={ref_reversal_rate:.1f}%\n"
+            f"下位机速度PI：Kp={kp}，Ki={ki}\n" + "\n".join(advice))
+
+    def _on_pi_tuning(self) -> None:
+        report = self._pi_report()
+        self._append_chat("PI诊断", report)
+        if report.startswith("有效运行数据不足"):
+            return
+        self._input.setText(
+            "以下是本机统计的PI诊断：\n" + report + "\n"
+            "请结合当前电机状态，判断速度环Kp/Ki应如何调整。"
+            "请给出调整顺序、下一组具体数值、风险和复测判据；不要建议一次大幅修改。")
+        if hasattr(self, "_client"):
+            self._on_send()
 
     def _on_add_images(self) -> None:
         paths, _ = QFileDialog.getOpenFileNames(

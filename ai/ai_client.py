@@ -17,7 +17,9 @@ class AIClient:
             data=json.dumps(payload).encode("utf-8"),
             headers={
                 "Content-Type": "application/json",
+                "Accept": "application/json, text/event-stream",
                 "Authorization": f"Bearer {self.api_key}",
+                "User-Agent": "MotorControlHMI/1.6 (OpenAI-compatible client)",
             },
             method="POST",
         )

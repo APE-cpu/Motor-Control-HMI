@@ -16,11 +16,27 @@ def _app():
     return QApplication.instance() or QApplication([])
 
 
+def test_实验管理默认使用真机档案和真机方案(tmp_path):
+    _app()
+    page = ExperimentPage(CommManager(), storage_root=tmp_path / "records")
+
+    assert page._source.currentData() == "real"
+    assert page._equipment_combo.currentData() == "DEV-BUILTIN-78W-R001"
+    assert page._template_combo.currentData() == "TPL-BUILTIN-78W-BASELINE"
+    assert page._bus_voltage.value() == 24.0
+    assert page._expected_device_id.text() == "EBF-F407-JIAOYANG-PMSM-001"
+    assert page._equipment_controller.text() == "野火 STM32F407 骄阳开发板"
+    assert "真机" in page._purpose.toPlainText()
+    page.shutdown()
+
+
 def test_界面可以完成创建记录与正常结束(tmp_path, monkeypatch):
     _app()
     comm = CommManager()
     page = ExperimentPage(comm, software_version="test",
                           storage_root=tmp_path / "records")
+    # 本用例只验证基础会话生命周期，不执行默认模板的引导工作流。
+    page._template_combo.setCurrentIndex(-1)
     page._name.setText("界面转速阶跃")
     page._operator.setText("tester")
 
@@ -125,11 +141,12 @@ def test_主窗口包含实验管理页面且导航索引正确(tmp_path, monkey
     )
     window = MainWindow(enable_training=False)
 
-    assert window.stack.count() == 11
-    assert window.stack.indexOf(window.experiment_page) == 8
-    assert window.stack.indexOf(window.operation_log_page) == 9
-    assert window.stack.indexOf(window.manual_page) == 10
-    window.nav.select_page(8)
+    assert window.stack.count() == 12
+    assert window.stack.indexOf(window.current_sampling_page) == 8
+    assert window.stack.indexOf(window.experiment_page) == 9
+    assert window.stack.indexOf(window.operation_log_page) == 10
+    assert window.stack.indexOf(window.manual_page) == 11
+    window.nav.select_page(9)
     assert window.stack.currentWidget() is window.experiment_page
     window.close()
 
@@ -138,6 +155,8 @@ def test_历史列表可在软件重启后只读打开(tmp_path):
     _app()
     root = tmp_path / "records"
     first_page = ExperimentPage(CommManager(), storage_root=root)
+    # 本用例只验证历史归档，不执行默认模板的引导工作流。
+    first_page._template_combo.setCurrentIndex(-1)
     first_page._name.setText("历史回看实验")
     first_page._purpose.setPlainText("验证重新打开")
     first_page._on_start()

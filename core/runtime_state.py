@@ -106,6 +106,12 @@ class RuntimeStateMachine(QObject):
         self._require(RuntimeState.STOPPING, "当前没有待确认的停机过程")
         self._transition(RuntimeState.READY, reason)
 
+    def observe_device_stopped(self, reason: str = "遥测确认设备已停机") -> None:
+        """设备安全逻辑可在没有上位机STOP命令时主动受控停机。"""
+        if self._state not in (RuntimeState.RUNNING, RuntimeState.STOPPING):
+            return
+        self._transition(RuntimeState.READY, reason)
+
     def reject_stop(self, reason: str = "设备拒绝停机命令") -> None:
         """收到明确NACK时回到RUNNING；超时/链路未知不应调用本方法。"""
         self._require(RuntimeState.STOPPING, "当前没有待确认的停机过程")

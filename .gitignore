@@ -14,6 +14,8 @@ logs/*.txt
 # Local config
 config/ai_config.json
 config/motor_info.json
+config/pi_parameter_profiles.json
+config/comm_config.json
 
 # 本机 RAG 知识库（用户自行放置的资料）
 knowledge/
@@ -23,6 +25,10 @@ reports/
 
 # 实验会话运行数据（元数据、遥测、事件与报告）
 experiment_records/
+
+# 真机波形与电流采样诊断数据
+波形记录/
+电流采样诊断_*.csv
 
 # IDE
 .vscode/

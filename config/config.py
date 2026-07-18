@@ -9,7 +9,7 @@ from typing import Dict, List
 
 # ============ UI 刷新参数 ============
 MONITOR_REFRESH_MS = 100         # 监控页面刷新周期
-CURVE_BUFFER_SIZE = 100          # 曲线缓冲点数（最近 100 个点）
+CURVE_BUFFER_SIZE = 1000         # 曲线缓冲点数，保留完整多级转速实验过程
 TEMP_NORMAL_THRESHOLD = 60.0     # 正常温度阈值（°C）
 TEMP_HIGH_THRESHOLD = 85.0       # 高温阈值（°C）
 
@@ -127,7 +127,7 @@ class MotorConfig:
     motor_type: str = MOTOR_TYPES[0]
     model: str = "默认型号"
     pole_pairs: int = 4
-    max_rpm: float = 3000.0
+    max_rpm: float = 4000.0
 
 
 @dataclass

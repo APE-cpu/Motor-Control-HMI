@@ -3,9 +3,11 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox
 
-from communications.comm_manager import CommManager
+from communications.comm_manager import CommManager, TelemetryFrame
+from communications.protocol import decode_frame
+from config.config import CMD_RESET_FAULT
 from core import RuntimeState, RuntimeStateMachine, TransitionError
 from pages.control_page import ControlPage
 from pages.experiment_page import ExperimentPage
@@ -100,6 +102,46 @@ def test_控制页启动和停机必须经过状态机(tmp_path, monkeypatch):
     app.processEvents()
 
 
+def test_停止命令不被非running界面状态拦截(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    sent = []
+    monkeypatch.setattr(comm, "send_frame", lambda data: sent.append(data) or True)
+    machine = RuntimeStateMachine()  # DISCONNECTED: 模拟界面状态已丢失
+    page = ControlPage(comm, machine)
+
+    page._on_stop()
+
+    assert sent, "安全停机命令必须尝试发送"
+    assert machine.state is RuntimeState.DISCONNECTED
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
+def test_READY时下位机故障状态会发送复位而不是启动(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    sent = []
+    frame = TelemetryFrame()
+    frame.mc_state = 11
+    comm._latest_frame = frame
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(comm, "send_frame", lambda data: sent.append(data) or True)
+    monkeypatch.setattr(QMessageBox, "information", lambda *args, **kwargs: None)
+    machine = RuntimeStateMachine()
+    _make_ready(machine)
+    page = ControlPage(comm, machine)
+
+    page._on_start()
+
+    assert decode_frame(sent[-1])[0] == CMD_RESET_FAULT
+    assert machine.state is RuntimeState.READY
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
 def test_实验页软件预检通过后进入READY(tmp_path, monkeypatch):
     app = _app()
     comm = CommManager()
@@ -115,6 +157,9 @@ def test_实验页软件预检通过后进入READY(tmp_path, monkeypatch):
     page = ExperimentPage(
         comm, storage_root=tmp_path / "records",
         snapshot_provider=lambda: snapshot, runtime_state=machine)
+    page._source.setCurrentIndex(page._source.findData("sim"))
+    page._template_combo.setCurrentIndex(-1)
+    page._equipment_combo.setCurrentIndex(-1)
 
     page._run_precheck()
 
@@ -130,10 +175,10 @@ def test_实验页软件预检通过后进入READY(tmp_path, monkeypatch):
 def test_实验页预检发现数据源不匹配(tmp_path, monkeypatch):
     app = _app()
     comm = CommManager()
-    monkeypatch.setattr(comm, "is_sim_running", lambda: False)
-    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(comm, "is_sim_running", lambda: True)
+    monkeypatch.setattr(comm, "is_connected", lambda: False)
     machine = RuntimeStateMachine()
-    machine.connection_changed(True, "真实设备已连接")
+    machine.connection_changed(True, "数字孪生已连接")
     snapshot = {
         "device": {"name": "PMSM", "sensors": ["QEP"],
                    "extra": {"max_rpm": 3000}},
@@ -143,11 +188,11 @@ def test_实验页预检发现数据源不匹配(tmp_path, monkeypatch):
     page = ExperimentPage(
         comm, storage_root=tmp_path / "records",
         snapshot_provider=lambda: snapshot, runtime_state=machine)
-    # 页面默认选择数字孪生，但实际连接的是真实设备。
+    # 页面现在默认选择真实设备，但实际连接的是数字孪生。
     page._run_precheck()
 
     assert machine.state is RuntimeState.CONNECTED
-    assert "数字孪生" in page._precheck_detail.text()
+    assert "真实设备" in page._precheck_detail.text()
     page.shutdown()
     page.close()
     page.deleteLater()

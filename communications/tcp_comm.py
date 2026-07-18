@@ -1,4 +1,4 @@
-"""TCP 服务器通信封装（等待 STM32 客户端连接）。"""
+"""TCP 客户端通信封装（主动连接 STM32 TCP 服务端）。"""
 import socket
 from typing import Optional
 
@@ -9,27 +9,23 @@ class TCPComm(BaseComm):
     name = "TCP"
 
     def __init__(self) -> None:
-        self._server: Optional[socket.socket] = None
         self._conn: Optional[socket.socket] = None
 
-    def open(self, host: str = "0.0.0.0", port: int = 8888, timeout: float = 10.0, **_) -> bool:
-        self._server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self._server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self._server.bind((host, int(port)))
-        self._server.listen(1)
-        self._server.settimeout(timeout)
-        self._conn, _ = self._server.accept()  # 阻塞等待STM32连入
+    def open(self, host: str = "192.168.1.50", port: int = 5000,
+             timeout: float = 10.0, **_) -> bool:
+        self.close()
+        self._conn = socket.create_connection((host, int(port)), timeout)
+        self._conn.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         self._conn.settimeout(0.1)
         return True
 
     def close(self) -> None:
-        for s in (self._conn, self._server):
-            if s:
-                try:
-                    s.close()
-                except Exception:
-                    pass
-        self._conn = self._server = None
+        if self._conn:
+            try:
+                self._conn.close()
+            except Exception:
+                pass
+        self._conn = None
 
     def is_open(self) -> bool:
         return self._conn is not None

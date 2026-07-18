@@ -62,6 +62,13 @@ class TelemetryFrame:
         "low_speed_warn",  # 低速段是否进入不可用区
         "fault_code",      # 下位机故障位掩码；0 表示无锁定故障
         "fault_text",      # 可读故障原因
+        "mc_state",        # MCSDK状态机原始值；0=IDLE, 6=RUN, 11=FAULT_OVER
+        "max_rpm",         # 下位机实际采用的最高转速限制
+        "current_limit_a", # 下位机实际采用的Iq限流
+        "runaway_limit_rpm", # 当前动态跑飞阈值
+        "phase_current_a", # 相电流幅值，区别于current_actual(q轴电流)
+        "speed_kp",        # 下位机速度环实际Kp数字量
+        "speed_ki",        # 下位机速度环实际Ki数字量
         "data_source",     # "sim" / "real" / "real_partial"
     )
 
@@ -84,6 +91,13 @@ class TelemetryFrame:
         self.low_speed_warn = False
         self.fault_code = 0
         self.fault_text = ""
+        self.mc_state = 0
+        self.max_rpm = 0.0
+        self.current_limit_a = 0.0
+        self.runaway_limit_rpm = 0.0
+        self.phase_current_a = 0.0
+        self.speed_kp = 0
+        self.speed_ki = 0
         self.data_source = "sim"
 
 
@@ -92,6 +106,8 @@ class CommManager(QObject):
 
     statusChanged = Signal(bool, str)        # 连接状态 + 备注
     telemetryReceived = Signal(object)        # TelemetryFrame
+    highRateTelemetryReceived = Signal(object) # 200Hz紧凑诊断样本dict
+    currentSamplingDiagReceived = Signal(object) # F2 ADC/PWM采样诊断
     logMessage = Signal(str)                  # 日志/错误信息
     rawReceived = Signal(int, bytes)          # CAN原始帧 (arbitration_id, data)
     faultDetected = Signal(str)               # 需要进入 FAULT_LOCKED 的故障
@@ -506,12 +522,35 @@ class CommManager(QObject):
             return False
         command, payload = decoded
         with self._v2_lock:
-            if (self._v2_session is None or self._driver is None or
+            if self._driver is None or not self._driver.is_open():
+                self.logMessage.emit("[警告] negotiated-v2会话未就绪，命令被拒绝")
+                return False
+            if (self._v2_session is None or
                     self._v2_session.state is not ProtocolSessionState.READY):
+                if command in (CMD_STOP, CMD_EMERGENCY_STOP):
+                    try:
+                        wire = encode_v2_frame(V2Frame(
+                            MessageType.COMMAND, command=command,
+                            payload=payload, address=1, sequence=0xFFFF))
+                        self._send_real_v2_wire(wire)
+                        self.logMessage.emit(
+                            f"[发送] 无会话安全命令 CMD=0x{command:02X}")
+                        return True
+                    except Exception as exc:
+                        self.logMessage.emit(f"[错误] 无会话安全命令发送失败：{exc}")
+                        return False
                 self.logMessage.emit("[警告] negotiated-v2会话未就绪，命令被拒绝")
                 return False
             try:
                 request = self._v2_session.build_command(command, payload)
+            except ProtocolV2Error as exc:
+                # Capability rejection is local command validation, not a
+                # broken transport/session.  Keep heartbeat and safety
+                # commands available.
+                self.logMessage.emit(
+                    f"[错误] v2命令未发送 CMD=0x{command:02X}：{exc}")
+                return False
+            try:
                 self._v2_pending_legacy[request.sequence] = legacy_frame
                 wire = encode_v2_frame(request)
                 self._send_real_v2_wire(wire)
@@ -538,6 +577,62 @@ class CommManager(QObject):
                 continue
             if frame.message_type is MessageType.TELEMETRY:
                 self._protocol_stats["telemetry_frames"] += 1
+                if frame.command == 0xF1:
+                    if len(frame.payload) not in (12, 16):
+                        self._protocol_stats["crc_or_frame_errors"] += 1
+                        continue
+                    tick_ms, angle_raw, speed_rpm, iq_raw, iqref_raw = \
+                        struct.unpack("<IHhhh", frame.payload[:12])
+                    sample = {
+                        "tick_ms": tick_ms,
+                        "angle_deg": angle_raw * 360.0 / 65536.0,
+                        "speed_rpm": float(speed_rpm),
+                        "iq_a": iq_raw * 0.000629,
+                        "iqref_a": iqref_raw * 0.000629,
+                    }
+                    if len(frame.payload) == 16:
+                        ia_raw, ib_raw = struct.unpack("<hh", frame.payload[12:])
+                        sample["ia_a"] = ia_raw * 0.000629
+                        sample["ib_a"] = ib_raw * 0.000629
+                    self.highRateTelemetryReceived.emit(sample)
+                    outputs.append(sample)
+                    continue
+                if frame.command == 0xF2:
+                    if len(frame.payload) not in (21, 29):
+                        self._protocol_stats["crc_or_frame_errors"] += 1
+                        continue
+                    values = struct.unpack("<IHHHHBHHHH", frame.payload[:21])
+                    sample = {
+                        "tick_ms": values[0], "adc1_raw": values[1],
+                        "adc2_raw": values[2], "offset_a": values[3],
+                        "offset_b": values[4], "sector": values[5],
+                        "duty_a": values[6], "duty_b": values[7],
+                        "duty_c": values[8], "sample_point": values[9],
+                    }
+                    # STM32F4 injected left-aligned data uses bit 15 as sign;
+                    # the unsigned 12-bit result therefore spans 0..32760.
+                    # MCSDK doubles it before offset subtraction.
+                    adc_volts_per_count = 3.3 / 32768.0
+                    amps_per_mc_digit = 3.3 / (65536.0 * 0.01 * 8.0)
+                    sample.update({
+                        "adc1_v": values[1] * adc_volts_per_count,
+                        "adc2_v": values[2] * adc_volts_per_count,
+                        "zero_a_v": (values[3] / 2.0) * adc_volts_per_count,
+                        "zero_b_v": (values[4] / 2.0) * adc_volts_per_count,
+                        "adc1_delta_a": (values[3] - 2 * values[1]) * amps_per_mc_digit,
+                        "adc2_delta_a": (values[4] - 2 * values[2]) * amps_per_mc_digit,
+                    })
+                    if len(frame.payload) == 29:
+                        cal = struct.unpack("<HHHH", frame.payload[21:29])
+                        sample.update({
+                            "cal_adc1_min": cal[0], "cal_adc1_max": cal[1],
+                            "cal_adc2_min": cal[2], "cal_adc2_max": cal[3],
+                            "cal_adc1_pp": cal[1] - cal[0],
+                            "cal_adc2_pp": cal[3] - cal[2],
+                        })
+                    self.currentSamplingDiagReceived.emit(sample)
+                    outputs.append(sample)
+                    continue
                 try:
                     telemetry = self._parse_v2_telemetry(frame)
                 except ProtocolV2Error as exc:
@@ -758,7 +853,8 @@ class CommManager(QObject):
                         break
 
                 if session is not None:
-                    expired = session.expire_commands(1.0, now=now)
+                    expired = session.expire_commands(
+                        1.0, now=now, heartbeat_timeout_s=3.0)
                     for result in expired:
                         self._v2_pending_legacy.pop(result.sequence, None)
                         self._protocol_stats["timeouts"] += 1

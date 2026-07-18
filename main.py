@@ -12,10 +12,22 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import QEvent, QObject
+from PySide6.QtWidgets import QApplication, QAbstractSpinBox, QComboBox
 
 from main_window import MainWindow
 from runtime_paths import resource_path
+
+
+class _WheelValueGuard(QObject):
+    """让滚轮只负责滚动页面，避免经过参数控件时意外改值。"""
+
+    def eventFilter(self, watched, event):  # noqa: N802 - Qt signature
+        if (event.type() == QEvent.Wheel and
+                isinstance(watched, (QAbstractSpinBox, QComboBox))):
+            event.ignore()
+            return True
+        return super().eventFilter(watched, event)
 
 
 def _training_enabled() -> bool:
@@ -31,6 +43,8 @@ def main() -> int:
     app = QApplication(sys.argv)
     app.setApplicationName("电机控制上位机")
     app.setStyle("Fusion")
+    app._wheel_value_guard = _WheelValueGuard(app)
+    app.installEventFilter(app._wheel_value_guard)
 
     # 加载全局深色商务风格
     try:

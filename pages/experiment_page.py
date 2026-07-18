@@ -15,6 +15,8 @@ from PySide6.QtWidgets import (
 )
 
 from communications.comm_manager import CommManager
+from communications.protocol import encode_frame
+from config.config import CMD_RESET_FAULT
 from core import RuntimeState, RuntimeStateMachine, TransitionError
 from experiments import (
     DeviceProfile, EquipmentProfile, EquipmentProfileRepository,
@@ -92,6 +94,7 @@ class ExperimentPage(QWidget):
             self._runtime_state.stateChanged.connect(self._on_runtime_state_changed)
         self._refresh_templates()
         self._refresh_equipment_profiles()
+        self._apply_selected_equipment()
         self._apply_selected_template()
         self._apply_snapshot_preview()
         self._refresh_runtime_state()
@@ -116,8 +119,8 @@ class ExperimentPage(QWidget):
         self._bus_voltage.setRange(0, 10_000)
         self._bus_voltage.setSuffix(" V")
         self._source = QComboBox()
-        self._source.addItem("数字孪生", "sim")
         self._source.addItem("真实设备", "real")
+        self._source.addItem("数字孪生", "sim")
         form.addRow("实验名称", self._name)
         form.addRow("实验目的", self._purpose)
         form.addRow("操作者", self._operator)
@@ -646,9 +649,25 @@ class ExperimentPage(QWidget):
         )
         if answer != QMessageBox.Yes:
             return
+        device_reset_sent = False
+        if self._comm.is_connected():
+            latest = self._comm.latest_frame()
+            if (getattr(latest, "mc_state", 0) == 11 or
+                    int(getattr(latest, "fault_code", 0) or 0) != 0):
+                self._comm.send_frame(encode_frame(CMD_RESET_FAULT))
+                device_reset_sent = True
+                logger.log("下位机故障确认复位", "已发送RESET_FAULT清除MCSDK/应用层锁存")
+        if device_reset_sent:
+            # negotiated-v2 的发送结果是异步 ACK/NACK。运行状态只能由主窗口
+            # 收到设备 ACK 后复位，不能在这里提前伪装成 CONNECTED。
+            self._set_message("已发送下位机故障复位，正在等待设备ACK……")
+            return
         try:
-            self._runtime_state.reset_fault()
-            logger.log("故障状态复位", "用户确认故障原因已排除")
+            if self._runtime_state.state is RuntimeState.FAULT_LOCKED:
+                self._runtime_state.reset_fault()
+                logger.log("故障状态复位", "用户确认故障原因已排除")
+            if self._runtime_state.state is not RuntimeState.FAULT_LOCKED:
+                self._set_message("当前上位机和下位机均无待确认故障。")
         except TransitionError as exc:
             self._set_message(str(exc), error=True)
 
@@ -673,7 +692,8 @@ class ExperimentPage(QWidget):
         self._runtime_value.setStyleSheet(
             f"font-size: 16px; font-weight: 600; color: {color};")
         self._btn_precheck.setEnabled(state is RuntimeState.CONNECTED)
-        self._btn_reset_fault.setEnabled(state is RuntimeState.FAULT_LOCKED)
+        self._btn_reset_fault.setEnabled(
+            state is RuntimeState.FAULT_LOCKED or self._comm.is_connected())
 
     def _apply_snapshot_preview(self) -> None:
         """显示控制页当前设备摘要；真正快照仍在实验开始瞬间重新读取。"""
@@ -693,7 +713,6 @@ class ExperimentPage(QWidget):
 
     def _refresh_equipment_profiles(self, select_id: str = "") -> None:
         self._equipment_combo.clear()
-        self._equipment_combo.addItem("不使用设备档案（兼容模式）", "")
         for profile in self.equipment_repository.list_profiles():
             built_in = "（内置）" if profile.built_in else ""
             self._equipment_combo.addItem(
@@ -795,7 +814,6 @@ class ExperimentPage(QWidget):
 
     def _refresh_templates(self, select_id: str = "") -> None:
         self._template_combo.clear()
-        self._template_combo.addItem("不使用模板（自由实验）", "")
         for template in self.template_repository.list_templates():
             label = template.name + ("（内置）" if template.built_in else "")
             self._template_combo.addItem(label, template.template_id)

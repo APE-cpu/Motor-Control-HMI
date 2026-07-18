@@ -37,19 +37,21 @@ if _PG_OK:
 class TrendCurve(QWidget):
     """显示一条或多条同图曲线（如转速 实际值 vs 给定值）。"""
 
-    def __init__(self, title: str, series: Dict[str, str], y_label: str = "") -> None:
+    def __init__(self, title: str, series: Dict[str, str], y_label: str = "",
+                 buffer_size: int = CURVE_BUFFER_SIZE) -> None:
         super().__init__()
         self._popout_callbacks = []
         self._title = title
         self._series = series
         self._y_label = y_label
+        self._buffer_size = max(1, int(buffer_size))
         self._t0: float = 0.0  # 第一个数据点的时间，用于计算相对时间
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
         self._buffers: Dict[str, Deque[float]] = {
-            name: deque(maxlen=CURVE_BUFFER_SIZE) for name in series
+            name: deque(maxlen=self._buffer_size) for name in series
         }
-        self._times: Deque[float] = deque(maxlen=CURVE_BUFFER_SIZE)
+        self._times: Deque[float] = deque(maxlen=self._buffer_size)
         self._manual_y = False   # 用户手动缩放过 Y 轴时暂停自动量程
         if _PG_OK:
             self._plot = _YZoomPlot(self, title=title)
@@ -86,6 +88,28 @@ class TrendCurve(QWidget):
             self._update_stats()
         for cb in self._popout_callbacks:
             cb(values)
+
+    def append_batch(self, samples: list[Dict[str, float]], interval_s: float) -> None:
+        """批量加入高速样本，只重绘一次，避免高频刷新阻塞界面。"""
+        if not samples:
+            return
+        if not self._times:
+            self._t0 = time.time()
+        start = self._times[-1] + interval_s if self._times else 0.0
+        for index, values in enumerate(samples):
+            self._times.append(start + index * interval_s)
+            for name, value in values.items():
+                if name in self._buffers:
+                    self._buffers[name].append(float(value))
+        if _PG_OK:
+            for name, curve in self._curves.items():
+                count = len(self._buffers[name])
+                curve.setData(list(self._times)[-count:], list(self._buffers[name]))
+            self._update_y_range()
+            self._update_stats()
+        for values in samples:
+            for cb in self._popout_callbacks:
+                cb(values)
 
     def _update_y_range(self) -> None:
         """限制纵轴最小跨度：稳态噪声不再被自动缩放放大成满屏波浪。"""
@@ -124,3 +148,15 @@ class TrendCurve(QWidget):
 
     def add_popout_callback(self, cb) -> None:
         self._popout_callbacks.append(cb)
+
+    def clear(self) -> None:
+        """清空当前曲线数据并重置相对时间轴。"""
+        self._times.clear()
+        for buffer in self._buffers.values():
+            buffer.clear()
+        self._t0 = 0.0
+        self._manual_y = False
+        if _PG_OK:
+            for curve in self._curves.values():
+                curve.setData([], [])
+            self._stats_label.clear()

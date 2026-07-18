@@ -17,6 +17,9 @@ _LOG_PREFIXES = {
 }
 
 from communications.comm_manager import CommManager
+from communications.protocol_v2 import (
+    MessageType, ProtocolV2Error, decode_nack_payload, decode_v2_frame,
+)
 from communications.serial_comm import SerialComm
 from config.config import (
     BAUD_RATES_CAN, BAUD_RATES_SERIAL, COMM_TYPES,
@@ -84,8 +87,8 @@ def _protocol_doc() -> str:
 
 【五、以太网 TCP】
 
-  上位机作为监听端（Server）等待下位机接入。
-  当前版本 TCP 数据仅原样显示在日志中，不做遥测帧解析。
+  STM32 作为服务端监听 5000；上位机作为客户端主动连接板卡 IP。
+  TCP 直接承载 v2 帧，支持握手、命令 ACK 和遥测解析。
 
 【六、下位机侧参考实现】
 
@@ -220,12 +223,12 @@ class _TcpPanel(QWidget):
     def __init__(self) -> None:
         super().__init__()
         f = QFormLayout(self)
-        self.host = QLineEdit("0.0.0.0")
-        self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(8888)
+        self.host = QLineEdit("192.168.1.50")
+        self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(5000)
         self.timeout = QDoubleSpinBox(); self.timeout.setRange(1.0, 60.0); self.timeout.setValue(10.0)
-        f.addRow("监听地址", self.host)
-        f.addRow("监听端口", self.port)
-        f.addRow("等待连接超时 (s)", self.timeout)
+        f.addRow("板卡 IP", self.host)
+        f.addRow("板卡端口", self.port)
+        f.addRow("连接超时 (s)", self.timeout)
 
     def cfg(self) -> dict:
         return {
@@ -351,7 +354,12 @@ class CommunicationPage(QWidget):
         lh.addWidget(QLabel("过滤："))
         self._log_filter = QComboBox(); self._log_filter.addItems(list(_LOG_PREFIXES.keys()))
         self._log_filter.currentIndexChanged.connect(self._apply_log_filter)
-        lh.addWidget(self._log_filter); lh.addStretch(1)
+        lh.addWidget(self._log_filter)
+        lh.addWidget(QLabel("显示："))
+        self._receive_view = QComboBox()
+        self._receive_view.addItems(["协议解析", "原始 HEX"])
+        lh.addWidget(self._receive_view)
+        lh.addStretch(1)
         lv.addLayout(lh)
         self._log = QPlainTextEdit(); self._log.setReadOnly(True)
         self._log_lines: list[str] = []
@@ -484,10 +492,77 @@ class CommunicationPage(QWidget):
         self._append_log(f"[状态] {msg}")
 
     def _on_raw_received(self, arb_id: int, data: bytes) -> None:
-        if arb_id:
-            self._append_log(f"[接收] ID=0x{arb_id:03X}  ({data.hex(' ').upper()})")
+        if arb_id or self._receive_view.currentIndex() == 1:
+            prefix = f"ID=0x{arb_id:03X}  " if arb_id else ""
+            self._append_log(f"[接收] {prefix}({data.hex(' ').upper()})")
+            return
+        try:
+            frame = decode_v2_frame(data)
+        except ProtocolV2Error:
+            self._append_log(f"[接收] ({data.hex(' ').upper()})")
+            return
+
+        if frame.message_type is MessageType.CAPABILITIES:
+            try:
+                values = json.loads(frame.payload.decode("utf-8"))
+                self._append_log(
+                    "[接收] 设备能力："
+                    f"设备={values.get('device_id', '—')}，"
+                    f"硬件={values.get('hardware_version', '—')}，"
+                    f"固件={values.get('firmware_version', '—')}，"
+                    f"协议=v{values.get('protocol_max', frame.version)}")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._append_log("[接收] 设备能力帧（JSON无效）")
+        elif frame.message_type is MessageType.TELEMETRY:
+            if frame.command == 0xF1:
+                # 200 Hz/1 kHz binary samples belong to the real-time plots;
+                # logging every sample would flood the operator console.
+                if len(frame.payload) != 12:
+                    self._append_log(
+                        f"[接收] 高速诊断帧长度无效：{len(frame.payload)}")
+                return
+            try:
+                values = json.loads(frame.payload.decode("utf-8"))
+                temperature_valid = not (
+                    values.get("bus_state") == "uv"
+                    or float(values.get("vdc", 0) or 0) < 1.0
+                )
+                temperature_text = (
+                    f"{values.get('temperature', '—')} ℃"
+                    if temperature_valid
+                    else "不可用（采样电路未供电）"
+                )
+                self._append_log(
+                    "[接收] 遥测："
+                    f"转速={values.get('speed_actual', '—')} rpm，"
+                    f"目标={values.get('speed_target', '—')} rpm，"
+                    f"电流={values.get('current_actual', '—')} A，"
+                    f"母线={values.get('vdc', '—')} V，"
+                    f"温度={temperature_text}，"
+                    f"温度ADC={values.get('temperature_adc', '—')}，"
+                    f"故障={values.get('fault_code', '—')}")
+            except (UnicodeDecodeError, json.JSONDecodeError):
+                self._append_log("[接收] 遥测帧（JSON无效）")
+        elif frame.message_type is MessageType.ACK:
+            name = "心跳" if frame.command == 0 else f"命令0x{frame.command:02X}"
+            self._append_log(f"[接收] ACK：{name}，序号={frame.sequence}")
+        elif frame.message_type is MessageType.NACK:
+            try:
+                code, message = decode_nack_payload(frame.payload)
+                self._append_log(
+                    f"[接收] NACK：命令0x{frame.command:02X}，"
+                    f"错误={code}，原因={message}")
+            except ProtocolV2Error:
+                self._append_log(
+                    f"[接收] NACK：命令0x{frame.command:02X}，内容无效")
+        elif frame.message_type is MessageType.HELLO:
+            self._append_log(f"[接收] HELLO：序号={frame.sequence}")
+        elif frame.message_type is MessageType.HEARTBEAT:
+            self._append_log(f"[接收] 心跳：序号={frame.sequence}")
         else:
-            self._append_log(f"[接收]   ({data.hex(' ').upper()})")
+            self._append_log(
+                f"[接收] V2帧：类型={frame.message_type.name}，"
+                f"序号={frame.sequence}")
 
     def _on_protocol_session(self, status: dict) -> None:
         state = status.get("session_state", "not_active")

@@ -18,21 +18,24 @@ def _iso_now() -> str:
 def default_78w_template() -> ExperimentTemplate:
     return ExperimentTemplate(
         template_id="TPL-BUILTIN-78W-BASELINE",
-        name="78W PMSM 基础运行实验",
-        purpose="验证实验工作流、转速跟踪、停机过程和数据归档完整性",
-        data_source="sim",
+        name="野火 78W PMSM 真机基础运行实验",
+        purpose="验证真机通信、1000 rpm转速跟踪、电流波动、停机过程和数据归档完整性",
+        data_source="real",
         device_defaults={
             "name": "78W PMSM", "motor_type": "PMSM",
-            "rated_power_w": 78.0, "dc_bus_voltage_v": 48.0,
+            "rated_power_w": 78.0, "dc_bus_voltage_v": 24.0,
         },
-        safety_limits={"max_rpm": 3000.0, "max_bus_voltage_v": 60.0},
+        safety_limits={
+            "max_rpm": 4000.0, "max_bus_voltage_v": 30.0,
+            "max_current_a": 4.49, "max_temperature_c": 80.0,
+        },
         steps=[
             WorkflowStep("S01", "核对实验配置",
                          "核对设备、数据源、控制方式、目标值和保护参数。",
                          "配置与本次实验目的一致"),
             WorkflowStep("S02", "确认接线与安全状态",
-                         "确认急停可用；仿真时确认未误连真实功率级。",
-                         "接线和供电状态适合本次实验"),
+                         "确认急停可用、24 V母线极性正确，电机接驱动板接口1，QEP接接口1。",
+                         "真机接线和供电状态适合本次实验"),
             WorkflowStep("S03", "执行运行预检",
                          "在设备运行状态机区域执行预检并处理全部失败项。",
                          "状态机进入READY", True, "ready"),

@@ -62,7 +62,7 @@ def test_生成Markdown_HTML和SVG完整实验报告(tmp_path):
     html = paths.html.read_text(encoding="utf-8")
     svg = paths.svg.read_text(encoding="utf-8")
     assert "报告转速阶跃" in markdown
-    assert "78W PMSM 基础运行实验" in markdown
+    assert "野火 78W PMSM 真机基础运行实验" in markdown
     assert "步骤验证完成" in markdown
     assert "转速平均绝对跟踪误差" in markdown
     assert "运行状态切换" in markdown
