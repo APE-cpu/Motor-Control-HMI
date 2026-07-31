@@ -127,7 +127,7 @@ class AIPage(QWidget):
         self._monitor = monitor_page
         self._latest: TelemetryFrame = TelemetryFrame()
         self._history = deque(maxlen=300)
-        self._high_history = deque(maxlen=2000)
+        self._high_history = deque(maxlen=5000)
         self._worker = None  # 持有引用，防止 GC
         self._attachments: list = []  # [(文件名, mime, 原始字节)]
         self._rag_index: RAGIndex | None = None
@@ -146,6 +146,7 @@ class AIPage(QWidget):
 
         comm.telemetryReceived.connect(self._on_telemetry)
         comm.highRateTelemetryReceived.connect(self._on_high_rate)
+        comm.highRateTelemetryBatchReceived.connect(self._on_high_rate_batch)
         self._load_config()
         # 启动即后台构建索引：有缓存时 <1s 就绪，首个问题不再错过检索
         self._ensure_rag_index()
@@ -397,21 +398,27 @@ class AIPage(QWidget):
             frozen["target_rpm"] = target
             self._high_history.append(frozen)
 
+    def _on_high_rate_batch(self, samples: list[dict]) -> None:
+        for sample in samples:
+            self._on_high_rate(sample)
+
     def _pi_report(self) -> str:
         if len(self._high_history) >= 400:
-            hs = list(self._high_history)[-2000:]
+            rate_hz = int(self._high_history[-1].get("rate_hz", 200))
+            window_size = min(len(self._high_history), rate_hz * 10)
+            hs = list(self._high_history)[-window_size:]
             samples = [(x["speed_rpm"], x["target_rpm"], x["iq_a"], x["iqref_a"])
                        for x in hs]
-            source = "200Hz高速诊断通道"
+            source = f"{rate_hz}Hz高速诊断通道"
         else:
             samples = list(self._history)
             source = "10Hz常规遥测"
         if len(samples) < 20:
             return "有效运行数据不足20帧，请稳定运行至少3秒后再分析。"
         # 先保留最近窗口，再自动切出进入目标带后的稳态段。
-        samples = samples[-2000:] if source.startswith("200Hz") else samples[-100:]
+        samples = samples[-rate_hz * 10:] if "高速诊断" in source else samples[-100:]
         raw_samples = samples
-        rate_hz = 200 if source.startswith("200Hz") else 10
+        rate_hz = rate_hz if "高速诊断" in source else 10
         final_target = raw_samples[-1][1]
         # 只分析最后一次相同目标的连续区段，避免阶跃前数据污染。
         target_start = 0

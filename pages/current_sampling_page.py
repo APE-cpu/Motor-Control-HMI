@@ -20,10 +20,10 @@ class CurrentSamplingPage(QWidget):
         title = QLabel("电流采样诊断（50 Hz，不阻塞控制心跳）")
         title.setObjectName("PageTitle")
         root.addWidget(title)
-        note = QLabel("独立显示 ADC 注入采样、零点校准、PWM 扇区、占空比和采样点；仅在电机 RUN 时更新。运行监控F1仍为200 Hz。")
+        note = QLabel("独立显示 ADC 注入采样、零点校准、PWM 扇区、占空比和采样点；仅在电机 RUN 时更新。运行监控F1：以太网1 kHz，串口200 Hz。")
         note.setWordWrap(True)
         root.addWidget(note)
-        timing = QLabel("控制：电流环 16 kHz / 62.5 µs；速度环 500 Hz / 2 ms　　遥测：F1 200 Hz；F2 50 Hz")
+        timing = QLabel("控制：电流环 16 kHz / 62.5 µs；速度环 500 Hz / 2 ms　　遥测：F1 以太网1 kHz/串口200 Hz；F2 50 Hz")
         timing.setStyleSheet("color: #4fc3f7; font-weight: bold;")
         root.addWidget(timing)
 
@@ -39,7 +39,8 @@ class CurrentSamplingPage(QWidget):
                        ("cal_adc2_pp", "校准期ADC2峰峰")])
         fields.extend([("adc1_v", "ADC1电压/V"), ("adc2_v", "ADC2电压/V"),
                        ("adc1_delta_a", "ADC1等效电流/A"),
-                       ("adc2_delta_a", "ADC2等效电流/A")])
+                       ("adc2_delta_a", "ADC2等效电流/A"),
+                       ("vdda_v", "实测VDDA/V")])
         for index, (key, text) in enumerate(fields):
             grid.addWidget(QLabel(text), index // 3 * 2, index % 3)
             value = QLabel("--")
@@ -105,7 +106,7 @@ class CurrentSamplingPage(QWidget):
                   "cal_adc1_min", "cal_adc1_max", "cal_adc1_pp",
                   "cal_adc2_min", "cal_adc2_max", "cal_adc2_pp",
                   "adc1_v", "adc2_v", "zero_a_v", "zero_b_v",
-                  "adc1_delta_a", "adc2_delta_a")
+                  "adc1_delta_a", "adc2_delta_a", "vdda_v")
         with open(path, "w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.DictWriter(stream, fieldnames=fields)
             writer.writeheader()

@@ -108,13 +108,15 @@ def test_连续三次读取异常触发通信故障(monkeypatch):
     assert "连续读取异常" in faults[0]
 
 
-def test_真实设备遥测超时触发一次故障(monkeypatch):
+def test_真实设备遥测超时只告警不锁定故障(monkeypatch):
     comm = CommManager()
     comm._driver = _OpenDriver()
     comm._kind = "CAN总线"
     comm._last_valid_at = 0.0
     faults = []
+    logs = []
     comm.faultDetected.connect(faults.append)
+    comm.logMessage.connect(logs.append)
     monkeypatch.setattr(comm, "_read_real_frame", lambda: None)
     monkeypatch.setattr("communications.comm_manager.time.monotonic", lambda: 3.0)
     monkeypatch.setattr(
@@ -123,4 +125,5 @@ def test_真实设备遥测超时触发一次故障(monkeypatch):
 
     comm._poll_loop()
 
-    assert faults == ["真实设备遥测连续 2 秒超时"]
+    assert faults == []
+    assert any("遥测连续 2 秒超时" in item for item in logs)

@@ -9,9 +9,9 @@ from .base_controller import BaseController
 class VoltageControlController(BaseController):
     name = "VoltagePWM"
 
-    def __init__(self, dc_bus_voltage: float = 48.0, duty: float = 0.5,
+    def __init__(self, dc_bus_voltage: float = 24.0, duty: float = 0.5,
                  pwm_frequency: float = 20_000.0,
-                 voltage_limit: float = 48.0) -> None:
+                 voltage_limit: float = 24.0) -> None:
         self.vdc = dc_bus_voltage
         self.duty = duty
         self.f_pwm = pwm_frequency

@@ -1,5 +1,6 @@
 """电机控制页面：电机信息、位置传感器、控制方式、参数面板、控制按钮。"""
 import json
+import time
 from datetime import datetime
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -12,7 +13,7 @@ from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import encode_frame
 from core import RuntimeState, RuntimeStateMachine, TransitionError
 from config.config import (
-    CMD_EMERGENCY_STOP, CMD_RESET_FAULT, CMD_SET_PARAMS, CMD_SET_SENSOR,
+    CMD_EMERGENCY_STOP, CMD_SET_PARAMS, CMD_SET_SENSOR,
     CMD_START, CMD_STOP,
     CONTROL_MODES_BY_MOTOR, MOTOR_TYPES, POSITION_SENSORS, SENSOR_REGISTRY,
 )
@@ -96,6 +97,8 @@ class ControlPage(QWidget):
         self._comm = comm
         self._state_machine = state_machine
         self._current_sensor_name = POSITION_SENSORS[1]
+        self._start_command_pending = False
+        self._start_retry_not_before = 0.0
 
         # 为所有可能的控制方式各建一份控制器和面板（懒加载亦可，这里为简洁全建）
         self._controllers = {name: cls() for name, (cls, _) in _MODE_REGISTRY.items()}
@@ -118,6 +121,12 @@ class ControlPage(QWidget):
         root.addLayout(self._build_buttons())
 
         comm.telemetryReceived.connect(self._on_telemetry)
+        comm.commandResult.connect(self._on_command_result)
+        comm.statusChanged.connect(self._on_comm_status_changed)
+
+        # 顶部“电流限幅”与 PI 面板 iq_max 是同一物理量，保持双向同步。
+        self._syncing_iq_limit = False
+        self._wire_iq_limit_sync()
 
         # 初始按当前电机类型刷新控制方式列表
         self._refresh_modes_for_motor()
@@ -137,7 +146,7 @@ class ControlPage(QWidget):
         # 野火 78 W PMSM 额定最高转速为 4000 rpm；若档案已保存上限则优先使用。
         self._max_rpm.setValue(int(saved.get("max_rpm", 4000)))
         self._current_limit = QDoubleSpinBox()
-        # 当前野火电机参数 NOMINAL_CURRENT=7149，按下位机采样比例约4.496 A。
+        # 恢复实验基线：3000 digit ≈ 1.887 A（NOMINAL 上限约 4.49 A）。
         self._current_limit.setRange(0.1, 4.49)
         self._current_limit.setDecimals(3)
         self._current_limit.setSuffix(" A")
@@ -541,8 +550,13 @@ class ControlPage(QWidget):
             widget = getattr(panel, key, None)
             if widget is not None and key in values:
                 widget.setValue(float(values[key]))
+        # iq_max / max_current_a / 顶部电流限幅三者统一
         if "max_current_a" in values:
             self._current_limit.setValue(float(values["max_current_a"]))
+        elif "iq_max" in values:
+            self._current_limit.setValue(float(values["iq_max"]))
+        if hasattr(panel, "iq_max"):
+            panel.iq_max.setValue(self._current_limit.value())
         if "max_rpm" in values:
             self._max_rpm.setValue(int(values["max_rpm"]))
         self._select_mode("闭环PI控制")
@@ -742,12 +756,49 @@ class ControlPage(QWidget):
             "protection_params": protection,
         }
 
+    def _wire_iq_limit_sync(self) -> None:
+        """电流限幅 ↔ 转速环 iq_max 双向同步，避免界面上出现两个互相打架的上限。"""
+        pi = self._panels.get("闭环PI控制")
+        if pi is None or not hasattr(pi, "iq_max"):
+            return
+        # 以顶部电流限幅为初始权威值，覆盖 PI 面板旧默认 1.887。
+        pi.iq_max.setValue(self._current_limit.value())
+        self._current_limit.valueChanged.connect(self._on_top_current_limit_changed)
+        pi.iq_max.valueChanged.connect(self._on_pi_iq_max_changed)
+
+    def _on_top_current_limit_changed(self, value: float) -> None:
+        if self._syncing_iq_limit:
+            return
+        pi = self._panels.get("闭环PI控制")
+        if pi is None or not hasattr(pi, "iq_max"):
+            return
+        self._syncing_iq_limit = True
+        try:
+            pi.iq_max.setValue(float(value))
+        finally:
+            self._syncing_iq_limit = False
+
+    def _on_pi_iq_max_changed(self, value: float) -> None:
+        if self._syncing_iq_limit:
+            return
+        self._syncing_iq_limit = True
+        try:
+            self._current_limit.setValue(float(value))
+        finally:
+            self._syncing_iq_limit = False
+
     def _on_apply(self) -> None:
         mode = self._current_mode()
         if not mode:
             return
-        params = self._panels[mode].values()
-        current_limit = self._current_limit.value()
+        params = dict(self._panels[mode].values())
+        # PI 面板 iq_max 与顶部电流限幅统一后再下发，固件只认 max_current_a。
+        if "iq_max" in params:
+            current_limit = float(params["iq_max"])
+            self._current_limit.setValue(current_limit)
+            params["iq_max"] = current_limit
+        else:
+            current_limit = float(self._current_limit.value())
         self._comm.configure_motor_current_limit(current_limit)
         try:
             self._controllers[mode].set_params(**params)
@@ -811,11 +862,34 @@ class ControlPage(QWidget):
         self._comm.send_frame_with_id(frame, can_id=can_id)
 
     def _on_start(self) -> None:
+        now = time.monotonic()
+        if self._start_command_pending:
+            logger.log("忽略重复启动", "上一条START仍在等待设备ACK")
+            return
+        if now < self._start_retry_not_before:
+            logger.log("忽略过快启动", "停机/启动应答后的安全冷却尚未结束")
+            return
         if not self._comm.is_connected() and not self._comm.is_sim_running():
             QMessageBox.warning(
                 self, "无法启动",
                 "通信未连接，请先在「通信设置」页面建立连接，或启动仿真（虚拟电机）。")
             return
+        # UI 高速绘图拥塞时，STOP ACK/状态信号可能晚于设备实际停机。
+        # 只在遥测同时证明“非 RUN、零目标、近零速、无故障”时修复残留状态；
+        # 任一条件不满足都保持原有安全拦截。
+        if (self._state_machine is not None and
+                self._state_machine.state in
+                (RuntimeState.RUNNING, RuntimeState.STOPPING)):
+            latest = self._comm.latest_frame()
+            device_stopped = (
+                int(getattr(latest, "mc_state", 0) or 0) not in (6, 11) and
+                int(getattr(latest, "fault_code", 0) or 0) == 0 and
+                abs(float(getattr(latest, "speed_target", 0.0) or 0.0)) < 0.5 and
+                abs(float(getattr(latest, "speed_actual", 0.0) or 0.0)) < 30.0
+            )
+            if device_stopped:
+                self._state_machine.observe_device_stopped(
+                    "启动前遥测确认设备已停机，修复残留运行状态")
         if (self._state_machine is not None and
                 self._state_machine.state is not RuntimeState.READY):
             QMessageBox.warning(
@@ -831,15 +905,11 @@ class ControlPage(QWidget):
             if ans != QMessageBox.Yes:
                 return
 
-        # MCSDK仍停留在FAULT_OVER时，START必然被拒绝。先明确发送故障复位，
-        # 保持上位机READY，待下一帧确认mc_state恢复后再由用户启动。
+        # MCSDK FAULT_OVER（mc_state=11）不再拦截：固件 START 通过联锁检查后
+        # 会自行 MC_AcknowledgeFaultMotor1() 清掉已消失的故障；若联锁未通过，
+        # START 会收到明确 NACK，由 commandResult 路径提示。
         if getattr(self._comm.latest_frame(), "mc_state", 0) == 11:
-            self._comm.send_frame(encode_frame(CMD_RESET_FAULT))
-            QMessageBox.information(
-                self, "正在复位故障",
-                "下位机仍处于FAULT_OVER，已发送故障复位。\n"
-                "请确认故障清除后再次点击启动。")
-            return
+            logger.log("启动时FAULT_OVER待确认", "由下位机START流程自动确认")
 
         target = float(self._target_speed.value())
         max_rpm = float(self._max_rpm.value())
@@ -855,12 +925,30 @@ class ControlPage(QWidget):
         else:
             start_parts.append("control_mode=speed_closed")
         payload = ";".join(start_parts).encode("utf-8")
+        pending_before = self._comm.protocol_status().get("pending_ack", 0)
         sent = self._comm.send_frame(encode_frame(CMD_START, payload))
-        if not sent:
+        pending_after = self._comm.protocol_status().get("pending_ack", 0)
+        submitted_async = (
+            self._comm.protocol_status().get("mode") == "negotiated-v2" and
+            pending_after > pending_before
+        )
+        if submitted_async:
+            self._start_command_pending = True
+        if not sent and not submitted_async:
             return
+        logger.log("启动电机命令已提交",
+                   f"目标转速={target} rpm 控制方式={self._current_mode()} "
+                   f"等待设备ACK={submitted_async}")
         if self._state_machine is not None:
-            # v2 ACK 信号可能已在 send_frame 内同步推进状态；legacy-v1 仍在此确认。
-            if self._state_machine.state is RuntimeState.READY:
+            # negotiated-v2 的“已提交”绝不等于“设备已启动”。真实设备只能由
+            # MainWindow 收到 START ACK 后推进到 RUNNING；NACK 时必须保持 READY。
+            # virtual-v2 的同步 ACK 已在 send_frame 内发出 commandResult，异步 ACK
+            # 也由同一路径处理。仅 legacy/本地仿真保留本地确认。
+            protocol_mode = self._comm.protocol_status().get("mode")
+            device_ack_authoritative = protocol_mode in (
+                "negotiated-v2", "virtual-v2")
+            if (not device_ack_authoritative and
+                    self._state_machine.state is RuntimeState.READY):
                 try:
                     self._state_machine.confirm_started("启动命令本地发送成功")
                 except TransitionError as exc:
@@ -885,16 +973,31 @@ class ControlPage(QWidget):
             except TransitionError as exc:
                 logger.log("停止状态转换异常", str(exc))
         sent = self._comm.send_frame(encode_frame(CMD_STOP))
+        # 清除尚未处理的START意图，并给功率级/MCSDK状态回落留出时间。
+        self._start_command_pending = False
+        self._start_retry_not_before = time.monotonic() + 2.0
         if self._state_machine is not None:
             # v2 ACK/NACK 可能已通过 commandResult 同步改变状态。
-            if sent and self._state_machine.state is RuntimeState.STOPPING:
-                self._state_machine.confirm_stopped("停止命令本地发送成功")
+            mode = self._comm.protocol_status().get("mode")
+            if (sent and (mode == "virtual-v2" or self._comm.is_sim_running()) and
+                    self._state_machine.state is RuntimeState.STOPPING):
+                self._state_machine.confirm_stopped("数字孪生确认停机")
             elif not sent and self._state_machine.state is RuntimeState.STOPPING:
                 protocol = self._comm.protocol_status()
                 if not (protocol["mode"] in ("virtual-v2", "negotiated-v2") and
                         protocol["pending_ack"] > 0):
                     self._state_machine.lock_fault("停止命令发送失败，设备状态未知")
         logger.log("停止电机")
+
+    def _on_command_result(self, result) -> None:
+        if getattr(result, "command", None) == CMD_START:
+            self._start_command_pending = False
+            # ACK/NACK后短暂抑制积压鼠标事件再次发START。
+            self._start_retry_not_before = time.monotonic() + 1.0
+
+    def _on_comm_status_changed(self, connected: bool, _message: str) -> None:
+        if not connected:
+            self._start_command_pending = False
 
     def _on_emergency(self) -> None:
         for c in self._controllers.values():
@@ -904,33 +1007,6 @@ class ControlPage(QWidget):
             self._state_machine.lock_fault("用户触发紧急停止")
         logger.log("紧急停止")
         QMessageBox.critical(self, "紧急停止", "已发送紧急停止指令！")
-
-    def _on_toggle_sim(self) -> None:
-        if not self._sim_running:
-            if self._comm.is_connected():
-                QMessageBox.warning(
-                    self, "不可用",
-                    "真实设备已连接。请先断开真机通信，再启动仿真。")
-                return
-            self._comm.start_simulation()
-            self._sim_running = True
-            if self._state_machine is not None:
-                self._state_machine.connection_changed(True, "数字孪生已连接")
-            self._btn_sim.setText("停止仿真")
-            logger.log("启动仿真")
-        else:
-            if (self._state_machine is not None and
-                    self._state_machine.state in
-                    (RuntimeState.RUNNING, RuntimeState.STOPPING)):
-                QMessageBox.warning(self, "不能停止仿真",
-                                    "电机仍在运行，请先执行正常停机或紧急停止。")
-                return
-            self._comm.stop_simulation()
-            self._sim_running = False
-            if self._state_machine is not None:
-                self._state_machine.connection_changed(False, "数字孪生已断开")
-            self._btn_sim.setText("启动仿真")
-            logger.log("停止仿真")
 
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._last_speed_rpm = frame.speed_actual

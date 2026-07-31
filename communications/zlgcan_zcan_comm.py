@@ -324,13 +324,16 @@ class ZlgCanZcanComm(BaseComm):
              is_extended: bool = False) -> int:
         if not self.is_open():
             raise RuntimeError("ZLG CAN(ZCAN) 未打开")
+        if len(data) > 8:
+            raise ValueError(
+                f"经典CAN单帧最多8字节，拒绝静默截断 {len(data)} 字节")
         tx = _ZcanTransmitData()
         can_id = int(arbitration_id) & _CAN_ID_MASK
         if is_extended:
             can_id |= _CAN_EFF_FLAG
         tx.frame.can_id = can_id
         tx.transmit_type = 0          # 0=正常发送
-        n = min(len(data), 8)
+        n = len(data)
         tx.frame.can_dlc = n
         for i in range(n):
             tx.frame.data[i] = data[i]

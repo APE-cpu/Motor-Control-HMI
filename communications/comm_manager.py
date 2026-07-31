@@ -81,7 +81,7 @@ class TelemetryFrame:
         self.torque_target = 0.0
         self.angle_actual = 0.0
         self.temperature = 25.0
-        self.vdc = 48.0
+        self.vdc = 24.0
         self.bus_state = "normal"
         self.powers = {}
         self.sensor_source = ""
@@ -104,10 +104,23 @@ class TelemetryFrame:
 class CommManager(QObject):
     """通信管理器（线程安全），通过 Qt 信号将数据推给 UI。"""
 
+    # Heartbeat cadence must stay well inside the device PC-link watchdog
+    # (firmware 0.4.5: 15 s RX silence after a 3 s start arm).  ACK timeout
+    # used to be 3 s and false-killed the session whenever high-rate F1
+    # telemetry crowded the device TX queue and dropped a single heartbeat
+    # ACK; the motor then lost host traffic and tripped COMM_LOSS.  Keep
+    # heartbeats frequent, but tolerate multi-second ACK / telemetry gaps.
+    _V2_HEARTBEAT_INTERVAL_S = 0.5
+    _V2_HEARTBEAT_ACK_TIMEOUT_S = 8.0
+    _V2_TELEMETRY_LIVENESS_S = 3.0
+
     statusChanged = Signal(bool, str)        # 连接状态 + 备注
     telemetryReceived = Signal(object)        # TelemetryFrame
-    highRateTelemetryReceived = Signal(object) # 200Hz紧凑诊断样本dict
+    highRateTelemetryReceived = Signal(object) # 以太网1kHz/串口200Hz紧凑诊断样本
+    highRateTelemetryBatchReceived = Signal(object) # 以太网批量样本，降低UI事件率
     currentSamplingDiagReceived = Signal(object) # F2 ADC/PWM采样诊断
+    rlsCoeffReceived = Signal(object)         # F3 在线ARX/RLS辨识系数
+    burstReceived = Signal(object)            # F4 16kHz突发抓取波形(重组完成)
     logMessage = Signal(str)                  # 日志/错误信息
     rawReceived = Signal(int, bytes)          # CAN原始帧 (arbitration_id, data)
     faultDetected = Signal(str)               # 需要进入 FAULT_LOCKED 的故障
@@ -139,7 +152,9 @@ class CommManager(QObject):
         self._last_command_result: CommandResult | None = None
         self._v2_pending_legacy: dict[int, bytes] = {}
         self._v2_last_heartbeat_at = 0.0
+        self._v2_heartbeat_ack_warned_at = 0.0
         self._v2_connection_lost_reported = False
+        self._rx_backlog_warned_at = 0.0
         self._v2_stream_decoder: V2StreamDecoder | None = None
         self._protocol_stats = self._new_protocol_stats()
         self._expected_device_identity = {
@@ -217,7 +232,10 @@ class CommManager(QObject):
             if identity_error:
                 raise ProtocolV2Error(identity_error)
 
-            self._v2_last_heartbeat_at = time.monotonic()
+            now = time.monotonic()
+            self._v2_last_heartbeat_at = now
+            self._last_valid_at = now
+            self._v2_heartbeat_ack_warned_at = 0.0
             self._v2_connection_lost_reported = False
             self._protocol_stats["handshakes"] += 1
             self._stop.clear()
@@ -434,9 +452,41 @@ class CommManager(QObject):
         elif cmd == CMD_EMERGENCY_STOP:
             self._motor_sim.emergency_stop()
             self.logMessage.emit("[仿真] 虚拟电机紧急停止")
+        elif cmd == 0x20:  # CMD_SET_PARAMS，避免循环导入额外常量
+            try:
+                params = dict(
+                    part.split("=", 1) for part in payload.decode("utf-8").split(";")
+                    if "=" in part)
+                if "target" in params:
+                    self._motor_sim.speed_ref_rpm = float(params["target"])
+                    self.logMessage.emit(
+                        f"[仿真] 在线目标转速已设为 {self._motor_sim.speed_ref_rpm:.0f} rpm")
+                else:
+                    self.logMessage.emit("[仿真] 参数已接收（无target字段）")
+            except (UnicodeDecodeError, ValueError) as exc:
+                self.logMessage.emit(f"[仿真] 参数解析失败：{exc}")
+                return False
         else:
             self.logMessage.emit(f"[仿真] 虚拟电机收到 CMD=0x{cmd:02X}（未实现，忽略）")
         return True
+
+    def send_telemetry_config(self, flags: int, f1_ms: int,
+                              f2_ms: int, f3_ms: int) -> bool:
+        """下发遥测档位到固件（CMD_SET_TELEMETRY=0x22）。
+        flags: bit0=F2诊断开, bit1=F3在线辨识开; f1_ms=0 表示按传输默认。
+        由上位机把'省流/标准/辨识/自定义'解析成具体速率，固件只认速率。"""
+        from communications.protocol import encode_frame
+        self._f1_period_ms = int(f1_ms)   # F1 波形时间轴按此换算，勿再硬编码1kHz
+        payload = struct.pack("<BHHH", flags & 0xFF, f1_ms & 0xFFFF,
+                              f2_ms & 0xFFFF, f3_ms & 0xFFFF)
+        return self.send_frame(encode_frame(0x22, payload))
+
+    def send_burst_trigger(self) -> bool:
+        """请求一次 16kHz 突发抓取（CMD_CAPTURE_BURST=0x23）。需电机运行中。"""
+        from communications.protocol import encode_frame
+        self._burst_acc = {}          # 清空重组缓冲，准备接收新一帧
+        self._burst_total = 0
+        return self.send_frame(encode_frame(0x23, b""))
 
     def send_frame(self, data: bytes) -> bool:
         if self._protocol_mode == "virtual-v2":
@@ -447,6 +497,13 @@ class CommManager(QObject):
             if self.is_sim_running():
                 return self._dispatch_to_sim(data)
             self.logMessage.emit("[警告] 当前未连接，无法发送")
+            return False
+        decoded = decode_frame(data)
+        if (self._protocol_mode == "legacy-v1" and decoded is not None and
+                decoded[0] == CMD_START):
+            self.logMessage.emit(
+                "[错误] legacy-v1校验不覆盖CMD/LEN，禁止通过该模式启动真机；"
+                "请使用negotiated-v2")
             return False
         try:
             self._driver.send(data)
@@ -577,28 +634,67 @@ class CommManager(QObject):
                 continue
             if frame.message_type is MessageType.TELEMETRY:
                 self._protocol_stats["telemetry_frames"] += 1
+                # 真机持续遥测本身就是比单独心跳ACK更强的在线证据。高速
+                # F1/F2/F3可能占满下位机很小的TCP发送队列，导致心跳ACK
+                # 被丢弃，但只要遥测仍在到达就不能误判会话/电机已经失联。
+                self._last_valid_at = time.monotonic()
                 if frame.command == 0xF1:
-                    if len(frame.payload) not in (12, 16):
+                    payload_length = len(frame.payload)
+                    # 每样本字节数：22（含施加电压 Vd/Vq 和母线 Vbus）、16（仅相
+                    # 电流）、12（UART 精简帧，无相电流）。优先按 22 切分，兼容
+                    # 旧固件的 16；两者只有在长度同时整除 176 时才会歧义，而固件
+                    # 只发单样本或 16 样本批，实际不会出现。
+                    if payload_length == 12:
+                        sample_size = 12
+                    elif payload_length >= 22 and payload_length % 22 == 0:
+                        sample_size = 22
+                    elif payload_length >= 16 and payload_length % 16 == 0:
+                        sample_size = 16
+                    else:
                         self._protocol_stats["crc_or_frame_errors"] += 1
                         continue
-                    tick_ms, angle_raw, speed_rpm, iq_raw, iqref_raw = \
-                        struct.unpack("<IHhhh", frame.payload[:12])
-                    sample = {
-                        "tick_ms": tick_ms,
-                        "angle_deg": angle_raw * 360.0 / 65536.0,
-                        "speed_rpm": float(speed_rpm),
-                        "iq_a": iq_raw * 0.000629,
-                        "iqref_a": iqref_raw * 0.000629,
-                    }
-                    if len(frame.payload) == 16:
-                        ia_raw, ib_raw = struct.unpack("<hh", frame.payload[12:])
-                        sample["ia_a"] = ia_raw * 0.000629
-                        sample["ib_a"] = ib_raw * 0.000629
-                    self.highRateTelemetryReceived.emit(sample)
-                    outputs.append(sample)
+                    chunks = [frame.payload[index:index + sample_size]
+                              for index in range(0, payload_length, sample_size)]
+                    # 波形时间轴用实际 F1 速率换算，别再硬编码 1kHz：辨识/省流
+                    # 档把 F1 降到 200Hz，硬编码会把相电流挤成几十个周期一团。
+                    f1_ms = getattr(self, "_f1_period_ms", 0)
+                    if not f1_ms:   # 传输默认：TCP 1ms(1kHz)，其它 5ms(200Hz)
+                        f1_ms = 1 if (len(chunks) > 1 or
+                                      self._kind == "以太网TCP") else 5
+                    rate_hz = max(1, round(1000.0 / f1_ms))
+                    decoded_samples = []
+                    for chunk in chunks:
+                        tick_ms, angle_raw, speed_rpm, iq_raw, iqref_raw = \
+                            struct.unpack("<IHhhh", chunk[:12])
+                        sample = {
+                            "tick_ms": tick_ms,
+                            "rate_hz": rate_hz,
+                            "angle_deg": angle_raw * 360.0 / 65536.0,
+                            "speed_rpm": float(speed_rpm),
+                            "iq_a": iq_raw * 0.000629,
+                            "iqref_a": iqref_raw * 0.000629,
+                        }
+                        if sample_size >= 16:
+                            ia_raw, ib_raw = struct.unpack("<hh", chunk[12:16])
+                            sample["ia_a"] = ia_raw * 0.000629
+                            sample["ib_a"] = ib_raw * 0.000629
+                        if sample_size >= 22:
+                            # Vd/Vq 是 PI 输出的施加电压，MCSDK 内部 s16 码值；
+                            # 码值→伏特的比例离线用堵转 R*Iq 自标定，故此处保留
+                            # 原始码值。Vbus 为母线电压（伏特，整数）。
+                            vd_raw, vq_raw, vbus_v = struct.unpack("<hhH", chunk[16:22])
+                            sample["vd_raw"] = vd_raw
+                            sample["vq_raw"] = vq_raw
+                            sample["vbus_v"] = float(vbus_v)
+                        decoded_samples.append(sample)
+                        outputs.append(sample)
+                    if len(decoded_samples) > 1:
+                        self.highRateTelemetryBatchReceived.emit(decoded_samples)
+                    else:
+                        self.highRateTelemetryReceived.emit(decoded_samples[0])
                     continue
                 if frame.command == 0xF2:
-                    if len(frame.payload) not in (21, 29):
+                    if len(frame.payload) not in (21, 29, 31):
                         self._protocol_stats["crc_or_frame_errors"] += 1
                         continue
                     values = struct.unpack("<IHHHHBHHHH", frame.payload[:21])
@@ -622,7 +718,7 @@ class CommManager(QObject):
                         "adc1_delta_a": (values[3] - 2 * values[1]) * amps_per_mc_digit,
                         "adc2_delta_a": (values[4] - 2 * values[2]) * amps_per_mc_digit,
                     })
-                    if len(frame.payload) == 29:
+                    if len(frame.payload) >= 29:
                         cal = struct.unpack("<HHHH", frame.payload[21:29])
                         sample.update({
                             "cal_adc1_min": cal[0], "cal_adc1_max": cal[1],
@@ -630,8 +726,79 @@ class CommManager(QObject):
                             "cal_adc1_pp": cal[1] - cal[0],
                             "cal_adc2_pp": cal[3] - cal[2],
                         })
+                    if len(frame.payload) >= 31:
+                        # VREFINT换算的实际VDDA（mV）；0=固件尚未完成首次测量
+                        vdda_mv = struct.unpack("<H", frame.payload[29:31])[0]
+                        if vdda_mv:
+                            sample["vdda_v"] = vdda_mv / 1000.0
                     self.currentSamplingDiagReceived.emit(sample)
                     outputs.append(sample)
+                    continue
+                if frame.command == 0xF3:
+                    # 在线ARX/RLS辨识系数（固件跑在原始s16单位）。每轴7维：
+                    # [a1,a2,a3, b0,b1(本轴电压), b0,b1(交叉轴电压)]。
+                    if len(frame.payload) != 72:
+                        self._protocol_stats["crc_or_frame_errors"] += 1
+                        continue
+                    tick_ms, updates, innov_rms, p_trace = struct.unpack(
+                        "<IIff", frame.payload[:16])
+                    theta_d = struct.unpack("<7f", frame.payload[16:44])
+                    theta_q = struct.unpack("<7f", frame.payload[44:72])
+                    # raw→SI：a系数无标度直接用；b_SI = b_raw * I_LSB/V_LSB。
+                    i_lsb = (3.30 / 2) / (0.01 * 8.0) / 32767.0   # 6.2944e-4 A/digit
+                    v_lsb = 24.0 / (3 ** 0.5) / 32767.0           # 4.2288e-4 V/digit
+                    b2si = i_lsb / v_lsb
+                    ts = 1.0 / 16000.0
+                    a1_d, a1_q = theta_d[0], theta_q[0]
+                    b_dd0 = theta_d[3] * b2si      # d轴电流对d轴电压
+                    b_qq0 = theta_q[5] * b2si      # q轴电流对q轴电压
+                    # 反解物理参数：L=Ts/b0，R=(1-a1)/b0_SI（a1受电流噪声影响大）
+                    ld_est = ts / b_dd0 if b_dd0 > 1e-9 else float("nan")
+                    lq_est = ts / b_qq0 if b_qq0 > 1e-9 else float("nan")
+                    rd_est = (1 - a1_d) / b_dd0 if b_dd0 > 1e-9 else float("nan")
+                    rq_est = (1 - a1_q) / b_qq0 if b_qq0 > 1e-9 else float("nan")
+                    sample = {
+                        "tick_ms": tick_ms, "updates": updates,
+                        "innov_rms_digit": innov_rms, "p_trace": p_trace,
+                        "theta_d": theta_d, "theta_q": theta_q,
+                        "a1_d": a1_d, "a1_q": a1_q,
+                        "b_dd0_si": b_dd0, "b_qq0_si": b_qq0,
+                        "ld_mh": ld_est * 1e3, "lq_mh": lq_est * 1e3,
+                        "rd_ohm": rd_est, "rq_ohm": rq_est,
+                    }
+                    self.rlsCoeffReceived.emit(sample)
+                    outputs.append(sample)
+                    continue
+                if frame.command == 0xF4:
+                    # 16kHz突发抓取分块：头6字节 total,start,count；随后 count×(ia,ib,ang)。
+                    # 按 start 索引重组，收齐 total 个样本后一次性发出。
+                    pl = frame.payload
+                    if len(pl) < 6:
+                        self._protocol_stats["crc_or_frame_errors"] += 1
+                        continue
+                    total, start, count = struct.unpack("<HHH", pl[:6])
+                    if len(pl) < 6 + count * 6 or count == 0:
+                        self._protocol_stats["crc_or_frame_errors"] += 1
+                        continue
+                    acc = getattr(self, "_burst_acc", None)
+                    if acc is None or getattr(self, "_burst_total", 0) != total:
+                        acc = self._burst_acc = {}
+                        self._burst_total = total
+                    for i in range(count):
+                        ia, ib, ang = struct.unpack("<hhH", pl[6 + i * 6:12 + i * 6])
+                        acc[start + i] = (ia, ib, ang)
+                    if len(acc) >= total:
+                        idx = sorted(acc)
+                        payload_obj = {
+                            "n": total,
+                            "ia": [acc[k][0] for k in idx],
+                            "ib": [acc[k][1] for k in idx],
+                            "ang": [acc[k][2] for k in idx],
+                        }
+                        self._burst_acc = {}
+                        self._burst_total = 0
+                        self.burstReceived.emit(payload_obj)
+                        outputs.append(payload_obj)
                     continue
                 try:
                     telemetry = self._parse_v2_telemetry(frame)
@@ -684,9 +851,31 @@ class CommManager(QObject):
         except (UnicodeDecodeError, json.JSONDecodeError) as exc:
             raise ProtocolV2Error("v2遥测payload无效") from exc
         telemetry = TelemetryFrame()
+        numeric_fields = {
+            "speed_actual", "speed_target", "current_actual", "current_target",
+            "torque_actual", "torque_target", "angle_actual", "temperature",
+            "vdc", "sensor_quality", "angle_raw", "convergence", "max_rpm",
+            "current_limit_a", "runaway_limit_rpm", "phase_current_a",
+        }
+        integer_fields = {"fault_code", "mc_state", "speed_kp", "speed_ki"}
         for field in TelemetryFrame.__slots__:
-            if field in values:
-                setattr(telemetry, field, values[field])
+            if field not in values:
+                continue
+            try:
+                value = values[field]
+                if field in numeric_fields:
+                    value = float(value)
+                elif field in integer_fields:
+                    value = int(value)
+                elif field in {"low_speed_warn"}:
+                    value = bool(value)
+                elif field in {"sensor_source", "fault_text", "bus_state"}:
+                    value = str(value)
+                elif field == "powers" and not isinstance(value, dict):
+                    raise TypeError("powers必须为对象")
+                setattr(telemetry, field, value)
+            except (TypeError, ValueError) as exc:
+                raise ProtocolV2Error(f"v2遥测字段{field}类型无效") from exc
         telemetry.data_source = (
             "sim" if self._protocol_mode == "virtual-v2" else "real")
         return telemetry
@@ -820,47 +1009,109 @@ class CommManager(QObject):
             self.logMessage.emit(f"[错误] 真实v2字节流丢弃{errors}个损坏帧")
         return frames
 
+    # 单次 recv 块大小 / 单轮读取总量上限。上限保证心跳节奏不被超大积压拖死：
+    # 256 KB 在 1 kHz 遥测（约 20-30 KB/s）下相当于近 10 秒的积压，正常永远达不到。
+    _RX_DRAIN_CHUNK = 4096
+    _RX_DRAIN_MAX_BYTES = 256 * 1024
+
+    def _drain_rx(self) -> tuple[bytes, bool]:
+        """把驱动接收缓冲读空（带上限），返回 (字节, 是否触顶仍有剩余)。
+
+        首次 recv 用 0.05s 超时等数据；后续用 1ms 超时非阻塞式掏空。
+        不能用 timeout=0：TCP 会进非阻塞模式抛 BlockingIOError 而不是超时。
+        """
+        chunks = []
+        total = 0
+        chunk = self._driver.recv(size=self._RX_DRAIN_CHUNK, timeout=0.05)
+        while chunk:
+            chunks.append(chunk)
+            total += len(chunk)
+            if total >= self._RX_DRAIN_MAX_BYTES:
+                return b"".join(chunks), True
+            chunk = self._driver.recv(size=self._RX_DRAIN_CHUNK, timeout=0.001)
+        return b"".join(chunks), False
+
     def _real_v2_poll_loop(self) -> None:
         """真实串口/TCP v2轮询；所有状态推进只依据有效帧和ACK。"""
         while not self._stop.is_set():
-            with self._v2_lock:
-                if self._driver is None or not self._driver.is_open():
+            # 读取放在锁外：recv 最长阻塞 50ms，而数据流不断时循环几乎不
+            # 停歇，若连读取一起持锁，主线程的 send_frame（如停止命令）会
+            # 被饿上数秒——表现为点停止后整个界面卡住一两秒才停。socket
+            # 收/发两个方向线程安全，_v2_lock 只需保护会话状态。
+            if self._driver is None or not self._driver.is_open():
+                with self._v2_lock:
                     self._handle_v2_session_loss("真实通信链路已关闭")
-                    break
-                try:
-                    chunk = self._driver.recv(size=512, timeout=0.05)
-                except Exception as exc:
+                break
+            try:
+                data, rx_capped = self._drain_rx()
+            except Exception as exc:
+                with self._v2_lock:
                     self._handle_v2_session_loss(f"真实v2读取失败：{exc}")
-                    break
-                if chunk:
-                    frames = self._decode_real_v2_chunk(chunk)
-                    if frames:
-                        self._process_v2_responses(
-                            [encode_v2_frame(frame) for frame in frames])
+                break
 
+            with self._v2_lock:
+                # 心跳先于帧解析：解析大段积压可能耗时，不能拖慢心跳节奏。
                 now = time.monotonic()
+                if rx_capped and now - self._rx_backlog_warned_at >= 5.0:
+                    self._rx_backlog_warned_at = now
+                    self.logMessage.emit(
+                        f"[警告] 接收积压：单轮读满 "
+                        f"{self._RX_DRAIN_MAX_BYTES // 1024} KB 仍有剩余，"
+                        "遥测速率超过上位机处理能力")
                 session = self._v2_session
                 if (session is not None and
                         session.state is ProtocolSessionState.READY and
-                        now - self._v2_last_heartbeat_at >= 0.5 and
-                        not session.has_pending_command(0)):
+                        now - self._v2_last_heartbeat_at >=
+                        self._V2_HEARTBEAT_INTERVAL_S):
                     try:
-                        self._send_real_v2_wire(
-                            encode_v2_frame(session.build_heartbeat()))
+                        pending_heartbeat = session.pending_sequence_for(0)
+                        if pending_heartbeat is None:
+                            heartbeat = session.build_heartbeat()
+                        else:
+                            # ACK可能被遥测发送队列丢弃。等待3秒超时期间仍用
+                            # 同一序号幂等重发，避免下位机误判PC已失联。
+                            heartbeat = V2Frame(
+                                MessageType.HEARTBEAT, address=1,
+                                sequence=pending_heartbeat,
+                                version=session.negotiated_version or 2)
+                        self._send_real_v2_wire(encode_v2_frame(heartbeat))
                         self._v2_last_heartbeat_at = now
                     except Exception as exc:
                         self._handle_v2_session_loss(f"心跳发送失败：{exc}")
                         break
 
+                if data:
+                    frames = self._decode_real_v2_chunk(data)
+                    if frames:
+                        self._process_v2_responses(
+                            [encode_v2_frame(frame) for frame in frames])
+
                 if session is not None:
                     expired = session.expire_commands(
-                        1.0, now=now, heartbeat_timeout_s=3.0)
+                        1.0, now=now,
+                        heartbeat_timeout_s=
+                        self._V2_HEARTBEAT_ACK_TIMEOUT_S)
                     for result in expired:
                         self._v2_pending_legacy.pop(result.sequence, None)
                         self._protocol_stats["timeouts"] += 1
                         if result.command == 0:
+                            # 下位机通信看门狗要求 RUN 期间持续收到上位机数据，
+                            # 因此心跳必须一直发。设备侧 TX 队列被 F1 占满时
+                            # 心跳 ACK 可能丢失，但下行 RX 与上行遥测仍正常：
+                            # 把“近期收到过任意有效帧”当作会话存活证据，只
+                            # 告警、不拆会话，避免连锁触发下位机 COMM_LOSS。
+                            # 仅当遥测也长时间消失时才按真正断链处理。
+                            if (now - self._last_valid_at <
+                                    self._V2_TELEMETRY_LIVENESS_S):
+                                if (now - self._v2_heartbeat_ack_warned_at >=
+                                        10.0):
+                                    self._v2_heartbeat_ack_warned_at = now
+                                    self.logMessage.emit(
+                                        "[警告] 心跳ACK超时，但实时遥测持续到达；"
+                                        "会话保持，不触发通信保护")
+                                continue
                             self._handle_v2_session_loss(
-                                "设备心跳ACK超时，会话已失效")
+                                "设备心跳ACK超时且遥测中断，会话已失效")
                             continue
                         self._last_command_result = result
                         self.commandResult.emit(result)
@@ -869,7 +1120,9 @@ class CommManager(QObject):
                             f"CMD=0x{result.command:02X}")
                     if expired:
                         self._emit_protocol_snapshot()
-            time.sleep(0.02)
+            # 有数据说明流量大，立即进入下一轮继续掏空；空闲才让出 CPU。
+            if not data:
+                time.sleep(0.02)
 
     # ------------------ 内部 ------------------
     def _start_poll(self) -> None:
@@ -908,16 +1161,23 @@ class CommManager(QObject):
                 self.telemetryReceived.emit(frame)
             elif (not read_failed and real_link and self._kind != "以太网TCP" and
                   time.monotonic() - self._last_valid_at >= 2.0):
-                self._report_fault_once("telemetry_timeout", "真实设备遥测连续 2 秒超时")
+                if "telemetry_timeout" not in self._reported_faults:
+                    self._reported_faults.add("telemetry_timeout")
+                    self.logMessage.emit("[警告] 真实设备遥测连续 2 秒超时（不锁定故障）")
             time.sleep(0.1)
+
+    def clear_reported_faults(self) -> None:
+        """复位成功后清空已报告故障，使下次同类保护能再次进入 FAULT_LOCKED。"""
+        self._reported_faults.clear()
 
     def _inspect_frame_fault(self, frame: TelemetryFrame) -> None:
         if frame.bus_state == "ov":
             self._report_fault_once("bus_overvoltage", "直流母线过压跳闸")
         if frame.fault_code:
+            # 0x8000 等超过 1 字节的故障码用完整十六进制，避免 :02x 截断误解。
             self._report_fault_once(
-                f"device_{frame.fault_code:02x}", frame.fault_text or
-                f"下位机故障位 0x{frame.fault_code:02X}")
+                f"device_{int(frame.fault_code):x}",
+                frame.fault_text or f"下位机故障位 0x{int(frame.fault_code):X}")
 
     def _report_fault_once(self, key: str, message: str) -> None:
         if key in self._reported_faults:
@@ -944,7 +1204,7 @@ class CommManager(QObject):
                 self.rawReceived.emit(0, chunk)
             return None
         # 串口：累计字节 → 在缓冲中扫描完整帧
-        chunk = self._driver.recv(size=64, timeout=0.05)
+        chunk = self._driver.recv(size=512, timeout=0.05)
         if chunk:
             self._rx_buf.extend(chunk)
         return self._try_extract_serial_frame()
@@ -952,6 +1212,7 @@ class CommManager(QObject):
     def _try_extract_serial_frame(self) -> Optional[TelemetryFrame]:
         """从 _rx_buf 中提取一个完整遥测帧。失败/不全时返回 None。"""
         buf = self._rx_buf
+        latest = None
         while buf:
             head = buf.find(FRAME_HEADER)
             if head < 0:
@@ -966,15 +1227,17 @@ class CommManager(QObject):
             if len(buf) < total:
                 return None
             candidate = bytes(buf[:total])
-            del buf[:total]
             decoded = decode_frame(candidate)
             if decoded is None:
-                continue   # 校验失败，丢弃这一帧后继续找下一个 0xAA
+                # 假帧头/错误长度不能吞掉其后的真实帧；只移过当前帧头重扫。
+                del buf[0]
+                continue
+            del buf[:total]
             cmd, payload = decoded
             if cmd != CMD_TELEMETRY or len(payload) < TELEM_LEN:
                 continue
-            return self._parse_telemetry_payload(payload)
-        return None
+            latest = self._parse_telemetry_payload(payload)
+        return latest
 
     def _parse_telemetry_payload(self, payload: bytes) -> TelemetryFrame:
         speed, spd_tgt, cur_ma, raw, ang_cdeg, temp_b, q, conv, flags = \

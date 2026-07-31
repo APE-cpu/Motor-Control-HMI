@@ -73,6 +73,122 @@ NACK payload 当前采用 UTF-8 JSON：
 3. 状态不允许、参数越界或保护未复位时返回 NACK，不得静默忽略。
 4. 上位机只接受当前待处理序号的应答；重复或迟到 ACK 不会匹配给其它命令。
 5. 超时形成明确失败结果，启动/停机等危险命令的超时将由状态机处理。
+6. **安全例外**：CMD_STOP（0x11）与 CMD_EMERGENCY_STOP（0x12）在会话尚未就绪时也允许发送，保命指令不依赖握手状态。
+
+## 命令字一览
+
+| 命令字 | 名称 | 方向 | 说明 |
+|---:|---|---|---|
+| 0x10 | CMD_START | 上位机→下位机 | 启动电机 |
+| 0x11 | CMD_STOP | 上位机→下位机 | 正常停机（允许在未就绪时发送） |
+| 0x12 | CMD_EMERGENCY_STOP | 上位机→下位机 | 紧急停机（允许在未就绪时发送） |
+| 0x13 | CMD_RESET_FAULT | 上位机→下位机 | 故障复位（保护条件未清除时必须 NACK） |
+| 0x20 | CMD_SET_PARAMS | 上位机→下位机 | 下发控制参数 |
+| 0x21 | CMD_SET_SENSOR | 上位机→下位机 | 下发位置传感器配置 |
+
+## 遥测帧格式（v2 专用）
+
+v2 把遥测拆成**三个独立通道**，每个通道有独立的频率、用途和命令字。所有遥测帧的 `MESSAGE_TYPE=6 (TELEMETRY)`，载荷格式按 `COMMAND` 区分。
+
+### 0xF0 常规遥测帧
+
+| 介质 | 载荷字节数 | struct 格式 | 字段 |
+|---|---|---|---|
+| 串口/RS-485/TCP | 15 | `<hHhHhbBBBx` | speed_actual(h) speed_target(H) current_actual(h) angle_raw(H) angle_actual(h) temperature(b) sensor_quality(B) convergence(B) flags(B) padding(x) |
+| CAN（v1 兼容） | 8 | `<hHhH` | speed_actual(h) speed_target(H) current_actual(h) angle_raw(H) |
+
+字段标度：
+
+| 字段 | 类型 | 物理量 | 换算 |
+|---|---|---|---|
+| speed_actual | int16 | 转速 rpm | 直接读 |
+| speed_target | uint16 | 目标转速 rpm | 直接读 |
+| current_actual | int16 | 电流 mA | `A = raw / 100` |
+| angle_raw | uint16 | 传感器原始值 | 由 SENSOR_REGISTRY 定义 |
+| angle_actual | int16 | 角度 0.01° | `deg = raw / 100` |
+| temperature | int8 | 温度 °C | `°C = raw - 40` |
+| sensor_quality | uint8 | 感器质量 0..255 | 255=最佳 |
+| convergence | uint8 | 观测器收敛度 0..255 | 255=完全收敛 |
+| flags | uint8 | 状态位 | bit0=低速警告, bit1=过流, bit2=驱动故障, bit3=急停 |
+| padding | 1 byte | 填充 | 0 |
+
+CAN 8 字节版本省略温度/质量/收敛度/flags，上位机沿用上一帧补全。
+
+### 0xF1 高速遥测帧
+
+高速通道用于电角度、Iq、相电流与施加电压，频率 200 Hz（UART/RS-485）或 1000 Hz（以太网 TCP，多样本批）。载荷可包含 1 个或多个样本，按 `payload_length` 判定单样本字节数：
+
+| 载荷总长 | 单样本字节 | 内容 |
+|---|---|---|
+| 12 的倍数 | 12 | 精简帧：tick_ms + angle_raw + speed_rpm + iq + iqref |
+| 16 的倍数 | 16 | 标准帧：精简 + Ia + Ib |
+| 22 的倍数 | 22 | 扩展帧：标准 + Vd_raw + Vq_raw + Vbus_v |
+
+**单样本布局**（小端序）：
+
+| 偏移 | 字节数 | 类型 | 字段 | 换算 |
+|---|---|---|---|---|
+| 0 | 4 | uint32 | tick_ms | 下位机 HAL_GetTick 毫秒时间戳 |
+| 4 | 2 | uint16 | angle_raw | `deg = raw × 360 / 65536` |
+| 6 | 2 | int16 | speed_rpm | 直接读 |
+| 8 | 2 | int16 | iq_raw | `A = raw × 0.000629` |
+| 10 | 2 | int16 | iqref_raw | `A = raw × 0.000629`（同上） |
+| 12 | 2 | int16 | ia_raw | `A = raw × 0.000629`（仅 16/22 字节帧） |
+| 14 | 2 | int16 | ib_raw | `A = raw × 0.000629`（仅 16/22 字节帧） |
+| 16 | 2 | int16 | vd_raw | MCSDK 内部 s16 码值，保留原始（仅 22 字节帧） |
+| 18 | 2 | int16 | vq_raw | MCSDK 内部 s16 码值，保留原始（仅 22 字节帧） |
+| 20 | 2 | uint16 | vbus_v | 母线电压，伏特整数（仅 22 字节帧） |
+
+> `0.000629` 是 MCSDK 默认的 s16→A 标度，对应 ADC 满量程与运放增益组合。若下位机改动采样电阻或运放增益，需要同步修改 `comm_manager.py` 的解码常量。
+
+### 0xF2 电流采样诊断帧
+
+低速通道用于 ADC 注入采样诊断与 PWM duty 上报，典型频率 50 Hz。载荷长度为 21、29 或 31 字节，对应基本、带校准、带 VDDA 三档。
+
+**21 字节基础布局**（小端序）：
+
+| 偏移 | 字节数 | 类型 | 字段 | 换算 |
+|---|---|---|---|---|
+| 0 | 4 | uint32 | tick_ms | 下位机毫秒时间戳 |
+| 4 | 2 | uint16 | adc1_raw | `V = raw × 3.3 / 32768` |
+| 6 | 2 | uint16 | adc2_raw | `V = raw × 3.3 / 32768` |
+| 8 | 2 | uint16 | offset_a | A 相零点，MCSDK 已翻倍：`zero_v = (raw / 2) × 3.3/32768` |
+| 10 | 2 | uint16 | offset_b | B 相零点，同上 |
+| 12 | 1 | uint8 | sector | SVPWM 扇区 0..5 |
+| 13 | 2 | uint16 | duty_a | A 相占空比原始码 |
+| 15 | 2 | uint16 | duty_b | B 相占空比始码 |
+| 17 | 2 | uint16 | duty_c | C 相占空比原始码 |
+| 19 | 2 | uint16 | sample_point | ADC 注入触发点 |
+
+**29 字节扩展**：在 21 字节后追加 8 字节校准数据：
+
+| 偏移 | 字节数 | 类型 | 字段 |
+|---|---|---|---|
+| 21 | 2 | uint16 | cal_adc1_min |
+| 23 | 2 | uint16 | cal_adc1_max |
+| 25 | 2 | uint16 | cal_adc2_min |
+| 27 | 2 | uint16 | cal_adc2_max |
+
+> `cal_adcN_pp = cal_adcN_max - cal_adcN_min`，上位机用于判断标定窗口是否覆盖实测电流摆幅。
+
+**31 字节扩展**：在 29 字节后追加 2 字节 VDDA：
+
+| 偏移 | 字节数 | 类型 | 字段 | 换算 |
+|---|---|---|---|---|
+| 29 | 2 | uint16 | vdda_mv | `V = raw / 1000`，0=固件尚未完成首次测量 |
+
+**电流换算公式**（写死在 `comm_manager.py`）：
+
+```
+adc_volts_per_count = 3.3 / 32768
+amps_per_mc_digit  = 3.3 / (65536 × 0.01 × 8)
+adc1_delta_a = (offset_a - 2 × adc1_raw) × amps_per_mc_digit
+adc2_delta_a = (offset_b - 2 × adc2_raw) × amps_per_mc_digit
+```
+
+其中 `0.01` 是采样电阻（Ω），`8` 是运放增益。**这两个常量必须与下位机硬件一致**，否则 A 相电流读数会全错。
+
+> STM32F4 注入组 ADC 采用 12 位结果左对齐至 16 位，bit15 用作符号位，有效范围 0..32760；MCSDK 把结果翻倍后再做 offset 减法，因此 `offset_*` 字段会出现大于 32768 的值（如 32840），这是协议特性，不是溢出。
 
 ## 心跳与会话失效
 

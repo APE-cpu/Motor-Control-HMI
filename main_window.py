@@ -29,7 +29,7 @@ from core import RuntimeStateMachine
 from core import RuntimeState
 from config.config import CMD_RESET_FAULT, CMD_START, CMD_STOP
 
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 
 class ResponsiveStack(QStackedWidget):
@@ -76,6 +76,7 @@ class MainWindow(QMainWindow):
         self.comm_manager = CommManager()
         self.runtime_state = RuntimeStateMachine()
         self._device_run_seen = False
+        self._device_stop_confirm_frames = 0
         self.comm_manager.statusChanged.connect(self.runtime_state.connection_changed)
         self.comm_manager.faultDetected.connect(self.runtime_state.lock_fault)
         self.comm_manager.commandResult.connect(self._on_v2_command_result)
@@ -163,19 +164,56 @@ class MainWindow(QMainWindow):
         logger.log("软件启动")
 
     def _on_runtime_telemetry(self, frame) -> None:
-        """同步下位机主动受控停机，避免界面残留在 RUNNING。"""
+        """同步下位机主动受控停机 / 保护锁存，避免界面残留在 RUNNING。"""
         mc_state = int(getattr(frame, "mc_state", 0) or 0)
+        fault_code = int(getattr(frame, "fault_code", 0) or 0)
+        fault_text = str(getattr(frame, "fault_text", "") or "").strip()
+        speed_actual = abs(float(getattr(frame, "speed_actual", 0.0) or 0.0))
+        speed_target = abs(float(getattr(frame, "speed_target", 0.0) or 0.0))
+        is_legacy = self.comm_manager.protocol_status().get("mode") == "legacy-v1"
+
+        # 下位机保护锁存（跑飞/反转/通信看门狗/MCSDK）优先于 mc_state==RUN 的早退。
+        # 旧逻辑在 mc_state 仍为 RUN 时直接 return，导致保护已触发而 UI 仍显示 running。
+        if (fault_code != 0 and
+                self.runtime_state.state in (RuntimeState.RUNNING,
+                                              RuntimeState.STOPPING)):
+            self._device_run_seen = False
+            self._device_stop_confirm_frames = 0
+            reason = fault_text or f"下位机故障位 0x{fault_code:X}"
+            try:
+                self.runtime_state.lock_fault(reason)
+            except Exception:
+                pass
+            return
+
         if self.runtime_state.state is RuntimeState.RUNNING and mc_state == 6:
             self._device_run_seen = True
+            self._device_stop_confirm_frames = 0
             return
-        if (self._device_run_seen and
-                self.runtime_state.state in (RuntimeState.RUNNING,
-                                              RuntimeState.STOPPING) and
-                int(getattr(frame, "fault_code", 0) or 0) == 0 and
-                mc_state not in (6, 11)):
+        if (is_legacy and self.runtime_state.state is RuntimeState.RUNNING and
+                (speed_actual >= 30 or speed_target >= 1)):
+            self._device_run_seen = True
+            self._device_stop_confirm_frames = 0
+            return
+        stopped_evidence = (
+            self._device_run_seen and
+            self.runtime_state.state in (RuntimeState.RUNNING,
+                                          RuntimeState.STOPPING) and
+            fault_code == 0 and mc_state not in (6, 11) and
+            speed_actual < 30 and speed_target < 1
+        )
+        if stopped_evidence:
+            self._device_stop_confirm_frames += 1
+        else:
+            self._device_stop_confirm_frames = 0
+        # 单帧 MCSDK 瞬态不再被误判为停机；必须连续三帧同时满足
+        # 非 RUN、零目标、近零速、无故障，才允许 RUNNING -> READY。
+        if self._device_stop_confirm_frames >= 3:
             self._device_run_seen = False
+            self._device_stop_confirm_frames = 0
             self.runtime_state.observe_device_stopped(
-                "下位机达到调试安全边界并受控停机")
+                f"连续遥测确认设备已停机（mc_state={mc_state}，"
+                f"目标={speed_target:.1f} rpm，转速={speed_actual:.1f} rpm）")
 
     def _on_v2_command_result(self, result) -> None:
         """用设备ACK/NACK推进状态；超时按设备状态未知处理。"""
@@ -183,27 +221,50 @@ class MainWindow(QMainWindow):
             if result.command == CMD_START:
                 if result.success and self.runtime_state.state is RuntimeState.READY:
                     self._device_run_seen = False
+                    self._device_stop_confirm_frames = 0
                     self.runtime_state.confirm_started(
                         f"设备ACK启动 SEQ={result.sequence}")
                 elif not result.success:
+                    reason = (f"设备NACK启动 SEQ={result.sequence} "
+                              f"CODE={result.error_code} "
+                              f"{result.message}")
+                    if result.error_code == -1:
+                        # START 超时不能证明设备没有启动，状态未知必须锁定，
+                        # 禁止把它伪装成 READY 后直接重试。
+                        self.runtime_state.lock_fault(
+                            "启动命令ACK超时，设备是否运行未知")
+                    else:
+                        self._device_run_seen = False
+                        self._device_stop_confirm_frames = 0
+                        self.runtime_state.reject_start(reason)
                     logger.log(
                         "设备拒绝启动",
                         f"SEQ={result.sequence} CODE={result.error_code} "
                         f"{result.message}")
+                    self.statusBar().showMessage(
+                        f"启动失败：{result.message or result.error_code}", 15000)
                 return
-            if result.command == CMD_STOP and \
-                    self.runtime_state.state is RuntimeState.STOPPING:
-                if result.success:
-                    self.runtime_state.confirm_stopped(
+            if result.command == CMD_STOP:
+                if (result.success and self.runtime_state.state in
+                        (RuntimeState.RUNNING, RuntimeState.STOPPING)):
+                    # STOP ACK 是设备侧已经停机的权威证据。即使 UI 事件拥塞
+                    # 导致 request_stop() 尚未把缓存推进到 STOPPING，也必须
+                    # 将残留的 RUNNING 归一为 READY，避免之后无法再次启动。
+                    self._device_run_seen = False
+                    self.runtime_state.observe_device_stopped(
                         f"设备ACK停机 SEQ={result.sequence}")
                 elif result.error_code == -1:
                     self.runtime_state.lock_fault("停止命令ACK超时，设备状态未知")
-                else:
+                elif self.runtime_state.state is RuntimeState.STOPPING:
                     self.runtime_state.reject_stop(
                         f"设备NACK停机：{result.message or result.error_code}")
                 return
             if result.command == CMD_RESET_FAULT:
                 if result.success:
+                    # 允许下一次同类保护再次触发 faultDetected（否则 key 被记住后 UI 不再锁定）。
+                    clear = getattr(self.comm_manager, "clear_reported_faults", None)
+                    if callable(clear):
+                        clear()
                     if self.runtime_state.state is RuntimeState.FAULT_LOCKED:
                         self.runtime_state.reset_fault(
                             f"设备ACK故障复位 SEQ={result.sequence}")

@@ -7,7 +7,7 @@ from PySide6.QtWidgets import QApplication, QMessageBox
 
 from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import decode_frame
-from config.config import CMD_RESET_FAULT
+from config.config import CMD_RESET_FAULT, CMD_START
 from core import RuntimeState, RuntimeStateMachine, TransitionError
 from pages.control_page import ControlPage
 from pages.experiment_page import ExperimentPage
@@ -51,6 +51,26 @@ def test_非法转换被拒绝且状态不变():
         machine.confirm_started()
     assert machine.state is RuntimeState.DISCONNECTED
     assert "当前状态：disconnected" in rejected[0]
+
+
+def test_START明确NACK撤销旧版本残留RUNNING():
+    machine = RuntimeStateMachine()
+    _make_ready(machine)
+    machine.confirm_started("旧版本错误地提前确认")
+
+    machine.reject_start("设备NACK启动")
+
+    assert machine.state is RuntimeState.READY
+    assert machine.history[-1].reason == "设备NACK启动"
+
+
+def test_START在READY等待NACK时保持READY():
+    machine = RuntimeStateMachine()
+    _make_ready(machine)
+
+    machine.reject_start("设备NACK启动")
+
+    assert machine.state is RuntimeState.READY
 
 
 def test_预检失败回到已连接状态():
@@ -119,7 +139,64 @@ def test_停止命令不被非running界面状态拦截(monkeypatch):
     app.processEvents()
 
 
-def test_READY时下位机故障状态会发送复位而不是启动(monkeypatch):
+def test_启动前用已停机遥测修复残留RUNNING(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    frame = TelemetryFrame()
+    frame.mc_state = 0
+    frame.fault_code = 0
+    frame.speed_target = 0.0
+    frame.speed_actual = 0.0
+    comm._latest_frame = frame
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(comm, "send_frame", lambda _data: True)
+    machine = RuntimeStateMachine()
+    _make_ready(machine)
+    machine.confirm_started("test")
+    page = ControlPage(comm, machine)
+
+    page._on_start()
+
+    assert machine.state is RuntimeState.RUNNING
+    assert any("修复残留运行状态" in item.reason for item in machine.history)
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
+def test_真实v2启动等待ACK期间忽略重复点击(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    calls = []
+    pending = {"count": 0}
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(
+        comm, "protocol_status",
+        lambda: {"mode": "negotiated-v2", "pending_ack": pending["count"]})
+
+    def send(_data):
+        calls.append(_data)
+        pending["count"] += 1
+        return False  # negotiated-v2的正常异步提交语义
+
+    monkeypatch.setattr(comm, "send_frame", send)
+    machine = RuntimeStateMachine()
+    _make_ready(machine)
+    page = ControlPage(comm, machine)
+
+    page._on_start()
+    assert machine.state is RuntimeState.READY
+    page._on_start()
+
+    assert len(calls) == 1
+    assert page._start_command_pending is True
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
+def test_READY时下位机FAULT_OVER不拦截直接发送启动(monkeypatch):
+    """固件START自带FAULT_OVER确认，上位机不再先发复位、不再多一次点击。"""
     app = _app()
     comm = CommManager()
     sent = []
@@ -135,8 +212,9 @@ def test_READY时下位机故障状态会发送复位而不是启动(monkeypatch
 
     page._on_start()
 
-    assert decode_frame(sent[-1])[0] == CMD_RESET_FAULT
-    assert machine.state is RuntimeState.READY
+    commands = [decode_frame(data)[0] for data in sent]
+    assert CMD_RESET_FAULT not in commands
+    assert commands[-1] == CMD_START
     page.close()
     page.deleteLater()
     app.processEvents()

@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from communications.base_comm import BaseComm
 from communications.comm_manager import CommManager
 from communications.protocol import encode_frame
+from communications.protocol_v2 import MessageType, decode_v2_frame
 from communications.v2_virtual_device import V2VirtualDevice
 from config.config import CMD_START
 from PySide6.QtWidgets import QApplication
@@ -178,6 +179,51 @@ def test_真实v2运行中设备复位由心跳发现():
     assert comm.is_connected() is False
     assert comm.protocol_status()["statistics"]["session_restarts_or_losses"] == 1
     assert "握手" in comm.protocol_status()["session_lost_reason"]
+    comm.disconnect()
+
+
+def test_真实v2心跳ACK丢失但遥测持续时不误判断链(monkeypatch):
+    class TelemetryButNoHeartbeatAckDriver(LoopbackV2Driver):
+        def __init__(self):
+            super().__init__()
+            self._emit_telemetry_next = True
+
+        def send(self, data: bytes):
+            frame = decode_v2_frame(data)
+            responses = self.device.receive_bytes(data, self._now)
+            if frame.message_type is not MessageType.HEARTBEAT:
+                self.queue(responses)
+            return len(data)
+
+        def recv(self, size=64, timeout=None):
+            if not self._open:
+                raise RuntimeError("测试驱动未打开")
+            with self._lock:
+                self._now += 0.05
+                if self._emit_telemetry_next:
+                    self._queue_unlocked(self.device.emit_telemetry(
+                        {"speed_actual": 500.0, "speed_target": 500.0},
+                        self._now))
+                self._emit_telemetry_next = not self._emit_telemetry_next
+                self._queue_unlocked(self.device.poll(self._now))
+                if self._chunks:
+                    return self._chunks.pop(0)
+            return b""
+
+    monkeypatch.setattr(CommManager, "_V2_HEARTBEAT_INTERVAL_S", 0.05)
+    monkeypatch.setattr(CommManager, "_V2_HEARTBEAT_ACK_TIMEOUT_S", 0.2)
+    monkeypatch.setattr(CommManager, "_V2_TELEMETRY_LIVENESS_S", 0.15)
+    driver = TelemetryButNoHeartbeatAckDriver()
+    comm = CommManager()
+
+    assert comm.connect_negotiated_v2(
+        "以太网TCP", driver=driver, handshake_timeout_s=0.5)
+    assert _wait_until(
+        lambda: comm.protocol_status()["statistics"]["timeouts"] >= 1,
+        timeout=1.0)
+    assert comm.protocol_status()["session_state"] == "ready"
+    assert comm.is_connected() is True
+    assert comm.latest_frame().speed_actual == 500.0
     comm.disconnect()
 
 

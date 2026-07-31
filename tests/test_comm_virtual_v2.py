@@ -120,6 +120,39 @@ def test_200Hz高速通道解码Iq和两相电流():
     assert samples[0]["ib_a"] == -150 * 0.000629
 
 
+def test_1kHz以太网批量高速通道逐样本解码():
+    comm = CommManager()
+    batches = []
+    comm.highRateTelemetryBatchReceived.connect(batches.append)
+    one = struct.pack("<IHhhhhh", 100, 1000, 900, 200, 80, 300, -150)
+    two = struct.pack("<IHhhhhh", 101, 1100, 901, 201, 81, 301, -151)
+    raw = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF1, payload=one + two))
+    outputs = comm._process_v2_responses([raw])
+    assert len(outputs) == 2
+    assert len(batches) == 1
+    samples = batches[0]
+    assert [sample["tick_ms"] for sample in samples] == [100, 101]
+    assert all(sample["rate_hz"] == 1000 for sample in samples)
+    assert samples[1]["ib_a"] == -151 * 0.000629
+
+
+def test_通信页静默接受1kHz批量F1且限制日志长度():
+    _app()
+    comm = CommManager()
+    page = CommunicationPage(comm)
+    sample = struct.pack("<IHhhhhh", 100, 1000, 900, 200, 80, 300, -150)
+    wire = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF1, payload=sample * 16))
+    page._on_raw_received(0, wire)
+    assert not any("高速诊断帧长度无效" in line for line in page._log_lines)
+    for index in range(5100):
+        page._append_log(f"[状态] test-{index}")
+    assert len(page._log_lines) == 5000
+    assert page._log.document().blockCount() <= 2000
+    page.close()
+
+
 def test_v2_NACK成为明确命令失败():
     comm = CommManager()
     device = V2VirtualDevice()
@@ -209,6 +242,28 @@ def test_v2迟到ACK驱动全局启动和停机状态(tmp_path, monkeypatch):
     assert window.runtime_state.state is RuntimeState.STOPPING
     assert _wait_until(
         lambda: window.runtime_state.state is RuntimeState.READY, timeout=1.0)
+    window.close()
+    window.deleteLater()
+    app.processEvents()
+
+
+def test_v2_START_NACK绝不把界面留在RUNNING(tmp_path, monkeypatch):
+    app = _app()
+    monkeypatch.setattr(
+        "pages.experiment_page.writable_path",
+        lambda *parts: tmp_path.joinpath(*parts),
+    )
+    window = MainWindow(enable_training=False)
+    assert window.comm_manager.connect_virtual_v2()
+    window.runtime_state.begin_precheck()
+    window.runtime_state.pass_precheck()
+    window.comm_manager.virtual_v2_device().nack_next_command(
+        102, "START interlock")
+
+    window.control_page._on_start()
+
+    assert window.runtime_state.state is RuntimeState.READY
+    assert "启动失败" in window.statusBar().currentMessage()
     window.close()
     window.deleteLater()
     app.processEvents()

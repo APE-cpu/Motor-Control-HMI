@@ -14,54 +14,73 @@ AI 异常检测与边缘 AI 推理的全流程开发与调试需求。
 
 ```
 上位机/
-├── main.py                       # 主程序入口
-├── main_window.py                # 主窗口（左导航 + QStackedWidget）
+├── main.py                       # 主程序入口（UTF-8 强制、滚轮事件过滤、训练页开关）
+├── main_window.py                # 主窗口（左导航 + ResponsiveStack 滚动容器）
+├── runtime_paths.py              # PyInstaller 单文件路径处理（_MEIPASS / 可写路径）
 ├── config/                       # 全局配置与样式
-│   ├── config.py                 # 常量、参数 dataclass、协议命令字
+│   ├── config.py                 # 常量、参数 dataclass、协议命令字、SENSOR_REGISTRY
 │   └── style.qss                 # 深色商务风格表
+├── core/
+│   └── runtime_state.py          # 设备运行状态机（DISCONNECTED..FAULT_LOCKED）
 ├── pages/                        # 各页面（每个页面一个文件）
 │   ├── monitor_page.py           # 监控
 │   ├── control_page.py           # 电机控制
 │   ├── vector_page.py            # 矢量可视化（iα-iβ 电流圆 / ψα-ψβ 磁链圆）
+│   ├── power_flow_page.py        # 功率流（逆变器输入/铜损/电磁/机械/母线/制动）
 │   ├── identify_page.py          # 电机参数辨识（B / Tc / J）
 │   ├── communication_page.py     # 通信设置
+│   ├── current_sampling_page.py  # 电流采样诊断（0xF2 ADC/PWM 波形）
+│   ├── experiment_page.py        # 可追溯实验工作流
 │   ├── ai_page.py                # 在线大模型分析（支持图片理解）
 │   ├── edge_ai_page.py           # 离线/边缘 AI 推理
-│   ├── training_page.py          # 模型训练（监督学习 + DRL）
+│   ├── training_page/            # 模型训练子包（监督学习 + DRL）
 │   ├── operation_log_page.py     # 操作记录
+│   ├── manual_page.py            # 内置使用说明书页
 │   └── control_param_panels/     # 各控制方式的参数子面板
 ├── controllers/                  # 控制算法（每种算法一个文件）
-│   ├── pi_controller.py
+│   ├── pi_controller.py          # 增量式 PID + 抗饱和
 │   ├── openloop_controller.py
-│   ├── mpc_controller.py
+│   ├── mpc_controller.py         # 一阶系统 + 网格搜索 MPC
 │   ├── sensorless_controller.py
 │   ├── current_chopping_controller.py    # SRM CCC
 │   ├── angle_position_controller.py      # SRM APC
-│   └── voltage_control_controller.py     # SRM 电压PWM
+│   └─ voltage_control_controller.py     # SRM 电压PWM
 ├── communications/               # 通信驱动
+│   ├── base_comm.py              # 通信抽象基类
 │   ├── serial_comm.py            # RS-232 / RS-485
 │   ├── can_comm.py               # CAN（python-can 后端）
 │   ├── zlgcan_comm.py            # 周立功 CAN——创芯 ControlCAN.dll（VCI_* 老接口）
 │   ├── zlgcan_zcan_comm.py       # 周立功 CAN——致远原厂 zlgcan.dll（ZCAN_* 新接口）
 │   ├── tcp_comm.py               # TCP/IP
 │   ├── motor_sim.py              # 数字孪生 L1：PMSM dq 轴物理模型（虚拟下位机）
-│   ├── protocol.py               # 帧编解码
-│   ├── protocol_v2.py            # v2 CRC16/地址/序号/ACK 帧（迁移中，v1仍为默认）
+│   ├── protocol.py               # v1 帧编解码（0xAA/0x55 + 8 位累加和）
+│   ├── protocol_v2.py            # v2 帧编解码（0xA5 0x5A + CRC16-CCITT-FALSE + 0x7E）
 │   ├── protocol_session.py       # v2 握手、能力协商与命令应答跟踪
-│   ├── v2_virtual_device.py      # 可脚本化v2虚拟下位机/故障注入节点
-│   └── comm_manager.py           # 上层 Qt 信号封装
+│   ├── v2_virtual_device.py      # 可脚本化 v2 虚拟下位机/故障注入节点
+│   └── comm_manager.py           # 上层 Qt 信号封装（三通道遥测分发）
 ├── training/
 │   ├── trainer.py                # MLP/CNN/LSTM/Transformer/RF/SVM 训练器
 │   └── drl_trainer.py            # PPO/SAC/TD3 深度强化学习训练器
-├── edge_ai/
+├─ edge_ai/
 │   └── engine.py                 # ONNX Runtime 推理引擎
 ├── ai/
-│   └── ai_client.py              # OpenAI 兼容大模型客户端
-├── widgets/                      # 自定义控件
-├── logs/                         # 操作日志（operation_logger 落盘）
+│   ├── ai_client.py              # OpenAI 兼容大模型客户端
+│   └── rag.py                    # BM25 本地检索 + 中文字符二元组分词 + PDF OCR
+├── experiments/                  # 可追溯实验持久化
+│   ├── repository.py              # 目录式实验仓库（原子写 + fsync）
+│   ├── session_manager.py        # 实验会话生命周期管理
+│   ├── models.py / equipment.py / templates.py / recorder.py
+│   ├── telemetry.py / report.py
+├── widgets/                      # 自定义控件（雷达图、温度标签、趋势曲线等）
+├── logs/
+│   └── operation_logger.py       # 操作日志落盘
+├── knowledge/                    # RAG 知识库（用户放置 md/txt/pdf）
 ├── zlgcan_x64/                   # 周立功驱动 DLL 及设备属性文件
-└── 下位机适配/                   # 下位机协议移植包（STM32/C2000/Arduino/FPGA）
+├── 下位机适配/                   # 下位机协议移植包（STM32/C2000/Arduino/FPGA）
+└── 波形记录/                     # 历史波形 CSV/PNG 落盘目录
 ```
+
+> 数字孪生模型参数详见 [`数字孪生与电机参数.md`](数字孪生与电机参数.md)；v2 协议帧格式详见 [`下位机适配/PROTOCOL_V2.md`](下位机适配/PROTOCOL_V2.md)；上下行数据字典与字段语义（含 PWM 比较值/采样点/扇区/VDDA）详见 [`通信规约与数据字典.md`](通信规约与数据字典.md)。
 
 ## 三、主要功能特性
 
@@ -75,17 +94,19 @@ AI 异常检测与边缘 AI 推理的全流程开发与调试需求。
 - 控制页记录额定工作点温度，实际遥测温度集中在监控页展示
 
 ### 3.2 位置传感器多选
-位置传感器列表**支持多选**，可同时勾选多种作为主用 / 兜底 / 估算方式：
+位置传感器列表**支持多选**，可同时勾选多种作为主用 / 兜底 / 估算方式。`config.SENSOR_REGISTRY` 维护每个传感器的元数据（sensor_id、bus、sample_rate_hz、can_id_default、allowed_modes、sensorless_method）：
 
-| 类型 | 说明 |
-| --- | --- |
-| 霍尔传感器 (Hall) | 低成本、低分辨率，适合换相 |
-| 增量式编码器 (QEP) | 高分辨率，矢量控制常用 |
-| 旋转变压器 (Resolver) | 抗振动，工业/车规常用 |
-| 无位置-滑模观测器 (SMO) | 中高速估算 |
-| 无位置-扩展卡尔曼 (EKF) | 噪声鲁棒 |
-| 无位置-模型参考自适应 (MRAS) | 参数辨识友好 |
-| 无位置-高频注入 (HFI) | 零低速估算 |
+| 类型 | id | 总线 | 采样率 | CAN ID | 说明 |
+| --- | --- | --- | --- | --- | --- |
+| 霍尔传感器 (Hall) | 0 | RS-485 | 6 kHz | 0x000 | 低成本、低分辨率，适合换相 |
+| 增量式编码器 (QEP) | 1 | RS-485 | 20 kHz | 0x000 | 高分辨率，矢量控制常用 |
+| 旋转变压器 (Resolver) | 2 | CAN 总线 | 10 kHz | 0x201 | 抗振动，工业/车规常用 |
+| 无位置-滑模观测器 (SMO) | 3 | SPI（内部） | 10 kHz | 0x000 | 中高速估算 |
+| 无位置-扩展卡尔曼 (EKF) | 4 | SPI（内部） | 10 kHz | 0x000 | 噪声鲁棒 |
+| 无位置-模型参考自适应 (MRAS) | 5 | SPI（内部） | 10 kHz | 0x000 | 参数辨识友好 |
+| 无位-高频注入 (HFI) | 6 | SPI（内部） | 4 kHz | 0x000 | 零低速估算 |
+
+`allowed_modes=[]` 表示该传感器适配所有控制方式；`warn_modes` 列出兼容但不推荐的组合。每种传感器有独立的参数 dataclass（HallParams/QEPParams/ResolverParams/SMOParams/EKFParams/MRASParams/HFIParams），下位机收到 `CMD_SET_SENSOR(0x21)` 时按 sensor_id 切换内部观测器。
 
 ### 3.3 实时监控
 - 实时显示：转速 / 电流 / 转矩 / 角度 / 温度
@@ -105,13 +126,48 @@ AI 异常检测与边缘 AI 推理的全流程开发与调试需求。
   - `zlgcan-zcan`：致远原厂 zlgcan.dll（ZCAN_* 新接口）
   - 其余（slcan / pcan / kvaser 等）：走 python-can
 - 完整可配置：端口、波特率、数据位、停止位、校验位、超时
-- 自定义帧协议：`HEAD | CMD | LEN | PAYLOAD | CHKSUM | TAIL`
-- 命令字：`0x10 启动 / 0x11 停止 / 0x12 紧急停止 / 0x20 设置参数`
-- 异常处理：断线重连、超时提示、错误日志
 - 配套 `下位机适配/` 移植包：C 语言协议栈 + STM32 / TI C2000 / Arduino / FPGA(Verilog) 平台适配层
-- v2协议支持`virtual-v2`联调和`negotiated-v2`真实串口/TCP严格握手；默认仍为v1，握手失败不自动降级。经典CAN需先定义分片协议，暂不允许选择v2；规范见`下位机适配/PROTOCOL_V2.md`
-- 实验页支持不可变的设备档案修订，冻结电机、逆变器、控制板、传感器、固件身份和安全上限；新修订不覆盖历史实验引用的版本
-- 选择设备档案后，真机必须使用`negotiated-v2`；握手返回的设备ID、硬件版本和固件前缀必须符合白名单，不匹配时立即拒绝连接且不降级
+
+#### v1 协议（默认，兼容老固件）
+- 帧结构：`0xAA | CMD | LEN | PAYLOAD | 8位累加和 | 0x55`
+- 校验：PAYLOAD 所有字节求和取低 8 位
+- 命令字：`0x10 启动 / 0x11 停止 / 0x12 紧急停止 / 0x13 故障复位 / 0x20 设置参数 / 0x21 设置传感器`
+- CAN 模式：8 字节裸数据 `<hHhH`（speed_actual/target/current/angle_raw），无帧头/校验/帧尾
+- 串口遥测 payload 15 字节，struct 格式 `<hHhHhbBBBx`
+
+#### v2 协议（实验工作流推荐）
+- 帧结构：`0xA5 0x5A | version | address | sequence | msg_type | command | length(2B) | payload | CRC16-CCITT-FALSE | 0x7E`
+- magic `0xA5 0x5A` 用于字节流对齐，`0x7E` 帧尾确认
+- CRC16-CCITT-FALSE：`poly=0x1021, init=0xFFFF, 不反射, xor_out=0x0000`，校验向量 `"123456789" → 0x29B1`
+- payload 上限 4096 字节
+- 消息类型：COMMAND/ACK/NACK/HELLO/CAPABILITIES/TELEMETRY/HEARTBEAT
+- 握手：HELLO/CAPABILITIES 协议版本协商 + 设备身份白名单（device_id / hardware_version / firmware_prefix），不匹配**立即拒绝且不降级到 v1**
+- 心跳：0.5 s 周期、3 s ACK 超时；遥测持续时单独丢失心跳 ACK 不判定断链
+- 三种连接模式：`connect()`（v1）/`connect_negotiated_v2()`（真实链路严格握手）/`connect_virtual_v2()`（内存虚拟下位机）
+- **经典 CAN 不支持 v2**：v2 最小帧超过 8 字节，需先定义分片协议；CAN 上只能跑 v1 的 8 字节压缩遥测
+- 完整帧格式与三种遥测帧字节布局见 [`下位机适配/PROTOCOL_V2.md`](下位机适配/PROTOCOL_V2.md)
+
+#### 三通道遥测
+上位机把遥测拆成三个独立通道，各自有独立的频率、格式和回调
+
+| 命令 | 通道 | 典型频率 | 用途 |
+|---|---|---|---|
+| 0xF0 | `telemetryReceived` | 10 Hz | 速度/温度/故障等慢变量，UI 主曲线 |
+| 0xF1 | `highRateTelemetryReceived` | 200 Hz（UART）/1 kHz（TCP 批量） | 电角度/Iq/Iqref/相电流/Vd/Vq/Vbus |
+| 0xF2 | `currentSamplingDiagReceived` | 50 Hz | ADC 原始值/PWM duty/扇区/标定窗口 |
+
+三通道独立时钟，时间轴不严格对齐。每帧的 `tick_ms` 是下位机 HAL_GetTick 毫秒时间戳，上位机额外存 `monotonic_s` 与墙上时间 ISO 字符串。
+
+#### 运行状态机
+所有危险运行意图通过 `core/runtime_state.py` 的状态机统一约束：
+
+```
+DISCONNECTED → CONNECTED → PRECHECK → READY → RUNNING → STOPPING → READY
+                                            │
+                                  FAULT_LOCKED ──reset_fault(人工)──> CONNECTED/DISCONNECTED
+```
+
+`FAULT_LOCKED` 跨重连保持，必须显式复位；RUNNING/STOPPING 期间断线立即 `FAULT_LOCKED`。
 
 ### 3.5 监督学习模型训练
 **模型选择**：MLP、1D-CNN、LSTM、Transformer、随机森林、SVM 共 6 种
@@ -151,12 +207,16 @@ AI 异常检测与边缘 AI 推理的全流程开发与调试需求。
 均落盘到 `logs/operation_log.txt`，可在"操作记录"页面回看。
 
 ### 3.9 数字孪生 L1（虚拟下位机）
-`communications/motor_sim.py` 内置 PMSM dq 轴物理模型：
+`communications/motor_sim.py` 内置 PMSM dq 轴物理模型，完整参数表见 [`数字孪生与电机参数.md`](数字孪生与电机参数.md)。
+
 - dq 电压方程 + 电磁转矩方程 + 机械方程 + 一阶热模型，欧拉法 0.5 ms 步长积分
-- 内嵌转速/电流双闭环 PI，相当于下位机固件的控制环
+- 每 0.1 s 对外吐一帧遥测，1 kHz 内部高速轨迹（每 2 步采 1 次）
+- 内嵌转速/电流双闭环 PI：速度环 Kp=0.06/Ki=2.0（按 24V 小惯量电机整定），电流环 Kp=1.2/Ki=300（含交叉耦合前馈与抗饱和）
+- L2 母线动力学：电源内阻、母线电容、带滞回的制动斩波器（v_brake_on=27V / v_brake_off=25.5V）、过压跳闸 v_ov_trip=30V
+- 默认参数对齐**野火 42JSF840AS-1000-8 PMSM**（24V/4000rpm/4对极，Rs=0.59Ω, Ld=Lq=0.66mH, ψf=7.04mWb, J=1.85e-5 kg·m²）
 - 充当"虚拟下位机"：仿真模式下控制页的启动 / 停止 / 急停 / 目标转速
-  产生真实动态响应（阶跃、超调、滑行停机），含齿槽转矩、库仑摩擦、铜损发热
-- 默认参数为 48V 小功率 PMSM 占位值，拿到实际铭牌参数后替换 `PMSMParams` 即可
+  产生真实动态响应（阶跃、超调、滑行停机），齿槽转矩、库仑摩擦、铜损发热
+- 拿到实际铭牌参数后替换 `PMSMParams` 字段即可，PI 参数真机套用前建议先降低 20% 再现场整定
 
 ### 3.10 矢量可视化（αβ 平面）
 - **电流圆 iα-iβ** 与 **磁链圆 ψα-ψβ** 双图实时绘制，带余辉点云与当前矢量线
@@ -189,11 +249,16 @@ AI 异常检测与边缘 AI 推理的全流程开发与调试需求。
 | GUI 框架 | PySide6 (Qt 6) |
 | 绘图 | pyqtgraph |
 | 串口 | pyserial |
-| CAN | python-can |
+| CAN | python-can / 周立功 ControlCAN.dll / 周立功 zlgcan.dll |
 | 深度学习 | PyTorch |
 | 经典 ML | scikit-learn |
 | 推理 | ONNX Runtime |
-| 数据 | NumPy |
+| 数据 | NumPy / pandas |
+| 知识库 | BM25 本地检索（自实现） + pypdf + rapidocr_onnxruntime（可选） |
+| AI 客户端 | OpenAI 兼容 HTTP 接口 |
+| 打包 | PyInstaller（单文件，含 `runtime_paths.py` 处理 `_MEIPASS`） |
+
+> `requirements.txt` 为运行依赖，`requirements-train.txt` 额外含 torch 等训练依赖（体积较大）。打包精简版不带训练依赖，启动时 `import torch` 失败会自动关闭训练页。
 
 ## 六、安装与运行
 
@@ -290,6 +355,11 @@ ONNX 导出仅支持 PyTorch 模型（MLP / CNN / LSTM / Transformer）。
 
 ## 十一、更新日志
 
+- **v1.8**：实验室对拖联调版——通信页遥测档位（省流/标准/**辨识**/自定义）与
+  **F3 在线 ARX/RLS** 开关；监视页「在线辨识」曲线（a1/L/R）；F1/F2/F3 分频与
+  TCP 队列保护、控制/ACK 优先；波形批量导出与趋势曲线批处理；运行态与故障
+  遥测硬化；与 F407 固件 `v2_rls`（F3+RUN 起 16 kHz 被动辨识、约 10 Hz 上报）
+  联调通过。说明：默认「标准」档 F3 关；选「辨识」或勾选 F3 后再 START，加速段即可学习。
 - **v1.7**：实验室真机联调——RS-232/以太网TCP negotiated-v2通信强化、控制与
   ACK优先、心跳独立超时；真实遥测与200 Hz高速角度/Iq/Iqref/相电流通道、ADC
   注入采样与PWM诊断页、波形CSV归档；野火78 W PMSM真实温度和母线采样、

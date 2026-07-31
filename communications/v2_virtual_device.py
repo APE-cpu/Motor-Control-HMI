@@ -190,7 +190,7 @@ class V2VirtualDevice:
             "speed_target": 0.0,
             "current_actual": 0.0,
             "temperature": 25.0,
-            "vdc": 48.0,
+            "vdc": 24.0,
             "bus_state": "normal",
             "fault_code": self.fault_code,
             "fault_text": self.fault_text,

@@ -44,6 +44,7 @@ def test_控制页默认参数与当前真机固件一致(monkeypatch):
     assert page._motor_model.text() == "野火 78W PMSM"
     assert page._max_rpm.value() == 4000
     assert abs(page._current_limit.value() - 1.887) < 0.001
+    assert abs(pi.iq_max.value() - 1.887) < 0.001
     assert pi.kp_spd.value() == 1752
     assert pi.ki_spd.value() == 121
     assert pi.kp_cur.value() == 2323
@@ -82,6 +83,7 @@ def test_PI参数方案可保存并重新加载(tmp_path, monkeypatch):
     assert pi.ki_spd.value() == 100
     assert pi.kp_cur.value() == 2200
     assert pi.ki_cur.value() == 1900
-    assert pi.iq_max.value() == 1.5
-    assert page._current_limit.value() == 1.6
+    # iq_max 与顶部电流限幅已双向同步；加载时以 max_current_a 为准统一两者
+    assert abs(pi.iq_max.value() - 1.6) < 0.001
+    assert abs(page._current_limit.value() - 1.6) < 0.001
     assert page._max_rpm.value() == 4000

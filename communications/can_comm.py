@@ -43,9 +43,13 @@ class CANComm(BaseComm):
     def send(self, data: bytes, arbitration_id: int = 0x100) -> int:
         if not self.is_open():
             raise RuntimeError("CAN 未打开")
+        if len(data) > 8:
+            raise ValueError(
+                f"经典CAN单帧最多8字节，拒绝静默截断 {len(data)} 字节；"
+                "请使用已定义的分段协议或CAN-FD")
         import can as _c
         msg = _c.Message(arbitration_id=arbitration_id,
-                         data=list(data[:8]), is_extended_id=False)
+                         data=list(data), is_extended_id=False)
         self._bus.send(msg)
         return len(msg.data)
 

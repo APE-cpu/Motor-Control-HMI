@@ -11,8 +11,9 @@
 同时充当"虚拟下位机"：可接收启动/停止/急停/目标转速指令，
 仿真模式下控制页的操作产生真实的动态响应（阶跃、超调、滑行停机）。
 
-注意：默认参数是 48V 小功率 PMSM 的占位值，拿到实际电机铭牌参数后
-替换 PMSMParams 即可。
+默认参数对齐野火 42JSF840AS-1000-8 PMSM（24V/4000rpm/4对极/0.59Ω/
+0.66mH/反电动势2.95V/Krpm）。拿到实际铭牌参数后替换 PMSMParams 字段即可
+未知参数（B/Tc/J_load/热模型）为同规格电机的估算值，建议用辨识页实测后回写。
 """
 import math
 from collections import deque
@@ -21,29 +22,32 @@ from dataclasses import dataclass
 
 @dataclass
 class PMSMParams:
-    Rs: float = 0.5          # 定子电阻 Ω
-    Ld: float = 1.0e-3       # d 轴电感 H
-    Lq: float = 1.2e-3       # q 轴电感 H
-    psi_f: float = 0.016     # 永磁磁链 Wb（基速约 4000 rpm > 上位机默认最高 3000）
-    pole_pairs: int = 4
-    J: float = 2.0e-3        # 转动惯量 kg·m²（含负载/联轴器，滑行时间约数秒）
-    B: float = 1.5e-3        # 粘滞摩擦系数 N·m·s/rad
-    T_coulomb: float = 0.1   # 库仑摩擦 N·m
-    T_cogging: float = 0.03  # 齿槽转矩幅值 N·m（6 倍电角频率脉动）
-    Vdc: float = 48.0        # 电源空载电压 V（母线额定）
-    i_max: float = 8.0       # 电流限幅 A
+    # ── 电机本体（铭牌：野火 42JSF840AS-1000-8，24V/4000rpm/4对极） ──
+    Rs: float = 0.59         # 相电阻 Ω（铭牌 0.59±10%）
+    Ld: float = 0.66e-3      # d 轴电感 H（铭牌相电感 0.66±20% mH，表贴式 Ld≈Lq）
+    Lq: float = 0.66e-3      # q 轴电感 H（同上，凸极率≈1）
+    psi_f: float = 7.04e-3  # 永磁磁链 Wb（由铭牌反电动势 2.95V/Krpm 换算：
+                             # ψf = 2.95/(1000×2π/60)/pole_pairs ≈ 0.00704）
+    pole_pairs: int = 4     # 极对数（铭牌）
+    J: float = 1.85e-5       # 转动惯量 kg·m²（铭牌 1.85×10⁻⁵，仅转子不含负载）
+    B: float = 1.5e-4        # 粘滞摩擦系数 N·m·s/rad（小电机估取 1e-4 量级）
+    T_coulomb: float = 0.01 # 库仑摩擦 N·m（小电机估取 0.01 量级，约额定力矩5%）
+    T_cogging: float = 5e-3 # 齿槽转矩幅值 N·m（6 倍电角频率脉动，小电机估取）
+    # ── 母线与电流（24V 平台） ──
+    Vdc: float = 24.0       # 电源空载电压 V（铭牌 24V DC）
+    i_max: float = 8.0      # 电流限幅 A（额定电流约4.5A，留 1.8× 余量）
     # 直流母线硬件（数字孪生 L2：电源内阻 + 母线电容 + 制动斩波器）
-    r_src: float = 0.3       # 电源内阻 Ω（重载时母线下垂的来源）
-    c_bus: float = 2.0e-3    # 母线电容 F
-    r_brake: float = 10.0    # 制动斩波电阻 Ω
-    v_brake_on: float = 54.0     # 斩波开启阈值 V（滞环上限）
-    v_brake_off: float = 51.0    # 斩波关闭阈值 V（滞环下限）
-    v_ov_trip: float = 60.0      # 过压跳闸阈值 V（封管保护）
-    v_uv_warn: float = 42.0      # 欠压告警阈值 V
+    r_src: float = 0.2      # 电源内阻 Ω（24V 小功率平台估取 0.2）
+    c_bus: float = 1.0e-3   # 母线电容 F（24V 平台估取 1mF）
+    r_brake: float = 10.0   # 制动斩波电阻 Ω（24V 小电机通常无斩波，保留模型结构）
+    v_brake_on: float = 27.0    # 斩波开启阈值 V（1.125×Vdc，滞回上限）
+    v_brake_off: float = 25.5   # 斩波关闭阈值 V（1.0625×Vdc，滞回下限）
+    v_ov_trip: float = 30.0      # 过压跳闸阈值 V（1.25×Vdc，封管保护）
+    v_uv_warn: float = 21.0      # 欠压告警阈值 V（0.875×Vdc）
     # 一阶热模型（铜损发热）
-    rth: float = 1.5         # 热阻 K/W
-    tau_th: float = 60.0     # 热时间常数 s
-    t_amb: float = 25.0      # 环境温度 °C
+    rth: float = 3.0        # 热阻 K/W（小电机散热面积小，估取 3 K/W）
+    tau_th: float = 120.0   # 热时间常数 s（小电机热容小但散热慢，估取 120s）
+    t_amb: float = 25.0     # 环境温度 °C
 
 
 class MotorSim:
@@ -163,15 +167,22 @@ class MotorSim:
 
         if self.enabled:
             # --- 转速环（输出 iq 给定，带限幅抗饱和）---
+            # PI 增益按 24V/0.59Ω/0.66mH/1.85e-5 kg·m² 电机重整：
+            # Kt=1.5·p·ψf≈0.0423 N·m/A，J 比 48V 平台小 100×，
+            # 速度环 Kp 维持 0.06（小 J 电机对增益不敏感，保持原值即可
+            # 达到相近带宽）；Ki 适当上调以补偿小惯量下的稳态精度。
             spd_err = self.speed_ref_rpm * math.pi / 30.0 - self.omega
             self._int_spd += spd_err * dt
-            iq_ref = 0.06 * spd_err + 1.0 * self._int_spd
+            iq_ref = 0.06 * spd_err + 2.0 * self._int_spd
             if abs(iq_ref) > p.i_max:
                 iq_ref = math.copysign(p.i_max, iq_ref)
                 self._int_spd -= spd_err * dt   # 饱和时冻结积分
             self.iq_ref = iq_ref
 
             # --- 电流环（PI + 交叉解耦前馈）---
+            # 电流环带宽须 ≫ 速度环；24V 平台 Ld/Lq=0.66mH、Rs=0.59Ω，
+            # 电气时间常数 L/R≈1.1ms，Kp/Ki 维持 1.2/300 在该 L/R 下仍
+            # 稳定（原 48V 平台 L/R≈2ms 也用同值，覆盖范围足够）。
             ed = 0.0 - self.i_d
             eq = iq_ref - self.i_q
             self._int_d += ed * dt

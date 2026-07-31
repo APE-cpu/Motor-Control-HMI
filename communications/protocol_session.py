@@ -106,6 +106,11 @@ class ProtocolSession:
     def has_pending_command(self, command: int) -> bool:
         return any(item[0] == command for item in self._pending.values())
 
+    def pending_sequence_for(self, command: int) -> int | None:
+        """返回指定在途命令序号，用于幂等重发（当前仅心跳使用）。"""
+        return next((sequence for sequence, item in self._pending.items()
+                     if item[0] == command), None)
+
     def invalidate(self, reason: str) -> list[CommandResult]:
         """会话丢失：清理全部待应答命令并返回明确失败结果。"""
         self.session_lost_reason = reason
@@ -174,5 +179,9 @@ class ProtocolSession:
 
     def _allocate_sequence(self) -> int:
         sequence = self._next_sequence
-        self._next_sequence = 1 if sequence >= 0xFFFF else sequence + 1
+        # 0xFFFF保留给无会话STOP/急停，不能与正常ACK序号冲突。
+        if sequence >= 0xFFFE:
+            self._next_sequence = 1
+        else:
+            self._next_sequence = sequence + 1
         return sequence

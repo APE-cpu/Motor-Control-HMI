@@ -152,7 +152,7 @@ class _FlowDiagram(QWidget):
         super().__init__()
         self.setMinimumHeight(220)
         self._powers: dict = {}
-        self._vdc = 48.0
+        self._vdc = 24.0
         self._bus_state = "normal"
         # 能量脉冲动画：虚线相位随时间推进，流速 ∝ 功率
         self._t = 0.0

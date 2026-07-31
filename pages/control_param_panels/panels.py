@@ -134,7 +134,11 @@ class PIPanel(_FormulaPanel):
         self.kp_spd = _dspin(0, 1e4, 1752, 0)
         self.ki_spd = _dspin(0, 1e4, 121, 0)
         self.kd_spd = _dspin(0, 1e4, 0.0)
-        self.iq_max = _dspin(0, 4.49, 1.887, 3)
+        # 与顶部“电流限幅”同一物理量；恢复实验基线 1.887 A（约 4.5 A 硬件上限）。
+        self.iq_max = _dspin(0.1, 4.49, 1.887, 3, 0.1)
+        self.iq_max.setToolTip(
+            "转速环输出限幅 i_qmax（A）。发送参数时同步为 max_current_a。"
+            "实验基线 1.887 A；可调到约 4.49 A。")
         self.dt_spd = _dspin(1e-6, 1.0, 0.002, 6)
         self.dt_spd.setReadOnly(True)
         self.dt_spd.setToolTip("下位机固定500 Hz；界面不可修改")
@@ -186,14 +190,14 @@ _OPENLOOP_FORMULA = (
         "Iqref：q轴转矩电流给定；空载电机会向任一方向加速，不能把它当速度给定",
         "Kpi/Kii：电流内环整数增益；运行中每次只允许修改 ±10%",
         "斜坡时间：改变 Iqref 时的过渡时间，避免电流阶跃过猛")
-    + _txt("<b style='color:#ff8a65'>⚠ 禁止空载长时间运行</b>：本模式仅允许固定转子测试或"
-           "极短低电流脉冲；超过 100 rpm 下位机将独立切断功率级。"))
+    + _txt("<b style='color:#ff8a65'>⚠ 注意空载加速</b>：本模式无速度环，空载电机会持续加速；"
+           "超过 1500 rpm 下位机受控停机，超过 2500 rpm 按跑飞锁存故障。"))
 
 
 class OpenLoopPanel(_FormulaPanel):
     def __init__(self) -> None:
         super().__init__()
-        self.iq_ref = _dspin(-0.5, 0.5, 0.00, 3, 0.01)
+        self.iq_ref = _dspin(-1.5, 1.5, 0.00, 3, 0.01)
         self.kp_cur = _dspin(0, 10000, 2323, 0)
         self.ki_cur = _dspin(0, 10000, 2077, 0)
         self.ramp_ms = _dspin(100, 5000, 500, 0, 100)
@@ -457,10 +461,10 @@ class VoltageControlPanel(_FormulaPanel):
     """电压 PWM 控制：占空比直接调制平均电压，结构简单适合宽调速。"""
     def __init__(self) -> None:
         super().__init__()
-        self.vdc = _dspin(0, 1000, 48.0, 2)
+        self.vdc = _dspin(0, 1000, 24.0, 2)
         self.duty = _dspin(0, 1, 0.5, 2, 0.05)
         self.f_pwm = _dspin(1_000, 200_000, 20_000.0, 0)
-        self.v_limit = _dspin(0, 1000, 48.0, 2)
+        self.v_limit = _dspin(0, 1000, 24.0, 2)
         self.form.addRow("直流母线电压 (V)", self.vdc)
         self.form.addRow("占空比 (0-1)", self.duty)
         self.form.addRow("PWM 频率 (Hz)", self.f_pwm)

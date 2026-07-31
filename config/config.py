@@ -116,10 +116,10 @@ class AnglePositionParams:
 
 @dataclass
 class VoltageControlParams:
-    dc_bus_voltage: float = 48.0
+    dc_bus_voltage: float = 24.0
     duty: float = 0.5
     pwm_frequency: float = 20_000.0
-    voltage_limit: float = 48.0
+    voltage_limit: float = 24.0
 
 
 @dataclass

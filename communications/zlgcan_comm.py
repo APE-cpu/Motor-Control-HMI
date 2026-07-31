@@ -175,12 +175,15 @@ class ZlgCanComm(BaseComm):
     def send(self, data: bytes, arbitration_id: int = 0x100) -> int:
         if not self.is_open():
             raise RuntimeError("ZLG CAN 未打开")
+        if len(data) > 8:
+            raise ValueError(
+                f"经典CAN单帧最多8字节，拒绝静默截断 {len(data)} 字节")
         obj = VCI_CAN_OBJ()
         obj.ID = int(arbitration_id)
         obj.SendType = 0          # 0=正常发送
         obj.RemoteFlag = 0        # 0=数据帧
         obj.ExternFlag = 0        # 0=标准帧（11位ID）
-        n = min(len(data), 8)
+        n = len(data)
         obj.DataLen = n
         for i in range(n):
             obj.Data[i] = data[i]

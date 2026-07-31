@@ -8,8 +8,9 @@ from collections import deque
 from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
-    QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QMessageBox,
-    QProgressBar, QPushButton, QSpinBox, QTabWidget, QVBoxLayout, QWidget,
+    QCheckBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QMessageBox, QProgressBar, QPushButton, QSpinBox, QTabWidget, QVBoxLayout,
+    QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
@@ -19,6 +20,13 @@ from widgets.trend_curve import TrendCurve
 from runtime_paths import writable_path
 from widgets.temperature_label import TemperatureLabel
 from config.config import TEMP_HIGH_THRESHOLD, TEMP_NORMAL_THRESHOLD
+
+try:
+    import numpy as np
+    import pyqtgraph as pg
+    _MP_PG_OK = True
+except Exception:  # pragma: no cover
+    _MP_PG_OK = False
 
 
 def _make_curve_panel(curve: TrendCurve, title: str) -> QWidget:
@@ -50,9 +58,19 @@ def _make_curve_panel(curve: TrendCurve, title: str) -> QWidget:
         def _sync(values, pc=pop_curve):
             pc.append(values)
 
+        def _sync_batch(samples, interval_s, pc=pop_curve):
+            pc.append_batch(samples, interval_s)
+
         curve.add_popout_callback(_sync)
-        win.destroyed.connect(lambda: curve._popout_callbacks.remove(_sync)
-                              if _sync in curve._popout_callbacks else None)
+        curve.add_popout_batch_callback(_sync_batch)
+
+        def _detach_popout_callbacks():
+            if _sync in curve._popout_callbacks:
+                curve._popout_callbacks.remove(_sync)
+            if _sync_batch in curve._popout_batch_callbacks:
+                curve._popout_batch_callbacks.remove(_sync_batch)
+
+        win.destroyed.connect(_detach_popout_callbacks)
         lv = QVBoxLayout(win)
         lv.addWidget(pop_curve, 1)
         win.show()
@@ -246,9 +264,11 @@ class MonitorPage(QWidget):
         self._comm = comm
         self._ctrl = control_page
         self._latest: TelemetryFrame = TelemetryFrame()
-        self._high_rate_samples = deque(maxlen=2000)
+        self._high_rate_samples = deque(maxlen=5000)
         self._last_high_angle_time = 0.0
         self._last_telemetry_time: float = 0.0
+        self._latest_vbus_v = 0.0
+        self._latest_rls: dict = {}
 
         root = QVBoxLayout(self)
 
@@ -261,6 +281,12 @@ class MonitorPage(QWidget):
         self._datasrc_label = QLabel("[ 电机未启动 ]")
         self._datasrc_label.setStyleSheet("color: #90a4ae; font-weight: bold;")
         title_row.addWidget(self._datasrc_label)
+        self._smooth_chk = QCheckBox("显示平滑")
+        self._smooth_chk.setToolTip(
+            "只平滑显示波形，不影响控制/导出/统计。\n"
+            "相电流用轻平滑保留正弦；电角度锯齿不平滑。")
+        self._smooth_chk.toggled.connect(self._on_smooth_toggled)
+        title_row.addWidget(self._smooth_chk)
         btn_save_all = QPushButton("保存所有波形")
         btn_save_all.clicked.connect(self._save_all_curves)
         title_row.addWidget(btn_save_all)
@@ -286,6 +312,7 @@ class MonitorPage(QWidget):
         self._btn_sim.clicked.connect(self._on_toggle_sim)
         self._btn_quick_sim.clicked.connect(self._on_quick_sim)
         self._sim_running = False
+        comm.statusChanged.connect(self._sync_sim_button)
         # 在线调速：运行中直接改目标转速，无需切换页面
         control_row.addWidget(QLabel("目标转速"))
         self._speed_spin = QSpinBox()
@@ -386,35 +413,77 @@ class MonitorPage(QWidget):
         # ---------- 曲线标签页（同屏只显示一排，高度翻倍）----------
         self._c_speed = TrendCurve("转速 rpm", {"实际": "#4fc3f7", "给定": "#ffb74d"}, y_label="rpm")
         self._c_current = TrendCurve(
-            "Iq / 相电流 A", {"实际 Iq": "#81c784", "给定 Iq": "#ffb74d",
-                              "Ia": "#4fc3f7", "Ib": "#f48fb1"},
-            y_label="A", buffer_size=2000)
+            "q轴电流 Iq A", {"实际 Iq": "#81c784", "给定 Iq": "#ffb74d"},
+            y_label="A", buffer_size=5000)
+        self._c_phase_current = TrendCurve(
+            "相电流 Ia / Ib A", {"Ia": "#4fc3f7", "Ib": "#f48fb1"},
+            y_label="A", buffer_size=5000)
+        # 只显示最近约 80ms（1000rpm/4对极 时约 5 个电周期），正弦看得清而不是
+        # 几千点糊成一片。缓冲仍是 5000 点，导出/统计/THD 不受影响；滚轮缩放后
+        # 恢复此视窗由双击触发。带载或变速时电周期数随速度变化，属正常。
+        self._c_phase_current.set_view_window(0.08)
         self._c_torque = TrendCurve("转矩 Nm", {"实际": "#ba68c8"}, y_label="Nm")
         self._c_angle = TrendCurve(
-            "高速电角度 200Hz", {"高速电角度": "#f48fb1"}, y_label="°",
-            buffer_size=2000)
+            "高速电角度", {"高速电角度": "#f48fb1"}, y_label="°",
+            buffer_size=5000)
         self._c_sensor_q = TrendCurve("传感器诊断 (0-1)", {"质量": "#ffcc80", "收敛度": "#ce93d8"}, y_label="")
+        # 施加电压 Vd/Vq（PI 输出，MCSDK 内部码值）——卡尔曼建模的控制输入 u。
+        self._c_voltage = TrendCurve(
+            "施加电压 Vd/Vq (码值)", {"Vd": "#80cbc4", "Vq": "#ffab91"},
+            y_label="digit", buffer_size=5000)
+        # F3 在线 ARX/RLS 辨识：反解出的物理参数。Ld/Lq 应收敛到 ~0.66mH，
+        # a1 应收敛到 ~0.944；R 由 a1 反解、对电流噪声敏感，需带载提 SNR。
+        self._c_rls_L = TrendCurve(
+            "辨识电感 Ld/Lq (mH)", {"Ld": "#4db6ac", "Lq": "#ff8a65"},
+            y_label="mH", buffer_size=2000)
+        self._c_rls_a1 = TrendCurve(
+            "ARX a1 系数 (→0.944)", {"a1_d": "#4fc3f7", "a1_q": "#ba68c8"},
+            y_label="", buffer_size=2000)
+        self._c_rls_R = TrendCurve(
+            "辨识电阻 Rd/Rq (Ω)", {"Rd": "#81c784", "Rq": "#f06292"},
+            y_label="Ω", buffer_size=2000)
 
         trend_tab = QWidget()
         curve_h = QHBoxLayout(trend_tab)
         curve_h.addWidget(_make_curve_panel(self._c_speed, "转速 rpm"))
-        curve_h.addWidget(_make_curve_panel(self._c_current, "电流 A"))
-        curve_h.addWidget(_make_curve_panel(self._c_torque, "转矩 Nm"))
+        curve_h.addWidget(_make_curve_panel(self._c_current, "q轴电流 Iq A"))
+        curve_h.addWidget(_make_curve_panel(
+            self._c_phase_current, "相电流 Ia / Ib A"))
 
         sensor_tab = QWidget()
         sensor_curve_h = QHBoxLayout(sensor_tab)
         sensor_curve_h.addWidget(_make_curve_panel(self._c_angle, "角度 °"))
         sensor_curve_h.addWidget(_make_curve_panel(self._c_sensor_q, "传感器诊断"))
 
+        power_tab = QWidget()
+        power_curve_h = QHBoxLayout(power_tab)
+        power_curve_h.addWidget(_make_curve_panel(self._c_torque, "转矩 Nm"))
+        power_curve_h.addWidget(_make_curve_panel(self._c_voltage, "施加电压 Vd/Vq"))
+
+        rls_tab = QWidget()
+        rls_curve_h = QHBoxLayout(rls_tab)
+        rls_curve_h.addWidget(_make_curve_panel(self._c_rls_a1, "ARX a1 (→0.944)"))
+        rls_curve_h.addWidget(_make_curve_panel(self._c_rls_L, "辨识电感 (mH)"))
+        rls_curve_h.addWidget(_make_curve_panel(self._c_rls_R, "辨识电阻 (Ω)"))
+
+        burst_tab = self._build_burst_tab()
+
         tabs = QTabWidget()
         tabs.setObjectName("CurveTabs")
         tabs.addTab(trend_tab, "📈 趋势曲线（最近 1000 点）")
         tabs.addTab(sensor_tab, "🧭 传感器波形")
+        tabs.addTab(power_tab, "⚡ 转矩与电压")
+        tabs.addTab(rls_tab, "🔬 在线辨识 (RLS)")
+        tabs.addTab(burst_tab, "📸 抓取波形 (16kHz)")
         root.addWidget(tabs, 1)
 
         # ---------- 连接信号 ----------
         comm.telemetryReceived.connect(self._on_telemetry)
         comm.highRateTelemetryReceived.connect(self._on_high_rate_telemetry)
+        comm.highRateTelemetryBatchReceived.connect(
+            self._on_high_rate_telemetry_batch)
+        comm.rlsCoeffReceived.connect(self._on_rls_coeff)
+        comm.burstReceived.connect(self._on_burst)
 
         # ---------- 刷新定时器 ----------
         self._timer = QTimer(self)
@@ -437,8 +506,134 @@ class MonitorPage(QWidget):
             "iqref_a": float(sample["iqref_a"]),
             "ia_a": float(sample.get("ia_a", 0.0)),
             "ib_a": float(sample.get("ib_a", 0.0)),
+            # 施加电压原始码值（旧固件缺省 0）+ 母线电压，供离线卡尔曼建模。
+            "vd_raw": float(sample.get("vd_raw", 0.0)),
+            "vq_raw": float(sample.get("vq_raw", 0.0)),
+            "vbus_v": float(sample.get("vbus_v", 0.0)),
+            "rate_hz": int(sample.get("rate_hz", 200)),
         })
+        self._latest_vbus_v = float(sample.get("vbus_v", self._latest_vbus_v))
         self._last_high_angle_time = time.time()
+
+    def _on_high_rate_telemetry_batch(self, samples: list[dict]) -> None:
+        for sample in samples:
+            self._on_high_rate_telemetry(sample)
+
+    def _on_rls_coeff(self, sample: dict) -> None:
+        """F3 在线辨识系数（50Hz）。只在有激励（updates 增长、b>0）时才画物理量，
+        否则温启动的 b≈0 会让 L 反解成 inf。原始 θ 缓存供导出。"""
+        self._latest_rls = sample
+        if int(sample.get("updates", 0)) <= 0:
+            return
+
+        def _finite(x, lo, hi):
+            return isinstance(x, float) and x == x and lo <= x <= hi
+
+        # a1 放宽到 ±8：匀速无激励时 θ 不收敛会飘，但仍应显示以证明辨识在跑
+        # （空面板反而分不清"没激励"还是"F3没到"）。收敛时 a1 应趋近 0.944。
+        a1_d, a1_q = sample.get("a1_d"), sample.get("a1_q")
+        if _finite(a1_d, -8.0, 8.0) and _finite(a1_q, -8.0, 8.0):
+            self._c_rls_a1.append({"a1_d": a1_d, "a1_q": a1_q})
+        ld, lq = sample.get("ld_mh"), sample.get("lq_mh")
+        if _finite(ld, 0.0, 10.0) and _finite(lq, 0.0, 10.0):
+            self._c_rls_L.append({"Ld": ld, "Lq": lq})
+        rd, rq = sample.get("rd_ohm"), sample.get("rq_ohm")
+        if _finite(rd, -5.0, 20.0) and _finite(rq, -5.0, 20.0):
+            self._c_rls_R.append({"Rd": rd, "Rq": rq})
+
+    # ------- 突发抓取波形 (16kHz) -------
+    def _build_burst_tab(self) -> QWidget:
+        tab = QWidget()
+        v = QVBoxLayout(tab)
+        bar = QHBoxLayout()
+        self._btn_burst = QPushButton("📸 抓取一帧波形（16kHz 真实）")
+        self._btn_burst.setObjectName("PrimaryButton")
+        self._btn_burst.clicked.connect(self._on_burst_click)
+        self._burst_status = QLabel("电机运行中点“抓取”，下位机录 128ms 原始 16kHz "
+                                    "电流再慢速回传（不占心跳）。")
+        self._burst_status.setStyleSheet("color:#90a4ae;")
+        bar.addWidget(self._btn_burst)
+        bar.addWidget(self._burst_status, 1)
+        v.addLayout(bar)
+        if _MP_PG_OK:
+            self._burst_raw = pg.PlotWidget(title="真实波形（16kHz 原始）")
+            self._burst_avg = pg.PlotWidget(title="同步平均单周期（按电角度折叠去噪）")
+            for plot, xlab in ((self._burst_raw, "时间 (ms)"),
+                               (self._burst_avg, "电角度 (°)")):
+                plot.setBackground("#10131a")
+                plot.showGrid(x=True, y=True, alpha=0.3)
+                plot.addLegend()
+                plot.setLabel("left", "相电流 (A)")
+                plot.setLabel("bottom", xlab)
+            self._burst_raw_ia = self._burst_raw.plot([], [], pen=pg.mkPen("#4fc3f7", width=1), name="Ia")
+            self._burst_raw_ib = self._burst_raw.plot([], [], pen=pg.mkPen("#f48fb1", width=1), name="Ib")
+            self._burst_avg_ia = self._burst_avg.plot([], [], pen=pg.mkPen("#4fc3f7", width=2), name="Ia")
+            self._burst_avg_ib = self._burst_avg.plot([], [], pen=pg.mkPen("#f48fb1", width=2), name="Ib")
+            plots = QHBoxLayout()
+            plots.addWidget(self._burst_raw)
+            plots.addWidget(self._burst_avg)
+            v.addLayout(plots, 1)
+        else:
+            v.addWidget(QLabel("[未安装 pyqtgraph，无法绘制抓取波形]"))
+        return tab
+
+    def _on_burst_click(self) -> None:
+        if not self._comm.is_connected():
+            self._burst_status.setText("未连接，无法抓取。")
+            return
+        ok = self._comm.send_burst_trigger()
+        self._burst_status.setText(
+            "已请求抓取，等待回传…（需电机运行中；约 0.3s 完成）" if ok
+            else "抓取请求发送失败。")
+
+    def _on_burst(self, data: dict) -> None:
+        if not _MP_PG_OK:
+            return
+        n = int(data.get("n", 0))
+        ia = np.asarray(data.get("ia", []), dtype=float) * 0.000629   # 码值→A
+        ib = np.asarray(data.get("ib", []), dtype=float) * 0.000629
+        ang = np.asarray(data.get("ang", []), dtype=float)            # 0..65535 = 0..360°
+        if n == 0 or ia.size == 0:
+            self._burst_status.setText("抓取回传为空。")
+            return
+        t_ms = np.arange(ia.size) / 16.0        # 16kHz → 1/16 ms 每点
+        self._burst_raw_ia.setData(t_ms, ia)
+        self._burst_raw_ib.setData(t_ms, ib)
+        # 同步平均：按电角度折叠到 360 个格子，信号叠加、噪声相消
+        bins = 360
+        idx = np.clip((ang * bins / 65536.0).astype(int), 0, bins - 1)
+        deg = np.arange(bins) + 0.5
+        sum_ia = np.bincount(idx, weights=ia, minlength=bins)
+        sum_ib = np.bincount(idx, weights=ib, minlength=bins)
+        cnt = np.bincount(idx, minlength=bins).astype(float)
+        valid = cnt > 0
+        avg_ia = np.where(valid, sum_ia / np.maximum(cnt, 1), np.nan)
+        avg_ib = np.where(valid, sum_ib / np.maximum(cnt, 1), np.nan)
+        self._burst_avg_ia.setData(deg[valid], avg_ia[valid])
+        self._burst_avg_ib.setData(deg[valid], avg_ib[valid])
+        periods = int(np.sum(np.abs(np.diff(ang)) > 40000))   # 角度回卷次数≈电周期数
+        self._burst_status.setText(
+            f"已抓取 {n} 点（128ms），约 {periods} 个电周期；"
+            f"左=真实波形，右=同步平均去噪单周期。")
+
+    def _on_smooth_toggled(self, checked: bool) -> None:
+        """显示平滑开关：每条曲线用合适窗口。仅平滑显示，不动缓冲/导出/统计。
+        相电流用轻平滑保留正弦基波；电角度是锯齿波，不平滑。"""
+        on = bool(checked)
+        windows = {
+            self._c_speed: 15,
+            self._c_current: 15,
+            self._c_phase_current: 3,   # 轻平滑，低速正弦基波几乎不衰减
+            self._c_torque: 15,
+            self._c_angle: 1,           # 0~360 锯齿，平滑会把回卷抹成斜坡
+            self._c_sensor_q: 1,
+            self._c_voltage: 9,
+            self._c_rls_a1: 1,          # 已是慢变量，无需平滑
+            self._c_rls_L: 1,
+            self._c_rls_R: 5,           # R 反解噪声大，轻平滑便于读趋势
+        }
+        for curve, n in windows.items():
+            curve.set_smoothing(n if on else 1)
 
     def _refresh(self) -> None:
         import time
@@ -489,25 +684,49 @@ class MonitorPage(QWidget):
         self._stat_current.feed(f.current_actual)
         self._stat_torque.feed(f.torque_actual)
 
-        self._c_speed.append({"实际": f.speed_actual, "给定": f.speed_target})
-        if high_rate:
-            self._c_current.append_batch(
-                [{"实际 Iq": sample["iq_a"],
-                  "给定 Iq": sample["iqref_a"],
-                  "Ia": sample["ia_a"], "Ib": sample["ib_a"]}
-                 for sample in high_rate], 0.005)
-        else:
-            self._c_current.append(
-                {"实际 Iq": f.current_actual, "给定 Iq": f.current_target})
-        self._c_torque.append({"实际": f.torque_actual})
+        # 停机后设备遥测全部归零（固件在非 RUN 状态只发零值），此时继续追加
+        # 只会让曲线滚动平直的零线，并在约一分钟内把刚跑完的实验数据挤出
+        # 缓冲区。冻结曲线、保留数据，方便停机后缩放查看波形。
+        curves_active = bool(high_rate) or any(
+            abs(value) > 1e-9 for value in (
+                f.speed_actual, f.speed_target, f.current_actual,
+                f.current_target, f.torque_actual))
+        # 新一次运行开始：解除上次停机后用户缩放造成的时间轴定格，
+        # 否则新数据画在可视窗口之外，看起来像"曲线不再更新"。
+        if curves_active and not getattr(self, "_curves_were_active", False):
+            for curve in (self._c_speed, self._c_current,
+                          self._c_phase_current, self._c_torque,
+                          self._c_angle, self._c_sensor_q, self._c_voltage,
+                          self._c_rls_a1, self._c_rls_L, self._c_rls_R):
+                curve.resume_follow()
+        self._curves_were_active = curves_active
+        if curves_active:
+            self._c_speed.append({"实际": f.speed_actual, "给定": f.speed_target})
+            if high_rate:
+                interval_s = 1.0 / max(high_rate[-1]["rate_hz"], 1)
+                self._c_current.append_batch(
+                    [{"实际 Iq": sample["iq_a"],
+                      "给定 Iq": sample["iqref_a"]}
+                     for sample in high_rate], interval_s)
+                self._c_phase_current.append_batch(
+                    [{"Ia": sample["ia_a"], "Ib": sample["ib_a"]}
+                     for sample in high_rate], interval_s)
+                self._c_voltage.append_batch(
+                    [{"Vd": sample["vd_raw"], "Vq": sample["vq_raw"]}
+                     for sample in high_rate], interval_s)
+            else:
+                self._c_current.append(
+                    {"实际 Iq": f.current_actual, "给定 Iq": f.current_target})
+            self._c_torque.append({"实际": f.torque_actual})
 
-        if high_rate:
-            self._c_angle.append_batch(
-                [{"高速电角度": sample["angle_deg"]}
-                 for sample in high_rate], 0.005)
-        elif time.time() - self._last_high_angle_time > 1.0:
-            self._c_angle.append({"高速电角度": f.angle_actual})
-        self._c_sensor_q.append({"质量": f.sensor_quality, "收敛度": f.convergence})
+            if high_rate:
+                self._c_angle.append_batch(
+                    [{"高速电角度": sample["angle_deg"]}
+                     for sample in high_rate], interval_s)
+            elif time.time() - self._last_high_angle_time > 1.0:
+                self._c_angle.append({"高速电角度": f.angle_actual})
+            self._c_sensor_q.append(
+                {"质量": f.sensor_quality, "收敛度": f.convergence})
         self._refresh_datasource_label(getattr(f, "data_source", "sim"))
 
     @staticmethod
@@ -543,10 +762,12 @@ class MonitorPage(QWidget):
             return b""
         curves = [
             (self._c_speed,    "转速"),
-            (self._c_current,  "电流"),
+            (self._c_current,  "q轴电流 Iq"),
+            (self._c_phase_current, "相电流 Ia / Ib"),
             (self._c_torque,   "转矩"),
             (self._c_angle,    "角度"),
             (self._c_sensor_q, "传感器诊断"),
+            (self._c_voltage,  "施加电压 Vd/Vq"),
         ]
         if not any(len(src._times) for src, _ in curves):
             return b""
@@ -573,9 +794,9 @@ class MonitorPage(QWidget):
         return bytes(buf.data())
 
     def _save_all_curves(self) -> None:
+        from PySide6.QtWidgets import QMessageBox
         png = self.render_waveforms_png()
         if not png:
-            from PySide6.QtWidgets import QMessageBox
             QMessageBox.warning(self, "提示", "暂无波形数据（或未安装 pyqtgraph）")
             return
         path, _ = QFileDialog.getSaveFileName(
@@ -600,9 +821,14 @@ class MonitorPage(QWidget):
         curves = [
             (self._c_speed, "speed"),
             (self._c_current, "iq_current"),
+            (self._c_phase_current, "phase_current"),
             (self._c_torque, "torque"),
             (self._c_angle, "electrical_angle"),
             (self._c_sensor_q, "sensor_diagnostics"),
+            (self._c_voltage, "applied_voltage"),
+            (self._c_rls_a1, "rls_a1"),
+            (self._c_rls_L, "rls_inductance_mh"),
+            (self._c_rls_R, "rls_resistance_ohm"),
         ]
         with open(path, "w", newline="", encoding="utf-8-sig") as stream:
             writer = csv.writer(stream)
@@ -660,8 +886,23 @@ class MonitorPage(QWidget):
                                 "只有状态机处于 READY 或 RUNNING 时才能设定目标转速。")
             return
         target = float(self._speed_spin.value())
+        max_rpm = float(getattr(getattr(self._ctrl, "_max_rpm", None),
+                                "value", lambda: 0)())
+        if max_rpm > 0 and abs(target) > max_rpm:
+            QMessageBox.warning(
+                self, "参数越界",
+                f"在线目标 {target:.0f} rpm 超过最高转速 {max_rpm:.0f} rpm。")
+            return
         payload = f"target={target}".encode("utf-8")
-        self._comm.send_frame(encode_frame(CMD_SET_PARAMS, payload))
+        if not self._comm.send_frame(encode_frame(CMD_SET_PARAMS, payload)):
+            status = self._comm.protocol_status()
+            if not (status.get("mode") == "negotiated-v2" and
+                    status.get("pending_ack", 0) > 0):
+                QMessageBox.warning(self, "设定未发送", "设备未接受在线调速命令。")
+
+    def _sync_sim_button(self, _connected: bool, _message: str) -> None:
+        self._sim_running = self._comm.is_sim_running()
+        self._btn_sim.setText("停止数字孪生" if self._sim_running else "启动数字孪生")
 
     def _on_start(self) -> None:
         if self._ctrl is not None:
@@ -677,6 +918,7 @@ class MonitorPage(QWidget):
 
     def _on_toggle_sim(self) -> None:
         state_machine = getattr(self._ctrl, "_state_machine", None)
+        self._sim_running = self._comm.is_sim_running()
         if not self._sim_running:
             if self._comm.is_connected():
                 QMessageBox.warning(
