@@ -33,3 +33,6 @@ experiment_records/
 # IDE
 .vscode/
 .idea/
+
+# Local implementation worktrees
+.worktrees/
