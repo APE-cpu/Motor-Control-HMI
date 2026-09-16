@@ -64,11 +64,23 @@ def test_对端关闭后先排空原生队列再释放接收器(monkeypatch):
             del self.frames[:max_frames]
             return batch
 
+        def drain_f1(self, max_samples):
+            return []
+
+        def drain_bursts(self, max_bursts):
+            return []
+
         def stats(self):
             return {
                 "running": False, "rx_bytes": 0, "rx_frames": 5,
                 "dropped_frames": 0, "decoder_errors": 0,
                 "queued_frames": len(self.frames),
+                "telemetry": {
+                    "f1_frames": 0, "f4_frames": 0, "f1_samples": 0,
+                    "completed_bursts": 0, "parse_errors": 0,
+                    "dropped_samples": 0, "dropped_bursts": 0,
+                    "queued_samples": 0, "queued_bursts": 0,
+                },
                 "last_error": "peer closed",
             }
 
@@ -105,15 +117,18 @@ def test_Cpp线程接收分包粘包并批量取帧():
         receiver.start(
             "127.0.0.1", port, local_host="127.0.0.1", timeout_s=1.0)
         assert _wait_until(lambda: receiver.stats()["rx_frames"] == len(frames))
-        actual = receiver.drain(100)
+        actual = receiver.drain_f1(100)
         stats = receiver.stats()
     finally:
         receiver.stop()
         server.join(timeout=1.0)
 
-    assert actual == frames
+    assert [sample["tick_ms"] for sample in actual] == [
+        int.from_bytes(frame.payload[:4], "little") for frame in frames]
+    assert receiver.drain(100) == []
     assert stats["decoder_errors"] == 0
     assert stats["dropped_frames"] == 0
+    assert stats["telemetry"]["f1_frames"] == len(frames)
 
 
 @pytest.mark.skipif(

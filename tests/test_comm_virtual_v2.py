@@ -137,6 +137,37 @@ def test_1kHz以太网批量高速通道逐样本解码():
     assert samples[1]["ib_a"] == -151 * 0.000629
 
 
+def test_F4乱序分片由通讯管理器重组并发出完整抓取():
+    comm = CommManager()
+    captures = []
+    comm.burstReceived.connect(captures.append)
+
+    def chunk(total, start, samples):
+        return struct.pack("<HHH", total, start, len(samples)) + b"".join(
+            struct.pack("<hhH", ia, ib, angle)
+            for ia, ib, angle in samples
+        )
+
+    tail = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF4,
+        payload=chunk(4, 2, [(12, -12, 200), (13, -13, 300)])))
+    head = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF4,
+        payload=chunk(4, 0, [(10, -10, 0), (11, -11, 100)])))
+
+    assert comm._process_v2_responses([tail]) == []
+    outputs = comm._process_v2_responses([head])
+
+    expected = {
+        "n": 4,
+        "ia": [10, 11, 12, 13],
+        "ib": [-10, -11, -12, -13],
+        "ang": [0, 100, 200, 300],
+    }
+    assert outputs == [expected]
+    assert captures == [expected]
+
+
 def test_通信页静默接受1kHz批量F1且限制日志长度():
     _app()
     comm = CommManager()

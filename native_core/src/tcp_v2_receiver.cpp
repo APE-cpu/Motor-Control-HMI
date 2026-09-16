@@ -211,8 +211,10 @@ NativeSocket connect_socket(const std::string& host, std::uint16_t port,
 
 }  // namespace
 
-TcpV2Receiver::TcpV2Receiver(std::size_t max_queue_frames)
+TcpV2Receiver::TcpV2Receiver(std::size_t max_queue_frames,
+                             std::size_t max_f1_samples)
     : max_queue_frames_(std::max<std::size_t>(1, max_queue_frames)),
+      telemetry_(max_f1_samples),
       socket_value_(kInvalidSocketValue) {}
 
 TcpV2Receiver::~TcpV2Receiver() { stop(); }
@@ -221,6 +223,7 @@ void TcpV2Receiver::start(const std::string& host, std::uint16_t port,
                           const std::string& local_host, double timeout_s) {
     stop();
     decoder_.reset();
+    telemetry_.reset();
     {
         std::lock_guard<std::mutex> lock(queue_mutex_);
         queue_.clear();
@@ -281,6 +284,25 @@ std::vector<Frame> TcpV2Receiver::drain(std::size_t max_frames) {
     return frames;
 }
 
+std::vector<F1Sample> TcpV2Receiver::drain_f1(std::size_t max_samples) {
+    return telemetry_.drain_f1(max_samples);
+}
+
+std::vector<BurstCapture> TcpV2Receiver::drain_bursts(
+        std::size_t max_bursts) {
+    return telemetry_.drain_bursts(max_bursts);
+}
+
+void TcpV2Receiver::set_f1_rate_hz(std::uint32_t value) noexcept {
+    telemetry_.set_f1_rate_hz(value);
+}
+
+void TcpV2Receiver::set_telemetry_processing_enabled(bool enabled) noexcept {
+    telemetry_processing_enabled_ = enabled;
+}
+
+void TcpV2Receiver::reset_burst() { telemetry_.reset_burst(); }
+
 ReceiverStats TcpV2Receiver::stats() const {
     ReceiverStats result;
     result.running = running_.load();
@@ -288,6 +310,7 @@ ReceiverStats TcpV2Receiver::stats() const {
     result.rx_frames = rx_frames_.load();
     result.dropped_frames = dropped_frames_.load();
     result.decoder_errors = decoder_errors_.load();
+    result.telemetry = telemetry_.stats();
     std::lock_guard<std::mutex> lock(queue_mutex_);
     result.queued_frames = queue_.size();
     result.last_error = last_error_;
@@ -307,8 +330,19 @@ void TcpV2Receiver::receive_loop(std::uintptr_t socket_value) noexcept {
             decoder_errors_ = decoder_.error_count();
             rx_frames_ += static_cast<std::uint64_t>(frames.size());
             if (!frames.empty()) {
-                std::lock_guard<std::mutex> lock(queue_mutex_);
+                std::vector<Frame> ordinary_frames;
+                ordinary_frames.reserve(frames.size());
                 for (auto& frame : frames) {
+                    if (telemetry_processing_enabled_.load() &&
+                        frame.message_type == 6U &&
+                        telemetry_.ingest(frame.command, frame.payload.data(),
+                                          frame.payload.size())) {
+                        continue;
+                    }
+                    ordinary_frames.push_back(std::move(frame));
+                }
+                std::lock_guard<std::mutex> lock(queue_mutex_);
+                for (auto& frame : ordinary_frames) {
                     if (queue_.size() >= max_queue_frames_) {
                         queue_.pop_front();
                         ++dropped_frames_;

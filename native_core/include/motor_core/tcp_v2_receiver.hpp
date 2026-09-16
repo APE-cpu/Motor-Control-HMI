@@ -1,6 +1,7 @@
 #pragma once
 
 #include "motor_core/protocol_v2.hpp"
+#include "motor_core/telemetry_processor.hpp"
 
 #include <atomic>
 #include <cstddef>
@@ -20,12 +21,14 @@ struct ReceiverStats {
     std::uint64_t dropped_frames = 0;
     std::uint64_t decoder_errors = 0;
     std::size_t queued_frames = 0;
+    TelemetryProcessorStats telemetry;
     std::string last_error;
 };
 
 class TcpV2Receiver {
 public:
-    explicit TcpV2Receiver(std::size_t max_queue_frames = 8192);
+    explicit TcpV2Receiver(std::size_t max_queue_frames = 8192,
+                           std::size_t max_f1_samples = 131072);
     ~TcpV2Receiver();
 
     TcpV2Receiver(const TcpV2Receiver&) = delete;
@@ -35,6 +38,11 @@ public:
                const std::string& local_host = {}, double timeout_s = 2.0);
     void stop() noexcept;
     std::vector<Frame> drain(std::size_t max_frames = 512);
+    std::vector<F1Sample> drain_f1(std::size_t max_samples = 8192);
+    std::vector<BurstCapture> drain_bursts(std::size_t max_bursts = 1);
+    void set_f1_rate_hz(std::uint32_t value) noexcept;
+    void set_telemetry_processing_enabled(bool enabled) noexcept;
+    void reset_burst();
     ReceiverStats stats() const;
 
 private:
@@ -47,9 +55,11 @@ private:
     std::deque<Frame> queue_;
     std::string last_error_;
     StreamDecoder decoder_;
+    TelemetryProcessor telemetry_;
     std::thread worker_;
     std::atomic<bool> running_{false};
     std::atomic<bool> stop_requested_{false};
+    std::atomic<bool> telemetry_processing_enabled_{true};
     std::atomic<std::uintptr_t> socket_value_;
     std::atomic<std::uint64_t> rx_bytes_{0};
     std::atomic<std::uint64_t> rx_frames_{0};

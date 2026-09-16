@@ -43,10 +43,12 @@ def native_tcp_transport_enabled() -> bool:
 class NativeTcpV2Receiver:
     backend = "cpp-tcp"
 
-    def __init__(self, max_queue_frames: int = 8192) -> None:
+    def __init__(self, max_queue_frames: int = 8192,
+                 max_f1_samples: int = 131072) -> None:
         if not native_tcp_transport_available():
             raise RuntimeError(f"C++ TCP 接收器不可用：{_native_import_error}")
-        self._receiver = _native.TcpV2Receiver(max(1, int(max_queue_frames)))
+        self._receiver = _native.TcpV2Receiver(
+            max(1, int(max_queue_frames)), max(1, int(max_f1_samples)))
         self.bound_local = ""
 
     def start(self, host: str, port: int, *, local_host: str = "",
@@ -79,6 +81,21 @@ class NativeTcpV2Receiver:
             for version, address, sequence, raw_type, command, payload
             in self._receiver.drain(max(1, int(max_frames)))
         ]
+
+    def drain_f1(self, max_samples: int = 8192) -> list[dict]:
+        return list(self._receiver.drain_f1(max(1, int(max_samples))))
+
+    def drain_bursts(self, max_bursts: int = 1) -> list[dict]:
+        return list(self._receiver.drain_bursts(max(1, int(max_bursts))))
+
+    def set_f1_rate_hz(self, rate_hz: int) -> None:
+        self._receiver.set_f1_rate_hz(max(1, int(rate_hz)))
+
+    def set_telemetry_processing_enabled(self, enabled: bool) -> None:
+        self._receiver.set_telemetry_processing_enabled(bool(enabled))
+
+    def reset_burst(self) -> None:
+        self._receiver.reset_burst()
 
     def stats(self) -> dict[str, object]:
         return dict(self._receiver.stats())

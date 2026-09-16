@@ -383,6 +383,9 @@ def test_RS485加以太网自动使用Cpp线程接收F1(monkeypatch):
         native_stats = comm.protocol_status()["native_telemetry_transport"]
         assert native_stats["rx_frames"] >= 1
         assert native_stats["decoder_errors"] == 0
+        parser_stats = comm.protocol_status()["native_telemetry_parser"]
+        assert parser_stats["f1_frames"] >= 1
+        assert parser_stats["f1_samples"] >= 1
     finally:
         comm.disconnect()
         release_server.set()

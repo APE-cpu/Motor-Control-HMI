@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(motor_core_cpp VERSION 0.2.0 LANGUAGES CXX)
+project(motor_core_cpp VERSION 0.3.0 LANGUAGES CXX)
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)
@@ -7,6 +7,7 @@ find_package(pybind11 CONFIG REQUIRED)
 pybind11_add_module(motor_core_cpp
     src/bindings.cpp
     src/protocol_v2.cpp
+    src/telemetry_processor.cpp
     src/tcp_v2_receiver.cpp
 )
 target_include_directories(motor_core_cpp PRIVATE include)

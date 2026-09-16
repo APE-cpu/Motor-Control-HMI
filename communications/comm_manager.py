@@ -43,6 +43,9 @@ from .native_transport import (
     NativeTcpV2Receiver, native_tcp_transport_enabled,
     native_tcp_transport_mode,
 )
+from .native_telemetry import (
+    NativeTelemetryProcessor, native_telemetry_enabled,
+)
 from .protocol_v2 import (
     MessageType, ProtocolV2Error, V2Frame,
     decode_v2_frame, encode_v2_frame,
@@ -226,6 +229,18 @@ class CommManager(QObject):
         self._native_telem_receiver: NativeTcpV2Receiver | None = None
         self._native_telem_decoder_errors_seen = 0
         self._native_telem_dropped_seen = 0
+        self._native_telem_parse_errors_seen = 0
+        self._native_telem_samples_dropped_seen = 0
+        self._native_telem_bursts_dropped_seen = 0
+        self._native_telem_high_frames_seen = 0
+        try:
+            self._native_telemetry_processor = (
+                NativeTelemetryProcessor() if native_telemetry_enabled() else None)
+        except (RuntimeError, ValueError):
+            self._native_telemetry_processor = None
+        self._native_processor_parse_errors_seen = 0
+        self._native_processor_samples_dropped_seen = 0
+        self._native_processor_bursts_dropped_seen = 0
         self._protocol_stats = self._new_protocol_stats()
         self._expected_device_identity = {
             "device_id": "", "hardware_version": "", "firmware_prefix": "",
@@ -274,6 +289,15 @@ class CommManager(QObject):
         self._native_telem_receiver = None
         self._native_telem_decoder_errors_seen = 0
         self._native_telem_dropped_seen = 0
+        self._native_telem_parse_errors_seen = 0
+        self._native_telem_samples_dropped_seen = 0
+        self._native_telem_bursts_dropped_seen = 0
+        self._native_telem_high_frames_seen = 0
+        if self._native_telemetry_processor is not None:
+            self._native_telemetry_processor.reset()
+        self._native_processor_parse_errors_seen = 0
+        self._native_processor_samples_dropped_seen = 0
+        self._native_processor_bursts_dropped_seen = 0
         try:
             if kind == "CAN总线":
                 raise ProtocolV2Error(
@@ -355,6 +379,10 @@ class CommManager(QObject):
                         if native_tcp_transport_enabled():
                             receiver = NativeTcpV2Receiver()
                             try:
+                                receiver.set_telemetry_processing_enabled(
+                                    self._native_telemetry_processor is not None)
+                                receiver.set_f1_rate_hz(
+                                    self._resolve_f1_rate_hz())
                                 receiver.start(
                                     host, port, local_host=local_host,
                                     timeout_s=timeout)
@@ -522,6 +550,14 @@ class CommManager(QObject):
         caps = session.capabilities if session else None
         policy_active = any(self._expected_device_identity.values())
         identity_error = self._identity_mismatch_reason(caps) if caps else ""
+        native_transport_stats = (
+            self._native_telem_receiver.stats()
+            if self._native_telem_receiver is not None else {})
+        native_parser_stats = (
+            dict(native_transport_stats.get("telemetry", {}))
+            if native_transport_stats else
+            self._native_telemetry_processor.stats()
+            if self._native_telemetry_processor is not None else {})
         return {
             "mode": self._protocol_mode,
             "session_state": session.state.value if session else "not_active",
@@ -554,9 +590,11 @@ class CommManager(QObject):
                 if self._native_telem_receiver is not None else
                 "python-tcp" if self._telem_driver is not None else
                 "not_active"),
-            "native_telemetry_transport": (
-                self._native_telem_receiver.stats()
-                if self._native_telem_receiver is not None else {}),
+            "native_telemetry_transport": native_transport_stats,
+            "telemetry_parser_backend": (
+                "cpp" if self._native_telemetry_processor is not None
+                else "python"),
+            "native_telemetry_parser": native_parser_stats,
         }
 
     def telemetry_age_s(self) -> float:
@@ -701,15 +739,31 @@ class CommManager(QObject):
         由上位机把'省流/标准/辨识/自定义'解析成具体速率，固件只认速率。"""
         from communications.protocol import encode_frame
         self._f1_period_ms = int(f1_ms)   # F1 波形时间轴按此换算，勿再硬编码1kHz
+        rate_hz = self._resolve_f1_rate_hz()
+        if self._native_telemetry_processor is not None:
+            self._native_telemetry_processor.set_f1_rate_hz(rate_hz)
+        if self._native_telem_receiver is not None:
+            self._native_telem_receiver.set_f1_rate_hz(rate_hz)
         payload = struct.pack("<BHHH", flags & 0xFF, f1_ms & 0xFFFF,
                               f2_ms & 0xFFFF, f3_ms & 0xFFFF)
         return self.send_frame(encode_frame(0x22, payload))
+
+    def _resolve_f1_rate_hz(self, payload_length: int = 0) -> int:
+        f1_ms = int(getattr(self, "_f1_period_ms", 0))
+        if not f1_ms:
+            ethernet = self._kind in ("以太网TCP", "RS-485+以太网")
+            f1_ms = 1 if ethernet or payload_length > 22 else 5
+        return max(1, round(1000.0 / f1_ms))
 
     def send_burst_trigger(self) -> bool:
         """请求一次 16kHz 突发抓取（CMD_CAPTURE_BURST=0x23）。需电机运行中。"""
         from communications.protocol import encode_frame
         self._burst_acc = {}          # 清空重组缓冲，准备接收新一帧
         self._burst_total = 0
+        if self._native_telemetry_processor is not None:
+            self._native_telemetry_processor.reset_burst()
+        if self._native_telem_receiver is not None:
+            self._native_telem_receiver.reset_burst()
         return self.send_frame(encode_frame(0x23, b""))
 
     def send_frame(self, data: bytes) -> bool:
@@ -884,6 +938,10 @@ class CommManager(QObject):
                     self.logMessage.emit("[状态] RS-485控制面已恢复")
             if frame.message_type is MessageType.TELEMETRY:
                 self._protocol_stats["telemetry_frames"] += 1
+                if (frame.command in (0xF1, 0xF4) and
+                        self._native_telemetry_processor is not None):
+                    outputs.extend(self._process_native_telemetry_frame(frame))
+                    continue
                 if frame.command == 0xF1:
                     payload_length = len(frame.payload)
                     # 每样本字节数：22（含施加电压 Vd/Vq 和母线 Vbus）、16（仅相
@@ -903,12 +961,7 @@ class CommManager(QObject):
                               for index in range(0, payload_length, sample_size)]
                     # 波形时间轴用实际 F1 速率换算，别再硬编码 1kHz：辨识/省流
                     # 档把 F1 降到 200Hz，硬编码会把相电流挤成几十个周期一团。
-                    f1_ms = getattr(self, "_f1_period_ms", 0)
-                    if not f1_ms:   # 传输默认：TCP 1ms(1kHz)，其它 5ms(200Hz)
-                        f1_ms = 1 if (len(chunks) > 1 or
-                                      self._kind in (
-                                          "以太网TCP", "RS-485+以太网")) else 5
-                    rate_hz = max(1, round(1000.0 / f1_ms))
+                    rate_hz = self._resolve_f1_rate_hz(payload_length)
                     decoded_samples = []
                     for chunk in chunks:
                         tick_ms, angle_raw, speed_rpm, iq_raw, iqref_raw = \
@@ -935,10 +988,7 @@ class CommManager(QObject):
                             sample["vbus_v"] = float(vbus_v)
                         decoded_samples.append(sample)
                         outputs.append(sample)
-                    if len(decoded_samples) > 1:
-                        self.highRateTelemetryBatchReceived.emit(decoded_samples)
-                    else:
-                        self.highRateTelemetryReceived.emit(decoded_samples[0])
+                    self._emit_high_rate_samples(decoded_samples)
                     continue
                 if frame.command == 0xF2:
                     if len(frame.payload) not in (21, 29, 31):
@@ -1105,6 +1155,60 @@ class CommManager(QObject):
                 self._protocol_stats["late_or_duplicate_acks"] += 1
         self._emit_protocol_snapshot()
         return outputs
+
+    def _emit_high_rate_samples(self, samples: list[dict]) -> None:
+        if not samples:
+            return
+        if len(samples) > 1:
+            self.highRateTelemetryBatchReceived.emit(samples)
+        else:
+            self.highRateTelemetryReceived.emit(samples[0])
+
+    def _emit_burst_captures(self, captures: list[dict]) -> None:
+        for capture in captures:
+            self.burstReceived.emit(capture)
+
+    def _sync_native_processor_stats(self) -> None:
+        processor = self._native_telemetry_processor
+        if processor is None:
+            return
+        stats = processor.stats()
+        parse_errors = int(stats["parse_errors"])
+        new_errors = max(
+            0, parse_errors - self._native_processor_parse_errors_seen)
+        if new_errors:
+            self._protocol_stats["crc_or_frame_errors"] += new_errors
+            self._protocol_stats["telemetry_parse_errors"] += new_errors
+        self._native_processor_parse_errors_seen = parse_errors
+
+        dropped_samples = int(stats["dropped_samples"])
+        new_samples = max(
+            0, dropped_samples - self._native_processor_samples_dropped_seen)
+        if new_samples:
+            self._protocol_stats["telemetry_dropped_samples"] += new_samples
+        self._native_processor_samples_dropped_seen = dropped_samples
+
+        dropped_bursts = int(stats["dropped_bursts"])
+        new_bursts = max(
+            0, dropped_bursts - self._native_processor_bursts_dropped_seen)
+        if new_bursts:
+            self._protocol_stats["telemetry_dropped_bursts"] += new_bursts
+        self._native_processor_bursts_dropped_seen = dropped_bursts
+
+    def _process_native_telemetry_frame(self, frame: V2Frame) -> list[object]:
+        processor = self._native_telemetry_processor
+        if processor is None:
+            return []
+        if frame.command == 0xF1:
+            processor.set_f1_rate_hz(
+                self._resolve_f1_rate_hz(len(frame.payload)))
+        processor.ingest(frame.command, frame.payload)
+        self._sync_native_processor_stats()
+        samples = processor.drain_f1()
+        captures = processor.drain_bursts(4)
+        self._emit_high_rate_samples(samples)
+        self._emit_burst_captures(captures)
+        return [*samples, *captures]
 
     def _parse_v2_telemetry(self, frame: V2Frame) -> TelemetryFrame:
         try:
@@ -1307,6 +1411,9 @@ class CommManager(QObject):
             "handshakes": 0,
             "session_restarts_or_losses": 0,
             "transport_dropped_frames": 0,
+            "telemetry_parse_errors": 0,
+            "telemetry_dropped_samples": 0,
+            "telemetry_dropped_bursts": 0,
         }
 
     def _identity_mismatch_reason(self, capabilities) -> str:
@@ -1378,6 +1485,8 @@ class CommManager(QObject):
     _RX_DRAIN_MAX_BYTES = 256 * 1024
     _TELEM_DRAIN_MAX_BYTES = 16 * 1024
     _NATIVE_TELEM_DRAIN_MAX_FRAMES = 1024
+    _NATIVE_TELEM_DRAIN_MAX_SAMPLES = 32768
+    _NATIVE_TELEM_DRAIN_MAX_BURSTS = 4
 
     def _drain_driver(self, driver: BaseComm | None,
                       first_timeout: float,
@@ -1441,18 +1550,23 @@ class CommManager(QObject):
                 pass
         self._native_telem_receiver = None
 
-    def _drain_native_telem(self) -> tuple[list[V2Frame], bool]:
-        """批量取得 C++ 接收线程已经校验的帧，并同步底层错误计数。"""
+    def _drain_native_telem(
+            self) -> tuple[list[V2Frame], list[dict], list[dict], bool]:
+        """批量取得普通帧、C++已解析F1样本和完成的F4抓取。"""
         receiver = self._native_telem_receiver
         if receiver is None:
-            return [], False
+            return [], [], [], False
         try:
             frames = receiver.drain(self._NATIVE_TELEM_DRAIN_MAX_FRAMES)
+            samples = receiver.drain_f1(
+                self._NATIVE_TELEM_DRAIN_MAX_SAMPLES)
+            captures = receiver.drain_bursts(
+                self._NATIVE_TELEM_DRAIN_MAX_BURSTS)
             stats = receiver.stats()
         except Exception as exc:
             self.logMessage.emit(f"[警告] C++以太网波形接收器异常：{exc}")
             self._stop_native_telem_receiver()
-            return [], False
+            return [], [], [], False
 
         decoder_errors = int(stats["decoder_errors"])
         new_errors = max(
@@ -1471,15 +1585,56 @@ class CommManager(QObject):
                 f"[警告] C++以太网接收队列过载，丢弃{new_dropped}个旧帧")
         self._native_telem_dropped_seen = dropped
 
+        telemetry_stats = dict(stats.get("telemetry", {}))
+        parse_errors = int(telemetry_stats.get("parse_errors", 0))
+        new_parse_errors = max(
+            0, parse_errors - self._native_telem_parse_errors_seen)
+        if new_parse_errors:
+            self._protocol_stats["crc_or_frame_errors"] += new_parse_errors
+            self._protocol_stats["telemetry_parse_errors"] += new_parse_errors
+            self.logMessage.emit(
+                f"[错误] C++遥测解析器丢弃{new_parse_errors}个无效F1/F4载荷")
+        self._native_telem_parse_errors_seen = parse_errors
+
+        dropped_samples = int(telemetry_stats.get("dropped_samples", 0))
+        new_dropped_samples = max(
+            0, dropped_samples - self._native_telem_samples_dropped_seen)
+        if new_dropped_samples:
+            self._protocol_stats["telemetry_dropped_samples"] += new_dropped_samples
+            self.logMessage.emit(
+                f"[警告] C++ F1环形队列过载，丢弃{new_dropped_samples}个旧样本")
+        self._native_telem_samples_dropped_seen = dropped_samples
+
+        dropped_bursts = int(telemetry_stats.get("dropped_bursts", 0))
+        new_dropped_bursts = max(
+            0, dropped_bursts - self._native_telem_bursts_dropped_seen)
+        if new_dropped_bursts:
+            self._protocol_stats["telemetry_dropped_bursts"] += new_dropped_bursts
+        self._native_telem_bursts_dropped_seen = dropped_bursts
+
+        high_frames = (
+            int(telemetry_stats.get("f1_frames", 0)) +
+            int(telemetry_stats.get("f4_frames", 0)))
+        new_high_frames = max(
+            0, high_frames - self._native_telem_high_frames_seen)
+        if new_high_frames:
+            self._protocol_stats["rx_frames"] += new_high_frames
+            self._protocol_stats["telemetry_frames"] += new_high_frames
+        self._native_telem_high_frames_seen = high_frames
+
         queued_frames = int(stats["queued_frames"])
-        capped = queued_frames > 0 or new_dropped > 0
+        queued_samples = int(telemetry_stats.get("queued_samples", 0))
+        queued_bursts = int(telemetry_stats.get("queued_bursts", 0))
+        capped = any((queued_frames, queued_samples, queued_bursts,
+                      new_dropped, new_dropped_samples, new_dropped_bursts))
         # 对端关闭后仍可能有超过单批上限的已校验帧。先分批排空，再释放
         # 原生接收器，避免把连接末尾的数据静默丢掉。
-        if not bool(stats["running"]) and queued_frames == 0:
+        if (not bool(stats["running"]) and queued_frames == 0 and
+                queued_samples == 0 and queued_bursts == 0):
             reason = str(stats["last_error"] or "TCP接收线程已停止")
             self.logMessage.emit(f"[警告] C++以太网波形断开：{reason}")
             self._stop_native_telem_receiver()
-        return frames, capped
+        return frames, samples, captures, capped
 
     def _real_v2_poll_loop(self) -> None:
         """真实串口/TCP v2轮询；所有状态推进只依据有效帧和ACK。"""
@@ -1494,7 +1649,8 @@ class CommManager(QObject):
                 break
             try:
                 control, telem, rx_capped = self._drain_rx()
-                native_telem_frames, native_capped = self._drain_native_telem()
+                (native_telem_frames, native_f1_samples,
+                 native_bursts, native_capped) = self._drain_native_telem()
                 rx_capped = rx_capped or native_capped
             except Exception as exc:
                 with self._v2_lock:
@@ -1593,8 +1749,15 @@ class CommManager(QObject):
                         [(frame, encode_v2_frame(frame))
                          for frame in native_telem_frames],
                         source="telemetry")
+                if native_f1_samples:
+                    self._last_valid_at = now
+                    self._emit_high_rate_samples(native_f1_samples)
+                if native_bursts:
+                    self._last_valid_at = now
+                    self._emit_burst_captures(native_bursts)
             # 有数据说明流量大，立即进入下一轮继续掏空；空闲才让出 CPU。
-            if not control and not telem and not native_telem_frames:
+            if (not control and not telem and not native_telem_frames and
+                    not native_f1_samples and not native_bursts):
                 time.sleep(0.02)
 
     # ------------------ 内部 ------------------

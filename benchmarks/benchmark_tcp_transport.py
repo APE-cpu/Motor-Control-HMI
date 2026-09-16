@@ -68,6 +68,8 @@ def measure_python(wire: bytes, frame_count: int) -> float:
 def measure_native(wire: bytes, frame_count: int) -> float:
     port, server = start_server(wire)
     receiver = NativeTcpV2Receiver(max_queue_frames=frame_count + 1)
+    # 这个基准只比较 TCP + 帧解码。F1/F4 处理由独立基准覆盖。
+    receiver.set_telemetry_processing_enabled(False)
     started = time.perf_counter()
     receiver.start(
         "127.0.0.1", port, local_host="127.0.0.1", timeout_s=2.0)
