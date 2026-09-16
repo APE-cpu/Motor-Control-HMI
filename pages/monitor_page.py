@@ -69,14 +69,20 @@ def _make_curve_panel(curve: TrendCurve, title: str,
         def _sync_batch(samples, interval_s, pc=pop_curve):
             pc.append_batch(samples, interval_s)
 
+        def _sync_columns(columns, interval_s, pc=pop_curve):
+            pc.append_columns(columns, interval_s)
+
         curve.add_popout_callback(_sync)
         curve.add_popout_batch_callback(_sync_batch)
+        curve.add_popout_columns_callback(_sync_columns)
 
         def _detach_popout_callbacks():
             if _sync in curve._popout_callbacks:
                 curve._popout_callbacks.remove(_sync)
             if _sync_batch in curve._popout_batch_callbacks:
                 curve._popout_batch_callbacks.remove(_sync_batch)
+            if _sync_columns in curve._popout_columns_callbacks:
+                curve._popout_columns_callbacks.remove(_sync_columns)
 
         win.destroyed.connect(_detach_popout_callbacks)
         lv = QVBoxLayout(win)
@@ -374,6 +380,12 @@ class MonitorPage(QWidget):
         self._ctrl = control_page
         self._latest: TelemetryFrame = TelemetryFrame()
         self._high_rate_samples = deque(maxlen=5000)
+        self._high_rate_columns = {
+            name: deque(maxlen=5000) for name in (
+                "angle_deg", "speed_rpm", "iq_a", "iqref_a", "ia_a",
+                "ib_a", "vd_raw", "vq_raw", "vbus_v")
+        }
+        self._high_rate_rate_hz = 200
         self._last_high_angle_time = 0.0
         self._last_telemetry_time: float = 0.0
         self._latest_vbus_v = 0.0
@@ -648,6 +660,8 @@ class MonitorPage(QWidget):
         comm.highRateTelemetryReceived.connect(self._on_high_rate_telemetry)
         comm.highRateTelemetryBatchReceived.connect(
             self._on_high_rate_telemetry_batch)
+        comm.highRateTelemetryColumnsReceived.connect(
+            self._on_high_rate_telemetry_columns)
         comm.rlsCoeffReceived.connect(self._on_rls_coeff)
         comm.burstReceived.connect(self._on_burst)
 
@@ -697,6 +711,19 @@ class MonitorPage(QWidget):
     def _on_high_rate_telemetry_batch(self, samples: list[dict]) -> None:
         for sample in samples:
             self._on_high_rate_telemetry(sample)
+
+    def _on_high_rate_telemetry_columns(self, columns: dict) -> None:
+        count = int(columns.get("count", 0))
+        if count <= 0:
+            return
+        for name, buffer in self._high_rate_columns.items():
+            values = columns.get(name, ())
+            buffer.extend(values[:count])
+        self._high_rate_rate_hz = max(1, int(columns.get("rate_hz", 200)))
+        vbus = columns.get("vbus_v", ())
+        if vbus:
+            self._latest_vbus_v = float(vbus[min(count, len(vbus)) - 1])
+        self._last_high_angle_time = time.time()
 
     def _on_rls_coeff(self, sample: dict) -> None:
         """F3 在线辨识系数：画合理值，同时明示原始值和过滤原因。"""
@@ -851,6 +878,8 @@ class MonitorPage(QWidget):
     def _clear_all_curves(self) -> None:
         """清空监控页全部实验波形和派生统计，不影响设备运行状态。"""
         self._high_rate_samples.clear()
+        for buffer in self._high_rate_columns.values():
+            buffer.clear()
         self._angle_dial.reset()
         for curve in (
                 self._c_speed, self._c_current, self._c_phase_current,
@@ -917,6 +946,30 @@ class MonitorPage(QWidget):
         self._orb.set_state(orb_state, f.speed_actual)
         high_rate = list(self._high_rate_samples)
         self._high_rate_samples.clear()
+        high_columns = {
+            name: list(buffer)
+            for name, buffer in self._high_rate_columns.items()
+        }
+        for buffer in self._high_rate_columns.values():
+            buffer.clear()
+        if high_rate:
+            for sample in high_rate:
+                high_columns["angle_deg"].append(float(sample["angle_deg"]))
+                high_columns["speed_rpm"].append(
+                    float(sample.get("speed_rpm", 0.0)))
+                high_columns["iq_a"].append(float(sample["iq_a"]))
+                high_columns["iqref_a"].append(float(sample["iqref_a"]))
+                high_columns["ia_a"].append(float(sample.get("ia_a", 0.0)))
+                high_columns["ib_a"].append(float(sample.get("ib_a", 0.0)))
+                high_columns["vd_raw"].append(
+                    float(sample.get("vd_raw", 0.0)))
+                high_columns["vq_raw"].append(
+                    float(sample.get("vq_raw", 0.0)))
+                high_columns["vbus_v"].append(
+                    float(sample.get("vbus_v", 0.0)))
+            self._high_rate_rate_hz = max(
+                1, int(high_rate[-1].get("rate_hz", 200)))
+        high_count = len(high_columns["angle_deg"])
         self._speed_actual.set_value(f.speed_actual)
         self._speed_target.set_value(f.speed_target)
         self._current_actual.set_value(f.current_actual)
@@ -977,7 +1030,7 @@ class MonitorPage(QWidget):
         # 停机后设备遥测全部归零（固件在非 RUN 状态只发零值），此时继续追加
         # 只会让曲线滚动平直的零线，并在约一分钟内把刚跑完的实验数据挤出
         # 缓冲区。冻结曲线、保留数据，方便停机后缩放查看波形。
-        curves_active = bool(high_rate) or position_active or any(
+        curves_active = bool(high_count) or position_active or any(
             abs(value) > 1e-9 for value in (
                 f.speed_actual, f.speed_target, f.current_actual,
                 f.current_target, f.torque_actual))
@@ -994,27 +1047,29 @@ class MonitorPage(QWidget):
         self._curves_were_active = curves_active
         if curves_active:
             self._c_speed.append({"实际": f.speed_actual, "给定": f.speed_target})
-            if high_rate:
-                interval_s = 1.0 / max(high_rate[-1]["rate_hz"], 1)
-                self._c_current.append_batch(
-                    [{"实际 Iq": sample["iq_a"],
-                      "给定 Iq": sample["iqref_a"]}
-                     for sample in high_rate], interval_s)
-                self._c_phase_current.append_batch(
-                    [{"Ia": sample["ia_a"], "Ib": sample["ib_a"]}
-                     for sample in high_rate], interval_s)
-                self._c_voltage.append_batch(
-                    [{"Vd": sample["vd_raw"], "Vq": sample["vq_raw"]}
-                     for sample in high_rate], interval_s)
+            if high_count:
+                interval_s = 1.0 / max(self._high_rate_rate_hz, 1)
+                self._c_current.append_columns({
+                    "实际 Iq": high_columns["iq_a"],
+                    "给定 Iq": high_columns["iqref_a"],
+                }, interval_s)
+                self._c_phase_current.append_columns({
+                    "Ia": high_columns["ia_a"],
+                    "Ib": high_columns["ib_a"],
+                }, interval_s)
+                self._c_voltage.append_columns({
+                    "Vd": high_columns["vd_raw"],
+                    "Vq": high_columns["vq_raw"],
+                }, interval_s)
             else:
                 self._c_current.append(
                     {"实际 Iq": f.current_actual, "给定 Iq": f.current_target})
             self._c_torque.append({"实际": f.torque_actual})
 
-            if high_rate:
-                self._c_angle.append_batch(
-                    [{"高速电角度": sample["angle_deg"]}
-                     for sample in high_rate], interval_s)
+            if high_count:
+                self._c_angle.append_columns({
+                    "高速电角度": high_columns["angle_deg"],
+                }, interval_s)
             elif time.time() - self._last_high_angle_time > 1.0:
                 self._c_angle.append({"高速电角度": f.angle_actual})
             self._c_sensor_q.append(

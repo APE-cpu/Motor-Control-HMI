@@ -68,6 +68,9 @@ def test_对端关闭后先排空原生队列再释放接收器(monkeypatch):
         def drain_f1(self, max_samples):
             return []
 
+        def drain_f1_columns(self, max_samples):
+            return {"count": 0}
+
         def drain_f2(self, max_samples):
             return []
 

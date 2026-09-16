@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.20)
-project(motor_core_cpp VERSION 0.3.0 LANGUAGES CXX)
+project(motor_core_cpp VERSION 0.4.0 LANGUAGES CXX)
 
 find_package(Python COMPONENTS Interpreter Development.Module REQUIRED)
 find_package(pybind11 CONFIG REQUIRED)

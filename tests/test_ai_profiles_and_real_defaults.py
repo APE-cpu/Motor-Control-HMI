@@ -1,8 +1,9 @@
 import json
+from collections import deque
 
 from PySide6.QtWidgets import QApplication
 
-from communications.comm_manager import CommManager
+from communications.comm_manager import CommManager, TelemetryFrame
 from pages.ai_page import AIPage
 from pages.control_page import ControlPage
 from PySide6.QtWidgets import QInputDialog, QMessageBox
@@ -10,6 +11,30 @@ from PySide6.QtWidgets import QInputDialog, QMessageBox
 
 def _app():
     return QApplication.instance() or QApplication([])
+
+
+def test_ai高速历史按列保存不复制逐样本字典():
+    class Sink:
+        pass
+
+    sink = Sink()
+    sink._latest = TelemetryFrame()
+    sink._latest.speed_target = 1200.0
+    sink._high_history = {
+        name: deque(maxlen=5000) for name in (
+            "speed_rpm", "target_rpm", "iq_a", "iqref_a", "rate_hz")
+    }
+    AIPage._on_high_rate_columns(sink, {
+        "count": 3,
+        "rate_hz": 1000,
+        "speed_rpm": [1000.0, 1100.0, 1200.0],
+        "iq_a": [0.1, 0.2, 0.3],
+        "iqref_a": [0.4, 0.5, 0.6],
+    })
+
+    assert list(sink._high_history["speed_rpm"]) == [1000.0, 1100.0, 1200.0]
+    assert list(sink._high_history["target_rpm"]) == [1200.0] * 3
+    assert list(sink._high_history["rate_hz"]) == [1000] * 3
 
 
 def test_ai模型档案可分别保存和切换(tmp_path, monkeypatch):

@@ -53,6 +53,38 @@ def test_high_rate_iq_drives_current_curve_and_csv(tmp_path):
     page.close()
 
 
+def test_columnar_high_rate_batch_drives_curves_without_sample_dicts():
+    _app()
+    page = MonitorPage(CommManager())
+    page._timer.stop()
+    page._latest = TelemetryFrame()
+    page._last_telemetry_time = time.time()
+    page._on_high_rate_telemetry_columns({
+        "count": 3,
+        "rate_hz": 1000,
+        "angle_deg": [10.0, 11.0, 12.0],
+        "speed_rpm": [100.0, 101.0, 102.0],
+        "iq_a": [0.1, 0.2, 0.3],
+        "iqref_a": [0.4, 0.5, 0.6],
+        "ia_a": [1.0, 2.0, 3.0],
+        "ib_a": [-1.0, -2.0, -3.0],
+        "vd_raw": [4.0, 5.0, 6.0],
+        "vq_raw": [7.0, 8.0, 9.0],
+        "vbus_v": [48.0, 48.0, 48.0],
+    })
+
+    page._refresh()
+
+    assert list(page._c_current._buffers["实际 Iq"])[-3:] == [0.1, 0.2, 0.3]
+    assert list(page._c_phase_current._buffers["Ia"])[-3:] == [1.0, 2.0, 3.0]
+    assert list(page._c_voltage._buffers["Vq"])[-3:] == [7.0, 8.0, 9.0]
+    assert list(page._c_angle._buffers["高速电角度"])[-3:] == [
+        10.0, 11.0, 12.0]
+    assert page._latest_vbus_v == 48.0
+    assert not any(page._high_rate_columns.values())
+    page.close()
+
+
 def test_position_loop_data_is_buffered_and_exported(tmp_path):
     _app()
     page = MonitorPage(CommManager())
@@ -123,6 +155,7 @@ def test_clear_existing_waveforms_resets_all_curves_and_statistics():
     )
     assert all(not curve._times for curve in curves)
     assert not page._high_rate_samples
+    assert not any(page._high_rate_columns.values())
     assert page._latest_rls == {}
     assert page._stat_speed._mn == float("inf")
     assert page._stat_speed._mx == float("-inf")

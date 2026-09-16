@@ -86,6 +86,62 @@ py::list f1_samples_to_python(
     return output;
 }
 
+py::dict f1_samples_to_columns(
+        const std::vector<motor_core::F1Sample>& samples) {
+    const auto size = static_cast<Py_ssize_t>(samples.size());
+    py::list tick_ms(size);
+    py::list angle_deg(size);
+    py::list speed_rpm(size);
+    py::list iq_a(size);
+    py::list iqref_a(size);
+    py::list ia_a(size);
+    py::list ib_a(size);
+    py::list vd_raw(size);
+    py::list vq_raw(size);
+    py::list vbus_v(size);
+    const auto set_item = [](py::list& column, Py_ssize_t index,
+                             PyObject* value) {
+        if (value == nullptr) {
+            throw py::error_already_set();
+        }
+        PyList_SET_ITEM(column.ptr(), index, value);
+    };
+    std::uint32_t rate_hz = 1000;
+    for (Py_ssize_t index = 0; index < size; ++index) {
+        const auto& sample = samples[static_cast<std::size_t>(index)];
+        rate_hz = sample.rate_hz;
+        set_item(tick_ms, index, PyLong_FromUnsignedLong(sample.tick_ms));
+        set_item(angle_deg, index, PyFloat_FromDouble(sample.angle_deg));
+        set_item(speed_rpm, index, PyFloat_FromDouble(sample.speed_rpm));
+        set_item(iq_a, index, PyFloat_FromDouble(sample.iq_a));
+        set_item(iqref_a, index, PyFloat_FromDouble(sample.iqref_a));
+        set_item(ia_a, index, PyFloat_FromDouble(
+            sample.has_phase_current ? sample.ia_a : 0.0));
+        set_item(ib_a, index, PyFloat_FromDouble(
+            sample.has_phase_current ? sample.ib_a : 0.0));
+        set_item(vd_raw, index, PyFloat_FromDouble(
+            sample.has_voltage ? sample.vd_raw : 0.0));
+        set_item(vq_raw, index, PyFloat_FromDouble(
+            sample.has_voltage ? sample.vq_raw : 0.0));
+        set_item(vbus_v, index, PyFloat_FromDouble(
+            sample.has_voltage ? sample.vbus_v : 0.0));
+    }
+    py::dict output;
+    output["count"] = samples.size();
+    output["rate_hz"] = rate_hz;
+    output["tick_ms"] = std::move(tick_ms);
+    output["angle_deg"] = std::move(angle_deg);
+    output["speed_rpm"] = std::move(speed_rpm);
+    output["iq_a"] = std::move(iq_a);
+    output["iqref_a"] = std::move(iqref_a);
+    output["ia_a"] = std::move(ia_a);
+    output["ib_a"] = std::move(ib_a);
+    output["vd_raw"] = std::move(vd_raw);
+    output["vq_raw"] = std::move(vq_raw);
+    output["vbus_v"] = std::move(vbus_v);
+    return output;
+}
+
 py::list bursts_to_python(
         const std::vector<motor_core::BurstCapture>& captures) {
     py::list output;
@@ -259,6 +315,18 @@ PYBIND11_MODULE(motor_core_cpp, module) {
             },
             py::arg("max_samples") = 8192)
         .def(
+            "drain_f1_columns",
+            [](motor_core::TelemetryProcessor& processor,
+               std::size_t max_samples) {
+                std::vector<motor_core::F1Sample> samples;
+                {
+                    py::gil_scoped_release release;
+                    samples = processor.drain_f1(max_samples);
+                }
+                return f1_samples_to_columns(samples);
+            },
+            py::arg("max_samples") = 8192)
+        .def(
             "drain_f2",
             [](motor_core::TelemetryProcessor& processor,
                std::size_t max_samples) {
@@ -341,6 +409,18 @@ PYBIND11_MODULE(motor_core_cpp, module) {
                     samples = receiver.drain_f1(max_samples);
                 }
                 return f1_samples_to_python(samples);
+            },
+            py::arg("max_samples") = 8192)
+        .def(
+            "drain_f1_columns",
+            [](motor_core::TcpV2Receiver& receiver,
+               std::size_t max_samples) {
+                std::vector<motor_core::F1Sample> samples;
+                {
+                    py::gil_scoped_release release;
+                    samples = receiver.drain_f1(max_samples);
+                }
+                return f1_samples_to_columns(samples);
             },
             py::arg("max_samples") = 8192)
         .def(

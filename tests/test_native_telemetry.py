@@ -54,6 +54,26 @@ def test_F1批量解析与环形队列丢旧留新():
     assert stats["dropped_samples"] == 2
 
 
+def test_F1列式导出不创建逐样本字典():
+    processor = NativeTelemetryProcessor()
+    payload = b"".join(
+        struct.pack(
+            "<IHhhhhhhhH", index, index, index, index, index,
+            index, -index, index * 2, -index * 2, 48)
+        for index in range(4)
+    )
+
+    assert processor.ingest(0xF1, payload)
+    columns = processor.drain_f1_columns()
+
+    assert columns["count"] == 4
+    assert columns["rate_hz"] == 1000
+    assert columns["tick_ms"] == [0, 1, 2, 3]
+    assert columns["iq_a"][3] == pytest.approx(3 * 0.000629)
+    assert columns["ib_a"][3] == pytest.approx(-3 * 0.000629)
+    assert columns["vbus_v"] == [48.0] * 4
+
+
 def test_F1非法长度计入解析错误且不产生样本():
     processor = NativeTelemetryProcessor()
     assert processor.ingest(0xF1, b"bad")

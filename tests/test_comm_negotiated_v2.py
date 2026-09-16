@@ -16,6 +16,7 @@ from communications.protocol_v2 import (
 )
 from communications.v2_virtual_device import V2VirtualDevice
 from config.config import CMD_START
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication
 from pages.communication_page import CommunicationPage
 
@@ -372,6 +373,9 @@ def test_RS485加以太网自动使用Cpp线程接收F1(monkeypatch):
     server = threading.Thread(target=serve, daemon=True)
     server.start()
     comm = CommManager()
+    column_batches = []
+    comm.highRateTelemetryColumnsReceived.connect(
+        column_batches.append, Qt.DirectConnection)
     try:
         assert comm.connect_negotiated_v2(
             "RS-485+以太网", driver=LoopbackV2Driver(),
@@ -380,6 +384,9 @@ def test_RS485加以太网自动使用Cpp线程接收F1(monkeypatch):
         assert comm.protocol_status()["telemetry_transport_backend"] == "cpp-tcp"
         assert _wait_until(
             lambda: comm.protocol_status()["statistics"]["telemetry_frames"] >= 1)
+        assert _wait_until(lambda: bool(column_batches))
+        assert column_batches[0]["count"] == 1
+        assert column_batches[0]["angle_deg"] == [0.0]
         native_stats = comm.protocol_status()["native_telemetry_transport"]
         assert native_stats["rx_frames"] >= 1
         assert native_stats["decoder_errors"] == 0

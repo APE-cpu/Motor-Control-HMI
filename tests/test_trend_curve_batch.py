@@ -29,3 +29,26 @@ def test_高速批次只向弹窗转发一次批量更新():
     assert batch_calls[0][1] == 0.001
     assert len(curve._times) == 100
     curve.close()
+
+
+def test_列式批次不构造逐样本字典且只重绘一次():
+    _app()
+    curve = TrendCurve("current", {"Ia": "#fff", "Ib": "#000"},
+                       buffer_size=5000)
+    column_calls = []
+    curve.add_popout_columns_callback(
+        lambda columns, interval: column_calls.append((columns, interval)))
+    columns = {
+        "Ia": [float(index) for index in range(100)],
+        "Ib": [-float(index) for index in range(100)],
+    }
+
+    curve.append_columns(columns, 0.001)
+
+    assert len(column_calls) == 1
+    assert column_calls[0][0] is columns
+    assert column_calls[0][1] == 0.001
+    assert len(curve._times) == 100
+    assert list(curve._buffers["Ia"])[-2:] == [98.0, 99.0]
+    assert list(curve._buffers["Ib"])[-2:] == [-98.0, -99.0]
+    curve.close()

@@ -127,7 +127,10 @@ class AIPage(QWidget):
         self._monitor = monitor_page
         self._latest: TelemetryFrame = TelemetryFrame()
         self._history = deque(maxlen=300)
-        self._high_history = deque(maxlen=5000)
+        self._high_history = {
+            name: deque(maxlen=5000) for name in (
+                "speed_rpm", "target_rpm", "iq_a", "iqref_a", "rate_hz")
+        }
         self._worker = None  # 持有引用，防止 GC
         self._attachments: list = []  # [(文件名, mime, 原始字节)]
         self._rag_index: RAGIndex | None = None
@@ -147,6 +150,8 @@ class AIPage(QWidget):
         comm.telemetryReceived.connect(self._on_telemetry)
         comm.highRateTelemetryReceived.connect(self._on_high_rate)
         comm.highRateTelemetryBatchReceived.connect(self._on_high_rate_batch)
+        comm.highRateTelemetryColumnsReceived.connect(
+            self._on_high_rate_columns)
         self._load_config()
         # 启动即后台构建索引：有缓存时 <1s 就绪，首个问题不再错过检索
         self._ensure_rag_index()
@@ -394,21 +399,41 @@ class AIPage(QWidget):
         target = float(self._latest.speed_target)
         # 把采样时的目标冻结进样本；停机后分析不能使用已归零的最新目标。
         if abs(target) > 1.0:
-            frozen = dict(sample)
-            frozen["target_rpm"] = target
-            self._high_history.append(frozen)
+            self._high_history["speed_rpm"].append(float(sample["speed_rpm"]))
+            self._high_history["target_rpm"].append(target)
+            self._high_history["iq_a"].append(float(sample["iq_a"]))
+            self._high_history["iqref_a"].append(float(sample["iqref_a"]))
+            self._high_history["rate_hz"].append(
+                int(sample.get("rate_hz", 200)))
 
     def _on_high_rate_batch(self, samples: list[dict]) -> None:
         for sample in samples:
             self._on_high_rate(sample)
 
+    def _on_high_rate_columns(self, columns: dict) -> None:
+        target = float(self._latest.speed_target)
+        count = int(columns.get("count", 0))
+        if abs(target) <= 1.0 or count <= 0:
+            return
+        self._high_history["speed_rpm"].extend(
+            columns.get("speed_rpm", ())[:count])
+        self._high_history["target_rpm"].extend([target] * count)
+        self._high_history["iq_a"].extend(columns.get("iq_a", ())[:count])
+        self._high_history["iqref_a"].extend(
+            columns.get("iqref_a", ())[:count])
+        rate_hz = max(1, int(columns.get("rate_hz", 200)))
+        self._high_history["rate_hz"].extend([rate_hz] * count)
+
     def _pi_report(self) -> str:
-        if len(self._high_history) >= 400:
-            rate_hz = int(self._high_history[-1].get("rate_hz", 200))
-            window_size = min(len(self._high_history), rate_hz * 10)
-            hs = list(self._high_history)[-window_size:]
-            samples = [(x["speed_rpm"], x["target_rpm"], x["iq_a"], x["iqref_a"])
-                       for x in hs]
+        high_count = len(self._high_history["speed_rpm"])
+        if high_count >= 400:
+            rate_hz = int(self._high_history["rate_hz"][-1])
+            window_size = min(high_count, rate_hz * 10)
+            columns = [
+                list(self._high_history[name])[-window_size:]
+                for name in ("speed_rpm", "target_rpm", "iq_a", "iqref_a")
+            ]
+            samples = list(zip(*columns))
             source = f"{rate_hz}Hz高速诊断通道"
         else:
             samples = list(self._history)

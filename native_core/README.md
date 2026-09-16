@@ -6,6 +6,10 @@ sample conversion, and F4 burst reassembly. The TCP socket, stream decoder, tele
 parsing, and bounded buffers run in C++; the existing Python session state
 machine and Qt signals consume converted data in batches.
 
+The hot F1 UI path uses a columnar batch (`drain_f1_columns`) so one Python
+object carries whole arrays of angle, speed, current, and voltage values. The
+legacy list-of-dictionaries API remains available for compatibility and tests.
+
 Build and install into the active Python environment:
 
 ```powershell

@@ -1,7 +1,7 @@
 """C++ TCP 遥测接收器的 Python 边界。
 
-原生线程只负责 socket 接收、v2 流解码和有界排队，不触碰 Qt 对象。Python
-轮询线程批量 ``drain`` 后，仍由现有 ``CommManager`` 推进协议与业务状态。
+原生线程负责 socket 接收、v2 解码、F1–F4 解析和有界排队，不触碰 Qt
+对象。F1 高频路径用列式批量跨越 C++/Python 边界，不构造逐样本字典。
 """
 from __future__ import annotations
 
@@ -84,6 +84,10 @@ class NativeTcpV2Receiver:
 
     def drain_f1(self, max_samples: int = 8192) -> list[dict]:
         return list(self._receiver.drain_f1(max(1, int(max_samples))))
+
+    def drain_f1_columns(self, max_samples: int = 8192) -> dict:
+        return dict(self._receiver.drain_f1_columns(
+            max(1, int(max_samples))))
 
     def drain_f2(self, max_samples: int = 512) -> list[dict]:
         return list(self._receiver.drain_f2(max(1, int(max_samples))))

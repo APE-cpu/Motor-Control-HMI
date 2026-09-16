@@ -61,6 +61,7 @@ class TrendCurve(QWidget):
         super().__init__()
         self._popout_callbacks = []
         self._popout_batch_callbacks = []
+        self._popout_columns_callbacks = []
         self._title = title
         self._series = series
         self._y_label = y_label
@@ -130,6 +131,34 @@ class TrendCurve(QWidget):
             self._update_stats()
         for cb in self._popout_batch_callbacks:
             cb(samples, interval_s)
+
+    def append_columns(self, columns: Dict[str, object],
+                       interval_s: float) -> None:
+        """批量加入列式数据，不构造逐样本字典。"""
+        active = [
+            (name, values) for name, values in columns.items()
+            if name in self._buffers and values is not None
+        ]
+        if not active:
+            return
+        count = min(len(values) for _name, values in active)
+        if count <= 0:
+            return
+        if not self._times:
+            self._t0 = time.time()
+        start = self._times[-1] + interval_s if self._times else 0.0
+        self._times.extend(start + index * interval_s
+                           for index in range(count))
+        for name, values in active:
+            self._buffers[name].extend(float(values[index])
+                                       for index in range(count))
+        if _PG_OK:
+            self._draw()
+            self._apply_xview()
+            self._update_y_range()
+            self._update_stats()
+        for cb in self._popout_columns_callbacks:
+            cb(columns, interval_s)
 
     def _smooth(self, y):
         """居中滑动平均，仅用于显示：零净相移、不改缓冲、不进控制。"""
@@ -262,6 +291,9 @@ class TrendCurve(QWidget):
 
     def add_popout_batch_callback(self, cb) -> None:
         self._popout_batch_callbacks.append(cb)
+
+    def add_popout_columns_callback(self, cb) -> None:
+        self._popout_columns_callbacks.append(cb)
 
     def clear(self) -> None:
         """清空当前曲线数据并重置相对时间轴。"""

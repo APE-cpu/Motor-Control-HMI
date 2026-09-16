@@ -182,6 +182,7 @@ class CommManager(QObject):
     telemetryReceived = Signal(object)        # TelemetryFrame
     highRateTelemetryReceived = Signal(object) # 以太网1kHz/串口200Hz紧凑诊断样本
     highRateTelemetryBatchReceived = Signal(object) # 以太网批量样本，降低UI事件率
+    highRateTelemetryColumnsReceived = Signal(object) # C++列式批量，避免逐样本dict
     currentSamplingDiagReceived = Signal(object) # F2 ADC/PWM采样诊断
     rlsCoeffReceived = Signal(object)         # F3 在线ARX/RLS辨识系数
     burstReceived = Signal(object)            # F4 16kHz突发抓取波形(重组完成)
@@ -1176,6 +1177,10 @@ class CommManager(QObject):
         else:
             self.highRateTelemetryReceived.emit(samples[0])
 
+    def _emit_high_rate_columns(self, columns: dict) -> None:
+        if int(columns.get("count", 0)) > 0:
+            self.highRateTelemetryColumnsReceived.emit(columns)
+
     def _emit_burst_captures(self, captures: list[dict]) -> None:
         for capture in captures:
             self.burstReceived.emit(capture)
@@ -1589,15 +1594,15 @@ class CommManager(QObject):
 
     def _drain_native_telem(
             self) -> tuple[
-                list[V2Frame], list[dict], list[dict], list[dict],
+                list[V2Frame], dict, list[dict], list[dict],
                 list[dict], bool]:
         """批量取得普通帧与 C++ 已解析的 F1–F4 数据。"""
         receiver = self._native_telem_receiver
         if receiver is None:
-            return [], [], [], [], [], False
+            return [], {}, [], [], [], False
         try:
             frames = receiver.drain(self._NATIVE_TELEM_DRAIN_MAX_FRAMES)
-            samples = receiver.drain_f1(
+            columns = receiver.drain_f1_columns(
                 self._NATIVE_TELEM_DRAIN_MAX_SAMPLES)
             f2_samples = receiver.drain_f2(
                 self._NATIVE_TELEM_DRAIN_MAX_DIAGNOSTICS)
@@ -1609,7 +1614,7 @@ class CommManager(QObject):
         except Exception as exc:
             self.logMessage.emit(f"[警告] C++以太网波形接收器异常：{exc}")
             self._stop_native_telem_receiver()
-            return [], [], [], [], [], False
+            return [], {}, [], [], [], False
 
         decoder_errors = int(stats["decoder_errors"])
         new_errors = max(
@@ -1693,7 +1698,7 @@ class CommManager(QObject):
             reason = str(stats["last_error"] or "TCP接收线程已停止")
             self.logMessage.emit(f"[警告] C++以太网波形断开：{reason}")
             self._stop_native_telem_receiver()
-        return frames, samples, f2_samples, f3_samples, captures, capped
+        return frames, columns, f2_samples, f3_samples, captures, capped
 
     def _real_v2_poll_loop(self) -> None:
         """真实串口/TCP v2轮询；所有状态推进只依据有效帧和ACK。"""
@@ -1708,7 +1713,7 @@ class CommManager(QObject):
                 break
             try:
                 control, telem, rx_capped = self._drain_rx()
-                (native_telem_frames, native_f1_samples, native_f2_samples,
+                (native_telem_frames, native_f1_columns, native_f2_samples,
                  native_f3_samples, native_bursts,
                  native_capped) = self._drain_native_telem()
                 rx_capped = rx_capped or native_capped
@@ -1809,9 +1814,9 @@ class CommManager(QObject):
                         [(frame, encode_v2_frame(frame))
                          for frame in native_telem_frames],
                         source="telemetry")
-                if native_f1_samples:
+                if int(native_f1_columns.get("count", 0)) > 0:
                     self._last_valid_at = now
-                    self._emit_high_rate_samples(native_f1_samples)
+                    self._emit_high_rate_columns(native_f1_columns)
                 if native_f2_samples:
                     self._last_valid_at = now
                     self._emit_f2_samples(native_f2_samples)
@@ -1823,7 +1828,8 @@ class CommManager(QObject):
                     self._emit_burst_captures(native_bursts)
             # 有数据说明流量大，立即进入下一轮继续掏空；空闲才让出 CPU。
             if (not control and not telem and not native_telem_frames and
-                    not native_f1_samples and not native_f2_samples and
+                    not native_f1_columns.get("count") and
+                    not native_f2_samples and
                     not native_f3_samples and not native_bursts):
                 time.sleep(0.02)
 
