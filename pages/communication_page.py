@@ -526,6 +526,7 @@ class CommunicationPage(QWidget):
         self._tele_level = QComboBox()
         self._tele_level.addItem("省流·安全（最稳，只留相电流）", "eco")
         self._tele_level.addItem("标准（默认：相电流 + 采样诊断）", "std")
+        self._tele_level.addItem("示波器·16kHz（TCP连续原始点）", "scope16k")
         self._tele_level.addItem("辨识（开在线RLS，相电流保持链路全速）", "id")
         self._tele_level.addItem("自定义", "custom")
         self._tele_level.setCurrentIndex(1)   # 标准 = 固件默认
@@ -542,7 +543,9 @@ class CommunicationPage(QWidget):
         adv = QHBoxLayout(self._tele_adv)
         adv.setContentsMargins(0, 0, 0, 0)
         self._tele_f1 = QComboBox()
-        for text, ms in (("1kHz", 1), ("500Hz", 2), ("200Hz", 5),
+        for text, ms in (("16kHz连续", -16000), ("8kHz连续", -8000),
+                         ("4kHz连续", -4000), ("2kHz连续", -2000),
+                         ("1kHz", 1), ("500Hz", 2), ("200Hz", 5),
                          ("100Hz", 10), ("自动", 0)):
             self._tele_f1.addItem(text, ms)
         self._tele_f2_on = QCheckBox("F2诊断")
@@ -582,18 +585,33 @@ class CommunicationPage(QWidget):
             return 0x00, 5, 20, 100
         if key == "std":
             return 0x01, 0, 20, 100
+        if key == "scope16k":
+            return 0x01, 0, 20, 100
         if key == "id":
             # 辨识不能牺牲电流波形采样率：0 表示使用当前传输链路默认值，
             # TCP 为 1 kHz，串口为 200 Hz；F3 仍以 10 Hz 独立发送。
             return 0x03, 0, 20, 100
         flags = ((0x01 if self._tele_f2_on.isChecked() else 0) |
                  (0x02 if self._tele_f3_on.isChecked() else 0))
-        return (flags, int(self._tele_f1.currentData()),
+        f1_value = int(self._tele_f1.currentData())
+        return (flags, 0 if f1_value < 0 else f1_value,
                 int(self._tele_f2.currentData()), int(self._tele_f3.currentData()))
+
+    def _resolve_f1_stream_rate_hz(self) -> int:
+        """返回FOC中断连续流速率；0表示沿用旧毫秒周期采样器。"""
+        if self._tele_level.currentData() == "scope16k":
+            return 16000
+        if self._tele_level.currentData() == "custom":
+            value = int(self._tele_f1.currentData())
+            return -value if value < 0 else 0
+        return 0
 
     def _update_tele_hint(self) -> None:
         flags, f1, _f2, _f3 = self._resolve_telemetry()
-        if f1 == 0:
+        stream_rate = self._resolve_f1_stream_rate_hz()
+        if stream_rate:
+            f1txt = f"{stream_rate // 1000}kHz"
+        elif f1 == 0:
             f1txt = "自动"
         else:
             hz = round(1000 / f1)
@@ -622,12 +640,12 @@ class CommunicationPage(QWidget):
         f0.setWordWrap(True)
         v.addWidget(f0)
 
-        # F1: 高速遥测 (200Hz~1kHz, 电流/电压)
+        # F1: 高速遥测 (200Hz~16kHz, 电流/电压)
         f1 = QLabel(
-            "🔹 <b>F1 高速遥测</b> | 200 Hz (串口) / 1 kHz (TCP, 批量) | 22字节\n"
+            "🔹 <b>F1 高速遥测</b> | 200 Hz (串口) / 1~16 kHz (TCP, 16点批量) | 22字节/点\n"
             "   电角度 (u16) · Iq (s16码值, ×0.000629→A) · 相电流 Ia/Ib (s16码值, ×0.000629→A)\n"
             "   施加电压 Vd/Vq (s16码值, ×0.000324→V) · 母线电压 Vbus (u16, 0.1V分辨率)\n"
-            "   <i>16点FOC周期平均（纯遥测，控制用原始）；TCP批量发送减少帧开销</i>")
+            "   <i>16kHz档由FOC中断逐周期写入环形缓冲；TCP批量发送，网络仍约1000帧/秒</i>")
         f1.setWordWrap(True)
         v.addWidget(f1)
 
@@ -660,7 +678,7 @@ class CommunicationPage(QWidget):
         # 心跳与瓶颈说明
         note = QLabel(
             "⚠️ <b>通信瓶颈</b>：制约的是 lwIP <b>队列条目数×帧率</b>，不是带宽。\n"
-            "   TCP_SND_QUEUELEN=8 (只有8槽!) + pbuf内存池 + 心跳抢占 → 高帧率小包易爆。\n"
+            "   TCP_SND_QUEUELEN=32 + pbuf内存池 + 心跳抢占 → 高帧率小包仍易爆。\n"
             "   策略：F1批量(减少帧数) + F2/F3低频 + 突发慢速非实时 = 队列压力最小。")
         note.setWordWrap(True)
         note.setStyleSheet("color:#ffab91; font-size:11px; font-style:italic;")
@@ -673,7 +691,10 @@ class CommunicationPage(QWidget):
         if not self._comm.is_connected():
             return
         flags, f1, f2, f3 = self._resolve_telemetry()
-        self._comm.send_telemetry_config(flags, f1, f2, f3)
+        self._comm.send_telemetry_config(
+            flags, f1, f2, f3,
+            f1_rate_hz=self._resolve_f1_stream_rate_hz(),
+            f1_batch_samples=16)
 
     def _on_tele_changed(self, *_args) -> None:
         self._tele_adv.setVisible(self._tele_level.currentData() == "custom")

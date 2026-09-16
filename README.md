@@ -153,10 +153,10 @@ AI 异常检测与边缘 AI 推理的全流程开发与调试需求。
 | 命令 | 通道 | 典型频率 | 用途 |
 |---|---|---|---|
 | 0xF0 | `telemetryReceived` | 10 Hz | 速度/温度/故障等慢变量，UI 主曲线 |
-| 0xF1 | `highRateTelemetryReceived` | 200 Hz（UART）/1 kHz（TCP 批量） | 电角度/Iq/Iqref/相电流/Vd/Vq/Vbus |
+| 0xF1 | `highRateTelemetryReceived` | 200 Hz（UART）/1~16 kHz（TCP，16点批量） | 电角度/Iq/Iqref/相电流/Vd/Vq/Vbus |
 | 0xF2 | `currentSamplingDiagReceived` | 50 Hz | ADC 原始值/PWM duty/扇区/标定窗口 |
 
-三通道独立时钟，时间轴不严格对齐。每帧的 `tick_ms` 是下位机 HAL_GetTick 毫秒时间戳，上位机额外存 `monotonic_s` 与墙上时间 ISO 字符串。
+三通道独立时钟，时间轴不严格对齐。每点的 `tick_ms` 是下位机 HAL_GetTick 毫秒时间戳；16 kHz 下同一毫秒内会有多个点，上位机按协商后的 `rate_hz` 重建亚毫秒时间轴，并额外存 `monotonic_s` 与墙上时间 ISO 字符串。
 
 #### 运行状态机
 所有危险运行意图通过 `core/runtime_state.py` 的状态机统一约束：

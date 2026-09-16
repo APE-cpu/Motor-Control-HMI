@@ -740,22 +740,64 @@ class CommManager(QObject):
         return True
 
     def send_telemetry_config(self, flags: int, f1_ms: int,
-                              f2_ms: int, f3_ms: int) -> bool:
+                              f2_ms: int, f3_ms: int, *,
+                              f1_rate_hz: int = 0,
+                              f1_batch_samples: int = 16) -> bool:
         """下发遥测档位到固件（CMD_SET_TELEMETRY=0x22）。
         flags: bit0=F2诊断开, bit1=F3在线辨识开; f1_ms=0 表示按传输默认。
-        由上位机把'省流/标准/辨识/自定义'解析成具体速率，固件只认速率。"""
+        f1_rate_hz>0 时使用兼容扩展载荷，请求由16kHz FOC中断生产连续样本；
+        旧固件/旧档位仍使用原来的7字节载荷。"""
         from communications.protocol import encode_frame
-        self._f1_period_ms = int(f1_ms)   # F1 波形时间轴按此换算，勿再硬编码1kHz
+        f1_rate_hz = int(f1_rate_hz)
+        f1_batch_samples = int(f1_batch_samples)
+        if f1_rate_hz not in (0, 1000, 2000, 4000, 8000, 16000):
+            raise ValueError("F1连续流速率必须是 1/2/4/8/16 kHz")
+        if not 1 <= f1_batch_samples <= 32:
+            raise ValueError("F1批量点数必须在1..32之间")
+        if (f1_rate_hz > 1000 and self._protocol_mode != "virtual-v2" and
+                self._kind not in ("以太网TCP", "RS-485+以太网")):
+            self.logMessage.emit("[错误] 2~16kHz连续F1需要以太网遥测链路")
+            return False
+        if self._protocol_mode not in ("virtual-v2", "negotiated-v2"):
+            self._apply_f1_stream_config(f1_ms, f1_rate_hz)
+        payload: bytes
+        if f1_rate_hz:
+            payload = struct.pack(
+                "<BHHHHB", flags & 0xFF, f1_ms & 0xFFFF,
+                f2_ms & 0xFFFF, f3_ms & 0xFFFF,
+                f1_rate_hz & 0xFFFF, f1_batch_samples & 0xFF)
+        else:
+            payload = struct.pack("<BHHH", flags & 0xFF, f1_ms & 0xFFFF,
+                                  f2_ms & 0xFFFF, f3_ms & 0xFFFF)
+        return self.send_frame(encode_frame(0x22, payload))
+
+    def _apply_f1_stream_config(self, f1_ms: int,
+                                f1_rate_hz: int = 0) -> None:
+        """在旧链路发送时或v2设备ACK后更新主机时间轴。"""
+        self._f1_period_ms = int(f1_ms)
+        self._f1_stream_rate_hz = int(f1_rate_hz)
         rate_hz = self._resolve_f1_rate_hz()
         if self._native_telemetry_processor is not None:
             self._native_telemetry_processor.set_f1_rate_hz(rate_hz)
         if self._native_telem_receiver is not None:
             self._native_telem_receiver.set_f1_rate_hz(rate_hz)
-        payload = struct.pack("<BHHH", flags & 0xFF, f1_ms & 0xFFFF,
-                              f2_ms & 0xFFFF, f3_ms & 0xFFFF)
-        return self.send_frame(encode_frame(0x22, payload))
+
+    def _apply_acked_telemetry_config(self, legacy_frame: bytes) -> None:
+        decoded = decode_frame(legacy_frame)
+        if decoded is None or decoded[0] != 0x22:
+            return
+        payload = decoded[1]
+        if len(payload) < 7:
+            return
+        f1_ms = struct.unpack_from("<H", payload, 1)[0]
+        f1_rate_hz = (struct.unpack_from("<H", payload, 7)[0]
+                      if len(payload) >= 10 else 0)
+        self._apply_f1_stream_config(f1_ms, f1_rate_hz)
 
     def _resolve_f1_rate_hz(self, payload_length: int = 0) -> int:
+        stream_rate_hz = int(getattr(self, "_f1_stream_rate_hz", 0))
+        if stream_rate_hz:
+            return stream_rate_hz
         f1_ms = int(getattr(self, "_f1_period_ms", 0))
         if not f1_ms:
             ethernet = self._kind in ("以太网TCP", "RS-485+以太网")
@@ -766,7 +808,10 @@ class CommManager(QObject):
         caps = (self._v2_session.capabilities
                 if self._v2_session is not None else None)
         firmware = caps.firmware_version if caps is not None else ""
-        return firmware.startswith("0.7.6-rls-si")
+        fields = caps.telemetry_fields if caps is not None else []
+        return (firmware.startswith("0.7.6-rls-si") or
+                firmware.startswith("0.8.0-f1-16k") or
+                "rls_coefficients_si" in fields)
 
     def send_burst_trigger(self) -> bool:
         """请求一次 16kHz 突发抓取（CMD_CAPTURE_BURST=0x23）。需电机运行中。"""
@@ -1156,6 +1201,8 @@ class CommManager(QObject):
                     continue
                 self._last_command_result = result
                 legacy_frame = self._v2_pending_legacy.pop(result.sequence, None)
+                if result.success and legacy_frame is not None:
+                    self._apply_acked_telemetry_config(legacy_frame)
                 if (result.success and legacy_frame is not None and
                         self._protocol_mode == "virtual-v2"):
                     self._dispatch_to_sim(legacy_frame)

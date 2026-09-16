@@ -485,6 +485,25 @@ def test_辨识档开启F3且相电流保持链路默认全速(tmp_path, monkeyp
     app.processEvents()
 
 
+def test_示波档请求16kHz连续采样并显示实际速率(tmp_path, monkeypatch):
+    app = _app()
+    monkeypatch.setattr(
+        "pages.communication_page._COMM_CFG_FILE", tmp_path / "comm.json")
+    comm = CommManager()
+    page = CommunicationPage(comm)
+
+    index = page._tele_level.findData("scope16k")
+    assert index >= 0
+    page._tele_level.setCurrentIndex(index)
+
+    assert page._resolve_telemetry() == (0x01, 0, 20, 100)
+    assert page._resolve_f1_stream_rate_hz() == 16000
+    assert "16kHz" in page._tele_hint.text()
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
 def test_通信配置保存并恢复辨识档(tmp_path, monkeypatch):
     app = _app()
     cfg_path = tmp_path / "comm.json"

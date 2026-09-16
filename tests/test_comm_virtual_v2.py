@@ -10,12 +10,14 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from communications.comm_manager import CommManager
-from communications.protocol import encode_frame
+from communications.protocol import decode_frame, encode_frame
 from communications.protocol_session import (
     DeviceCapabilities, ProtocolSession, ProtocolSessionState,
 )
 from communications.v2_virtual_device import V2VirtualDevice
-from communications.protocol_v2 import MessageType, V2Frame, encode_v2_frame, make_ack
+from communications.protocol_v2 import (
+    MessageType, V2Frame, decode_v2_frame, encode_v2_frame, make_ack, make_nack,
+)
 from config.config import CMD_SET_SENSOR, CMD_START, CMD_STOP
 from pages.communication_page import CommunicationPage
 from main_window import MainWindow
@@ -24,6 +26,66 @@ from core import RuntimeState
 
 def _app():
     return QApplication.instance() or QApplication([])
+
+
+def test_F1扩展配置携带16kHz与16点批量且旧配置仍为7字节(monkeypatch):
+    comm = CommManager()
+    comm._kind = "以太网TCP"
+    sent = []
+    monkeypatch.setattr(comm, "send_frame", lambda frame: sent.append(frame) or True)
+
+    assert comm.send_telemetry_config(0x01, 0, 20, 100)
+    command, legacy = decode_frame(sent[-1])
+    assert command == 0x22
+    assert legacy == struct.pack("<BHHH", 0x01, 0, 20, 100)
+
+    assert comm.send_telemetry_config(
+        0x01, 0, 20, 100, f1_rate_hz=16000, f1_batch_samples=16)
+    command, extended = decode_frame(sent[-1])
+    assert command == 0x22
+    assert extended == struct.pack("<BHHHHB", 0x01, 0, 20, 100, 16000, 16)
+    assert comm._resolve_f1_rate_hz() == 16000
+
+
+def test_真实v2仅在设备ACK后切换F1时间轴_NACK保持旧速率():
+    comm = CommManager()
+    comm._kind = "以太网TCP"
+    session = ProtocolSession()
+    session.state = ProtocolSessionState.READY
+    session.negotiated_version = 2
+    session.capabilities = DeviceCapabilities(
+        "DEVICE", "0.8.0-f1-16k", commands=[0x22],
+        telemetry_fields=["f1_stream_rate_hz"])
+    sent = []
+
+    class OpenDriver:
+        @staticmethod
+        def is_open():
+            return True
+
+        @staticmethod
+        def send(wire):
+            sent.append(wire)
+            return len(wire)
+
+    comm._protocol_mode = "negotiated-v2"
+    comm._v2_session = session
+    comm._driver = OpenDriver()
+    old_rate = comm._resolve_f1_rate_hz()
+
+    assert not comm.send_telemetry_config(
+        0x01, 0, 20, 100, f1_rate_hz=16000, f1_batch_samples=16)
+    assert comm._resolve_f1_rate_hz() == old_rate
+    request = decode_v2_frame(sent[-1])
+    comm._process_v2_responses([
+        encode_v2_frame(make_nack(request, 101, "old firmware"))])
+    assert comm._resolve_f1_rate_hz() == old_rate
+
+    assert not comm.send_telemetry_config(
+        0x01, 0, 20, 100, f1_rate_hz=16000, f1_batch_samples=16)
+    request = decode_v2_frame(sent[-1])
+    comm._process_v2_responses([encode_v2_frame(make_ack(request))])
+    assert comm._resolve_f1_rate_hz() == 16000
 
 
 def _wait_until(predicate, timeout=1.0):
