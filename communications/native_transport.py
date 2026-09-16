@@ -1,0 +1,84 @@
+"""C++ TCP 遥测接收器的 Python 边界。
+
+原生线程只负责 socket 接收、v2 流解码和有界排队，不触碰 Qt 对象。Python
+轮询线程批量 ``drain`` 后，仍由现有 ``CommManager`` 推进协议与业务状态。
+"""
+from __future__ import annotations
+
+import os
+
+from .protocol_v2 import MessageType, V2Frame
+from .tcp_comm import _prefer_local_ip
+
+
+try:
+    import motor_core_cpp as _native
+except (ImportError, OSError) as exc:
+    _native = None
+    _native_import_error = str(exc)
+else:
+    _native_import_error = ""
+
+
+def native_tcp_transport_available() -> bool:
+    return _native is not None and hasattr(_native, "TcpV2Receiver")
+
+
+def native_tcp_transport_mode() -> str:
+    mode = os.getenv("MOTOR_HMI_NATIVE_TRANSPORT", "auto").strip().lower()
+    if mode not in {"auto", "native", "python"}:
+        raise ValueError(
+            "MOTOR_HMI_NATIVE_TRANSPORT 只能是 auto、native 或 python")
+    if mode == "native" and not native_tcp_transport_available():
+        raise RuntimeError(
+            f"已强制使用 C++ TCP 接收器，但加载失败：{_native_import_error}")
+    return mode
+
+
+def native_tcp_transport_enabled() -> bool:
+    return (native_tcp_transport_mode() != "python" and
+            native_tcp_transport_available())
+
+
+class NativeTcpV2Receiver:
+    backend = "cpp-tcp"
+
+    def __init__(self, max_queue_frames: int = 8192) -> None:
+        if not native_tcp_transport_available():
+            raise RuntimeError(f"C++ TCP 接收器不可用：{_native_import_error}")
+        self._receiver = _native.TcpV2Receiver(max(1, int(max_queue_frames)))
+        self.bound_local = ""
+
+    def start(self, host: str, port: int, *, local_host: str = "",
+              timeout_s: float = 2.0) -> None:
+        host = str(host).strip()
+        port = int(port)
+        if not host or not 1 <= port <= 65535:
+            raise ValueError("TCP 主机或端口无效")
+        selected_local = _prefer_local_ip(host, local_host)
+        try:
+            self._receiver.start(
+                host, port, selected_local, max(0.05, float(timeout_s)))
+            self.bound_local = selected_local
+        except RuntimeError:
+            if not selected_local:
+                raise
+            self._receiver.start(host, port, "", max(0.05, float(timeout_s)))
+            self.bound_local = ""
+
+    def stop(self) -> None:
+        self._receiver.stop()
+
+    def drain(self, max_frames: int = 512) -> list[V2Frame]:
+        return [
+            V2Frame(
+                version=int(version), address=int(address),
+                sequence=int(sequence), message_type=MessageType(raw_type),
+                command=int(command), payload=bytes(payload),
+            )
+            for version, address, sequence, raw_type, command, payload
+            in self._receiver.drain(max(1, int(max_frames)))
+        ]
+
+    def stats(self) -> dict[str, object]:
+        return dict(self._receiver.stats())

@@ -39,6 +39,10 @@ from .native_protocol import (
     ProtocolStreamDecoder, create_v2_stream_decoder,
     native_protocol_diagnostics,
 )
+from .native_transport import (
+    NativeTcpV2Receiver, native_tcp_transport_enabled,
+    native_tcp_transport_mode,
+)
 from .protocol_v2 import (
     MessageType, ProtocolV2Error, V2Frame,
     decode_v2_frame, encode_v2_frame,
@@ -219,6 +223,9 @@ class CommManager(QObject):
         self._rx_backlog_warned_at = 0.0
         self._v2_stream_decoder: ProtocolStreamDecoder | None = None
         self._v2_telem_decoder: ProtocolStreamDecoder | None = None
+        self._native_telem_receiver: NativeTcpV2Receiver | None = None
+        self._native_telem_decoder_errors_seen = 0
+        self._native_telem_dropped_seen = 0
         self._protocol_stats = self._new_protocol_stats()
         self._expected_device_identity = {
             "device_id": "", "hardware_version": "", "firmware_prefix": "",
@@ -264,6 +271,9 @@ class CommManager(QObject):
         self._v2_session = session
         self._v2_stream_decoder = create_v2_stream_decoder()
         self._v2_telem_decoder = None
+        self._native_telem_receiver = None
+        self._native_telem_decoder_errors_seen = 0
+        self._native_telem_dropped_seen = 0
         try:
             if kind == "CAN总线":
                 raise ProtocolV2Error(
@@ -337,21 +347,44 @@ class CommManager(QObject):
                     self.logMessage.emit("[状态] 以太网波形已连接（测试/注入驱动）")
                 else:
                     try:
-                        telem = TCPComm()
-                        telem.open(
-                            host=str(cfg.get("host", "192.168.1.50")),
-                            port=int(cfg.get("tcp_port", 5000)),
-                            timeout=float(cfg.get("tcp_timeout", 2.0)),
-                            local_host=str(cfg.get("local_host", "")),
-                        )
-                        self._telem_driver = telem
-                        self._v2_telem_decoder = create_v2_stream_decoder()
-                        self.logMessage.emit(
-                            f"[状态] 以太网波形已连接 {cfg.get('host')}:"
-                            f"{cfg.get('tcp_port', 5000)}")
+                        host = str(cfg.get("host", "192.168.1.50"))
+                        port = int(cfg.get("tcp_port", 5000))
+                        timeout = float(cfg.get("tcp_timeout", 2.0))
+                        local_host = str(cfg.get("local_host", ""))
+                        native_error = None
+                        if native_tcp_transport_enabled():
+                            receiver = NativeTcpV2Receiver()
+                            try:
+                                receiver.start(
+                                    host, port, local_host=local_host,
+                                    timeout_s=timeout)
+                                self._native_telem_receiver = receiver
+                                self.logMessage.emit(
+                                    f"[状态] C++以太网波形接收器已连接 "
+                                    f"{host}:{port}")
+                            except Exception as exc:
+                                receiver.stop()
+                                native_error = exc
+                                if native_tcp_transport_mode() == "native":
+                                    raise
+                                self.logMessage.emit(
+                                    f"[警告] C++以太网接收器启动失败（{exc}），"
+                                    "回退Python TCP")
+                        if self._native_telem_receiver is None:
+                            telem = TCPComm()
+                            telem.open(
+                                host=host, port=port, timeout=timeout,
+                                local_host=local_host)
+                            self._telem_driver = telem
+                            self._v2_telem_decoder = create_v2_stream_decoder()
+                            self.logMessage.emit(
+                                f"[状态] Python以太网波形已连接 {host}:{port}"
+                                + (f"（C++失败：{native_error}）"
+                                   if native_error else ""))
                     except Exception as telem_exc:
                         self._telem_driver = None
                         self._v2_telem_decoder = None
+                        self._stop_native_telem_receiver()
                         self.logMessage.emit(
                             f"[警告] 以太网波形未连接（{telem_exc}），仅串口控制可用")
             self._stop.clear()
@@ -380,6 +413,7 @@ class CommManager(QObject):
                 except Exception:
                     pass
                 self._telem_driver = None
+            self._stop_native_telem_receiver()
             self._v2_telem_decoder = None
             self.logMessage.emit(f"[错误] negotiated-v2连接失败：{exc}；未降级到v1")
             self.statusChanged.emit(False, str(exc))
@@ -450,6 +484,7 @@ class CommManager(QObject):
             except Exception:
                 pass
             self._telem_driver = None
+        self._stop_native_telem_receiver()
         self._v2_session = None
         self._v2_device = None
         self._v2_stream_decoder = None
@@ -514,6 +549,14 @@ class CommManager(QObject):
             "decoder_backend": getattr(
                 self._v2_stream_decoder, "backend", "not_active"),
             "native_protocol": native_protocol_diagnostics(),
+            "telemetry_transport_backend": (
+                self._native_telem_receiver.backend
+                if self._native_telem_receiver is not None else
+                "python-tcp" if self._telem_driver is not None else
+                "not_active"),
+            "native_telemetry_transport": (
+                self._native_telem_receiver.stats()
+                if self._native_telem_receiver is not None else {}),
         }
 
     def telemetry_age_s(self) -> float:
@@ -1226,8 +1269,11 @@ class CommManager(QObject):
                     if self._v2_stream_decoder is not None else 0)
         telem_err = (self._v2_telem_decoder.error_count
                      if self._v2_telem_decoder is not None else 0)
+        telem_err += self._native_telem_decoder_errors_seen
         telem_open = (self._telem_driver is not None and
-                      self._telem_driver.is_open())
+                      self._telem_driver.is_open()) or (
+                          self._native_telem_receiver is not None and
+                          bool(self._native_telem_receiver.stats()["running"]))
         link_open = self._physical_link_open()
         self.logMessage.emit(
             f"[错误] v2会话失效：{reason}；"
@@ -1260,6 +1306,7 @@ class CommManager(QObject):
             "late_or_duplicate_acks": 0,
             "handshakes": 0,
             "session_restarts_or_losses": 0,
+            "transport_dropped_frames": 0,
         }
 
     def _identity_mismatch_reason(self, capabilities) -> str:
@@ -1330,6 +1377,7 @@ class CommManager(QObject):
     _RX_DRAIN_CHUNK = 4096
     _RX_DRAIN_MAX_BYTES = 256 * 1024
     _TELEM_DRAIN_MAX_BYTES = 16 * 1024
+    _NATIVE_TELEM_DRAIN_MAX_FRAMES = 1024
 
     def _drain_driver(self, driver: BaseComm | None,
                       first_timeout: float,
@@ -1362,7 +1410,10 @@ class CommManager(QObject):
         返回 (控制字节, 波形字节, 是否触顶仍有剩余)。
         """
         # 分路时不要每次先空等串口 50ms，否则 1kHz F1 在主机侧堆积。
-        serial_wait = 0.01 if getattr(self, "_telem_driver", None) else 0.05
+        serial_wait = 0.01 if (
+            getattr(self, "_telem_driver", None) is not None or
+            getattr(self, "_native_telem_receiver", None) is not None
+        ) else 0.05
         control, capped = self._drain_driver(self._driver, serial_wait)
         telem = b""
         telem_drv = getattr(self, "_telem_driver", None)
@@ -1381,6 +1432,55 @@ class CommManager(QObject):
                 self._v2_telem_decoder = None
         return control, telem, capped
 
+    def _stop_native_telem_receiver(self) -> None:
+        receiver = getattr(self, "_native_telem_receiver", None)
+        if receiver is not None:
+            try:
+                receiver.stop()
+            except Exception:
+                pass
+        self._native_telem_receiver = None
+
+    def _drain_native_telem(self) -> tuple[list[V2Frame], bool]:
+        """批量取得 C++ 接收线程已经校验的帧，并同步底层错误计数。"""
+        receiver = self._native_telem_receiver
+        if receiver is None:
+            return [], False
+        try:
+            frames = receiver.drain(self._NATIVE_TELEM_DRAIN_MAX_FRAMES)
+            stats = receiver.stats()
+        except Exception as exc:
+            self.logMessage.emit(f"[警告] C++以太网波形接收器异常：{exc}")
+            self._stop_native_telem_receiver()
+            return [], False
+
+        decoder_errors = int(stats["decoder_errors"])
+        new_errors = max(
+            0, decoder_errors - self._native_telem_decoder_errors_seen)
+        if new_errors:
+            self._protocol_stats["crc_or_frame_errors"] += new_errors
+            self.logMessage.emit(
+                f"[错误] C++以太网波形流丢弃{new_errors}个损坏帧")
+        self._native_telem_decoder_errors_seen = decoder_errors
+
+        dropped = int(stats["dropped_frames"])
+        new_dropped = max(0, dropped - self._native_telem_dropped_seen)
+        if new_dropped:
+            self._protocol_stats["transport_dropped_frames"] += new_dropped
+            self.logMessage.emit(
+                f"[警告] C++以太网接收队列过载，丢弃{new_dropped}个旧帧")
+        self._native_telem_dropped_seen = dropped
+
+        queued_frames = int(stats["queued_frames"])
+        capped = queued_frames > 0 or new_dropped > 0
+        # 对端关闭后仍可能有超过单批上限的已校验帧。先分批排空，再释放
+        # 原生接收器，避免把连接末尾的数据静默丢掉。
+        if not bool(stats["running"]) and queued_frames == 0:
+            reason = str(stats["last_error"] or "TCP接收线程已停止")
+            self.logMessage.emit(f"[警告] C++以太网波形断开：{reason}")
+            self._stop_native_telem_receiver()
+        return frames, capped
+
     def _real_v2_poll_loop(self) -> None:
         """真实串口/TCP v2轮询；所有状态推进只依据有效帧和ACK。"""
         while not self._stop.is_set():
@@ -1394,6 +1494,8 @@ class CommManager(QObject):
                 break
             try:
                 control, telem, rx_capped = self._drain_rx()
+                native_telem_frames, native_capped = self._drain_native_telem()
+                rx_capped = rx_capped or native_capped
             except Exception as exc:
                 with self._v2_lock:
                     self._handle_v2_session_loss(f"真实v2读取失败：{exc}")
@@ -1405,8 +1507,7 @@ class CommManager(QObject):
                 if rx_capped and now - self._rx_backlog_warned_at >= 5.0:
                     self._rx_backlog_warned_at = now
                     self.logMessage.emit(
-                        f"[警告] 接收积压：单轮读满 "
-                        f"{self._RX_DRAIN_MAX_BYTES // 1024} KB 仍有剩余，"
+                        f"[警告] 接收积压：单轮读取达到处理上限仍有剩余，"
                         "遥测速率超过上位机处理能力")
                 session = self._v2_session
                 if (session is not None and
@@ -1487,8 +1588,13 @@ class CommManager(QObject):
                             [(frame, encode_v2_frame(frame))
                              for frame in telem_frames],
                             source="telemetry")
+                if native_telem_frames:
+                    self._process_v2_frames(
+                        [(frame, encode_v2_frame(frame))
+                         for frame in native_telem_frames],
+                        source="telemetry")
             # 有数据说明流量大，立即进入下一轮继续掏空；空闲才让出 CPU。
-            if not control and not telem:
+            if not control and not telem and not native_telem_frames:
                 time.sleep(0.02)
 
     # ------------------ 内部 ------------------

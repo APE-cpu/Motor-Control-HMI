@@ -1,11 +1,15 @@
 import os
+import socket
 import threading
 import time
+
+import pytest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from communications.base_comm import BaseComm
 from communications.comm_manager import CommManager
+from communications.native_transport import native_tcp_transport_available
 from communications.protocol import encode_frame
 from communications.protocol_v2 import (
     MessageType, V2Frame, decode_v2_frame, encode_v2_frame,
@@ -339,6 +343,50 @@ def test_RS485加以太网F1半包不能冲掉串口心跳ACK(monkeypatch):
     assert comm.is_connected() is True
     assert status["statistics"]["crc_or_frame_errors"] == 0
     comm.disconnect()
+
+
+@pytest.mark.skipif(
+    not native_tcp_transport_available(), reason="尚未构建 C++ TCP 接收器")
+def test_RS485加以太网自动使用Cpp线程接收F1(monkeypatch):
+    monkeypatch.delenv("MOTOR_HMI_NATIVE_TRANSPORT", raising=False)
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    release_server = threading.Event()
+    f1 = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF1,
+        payload=b"\x00" * 22, sequence=77))
+
+    def serve():
+        try:
+            connection, _address = listener.accept()
+            with connection:
+                connection.sendall(f1[:9])
+                connection.sendall(f1[9:])
+                release_server.wait(2.0)
+        finally:
+            listener.close()
+
+    server = threading.Thread(target=serve, daemon=True)
+    server.start()
+    comm = CommManager()
+    try:
+        assert comm.connect_negotiated_v2(
+            "RS-485+以太网", driver=LoopbackV2Driver(),
+            host="127.0.0.1", tcp_port=port,
+            local_host="127.0.0.1", tcp_timeout=1.0)
+        assert comm.protocol_status()["telemetry_transport_backend"] == "cpp-tcp"
+        assert _wait_until(
+            lambda: comm.protocol_status()["statistics"]["telemetry_frames"] >= 1)
+        native_stats = comm.protocol_status()["native_telemetry_transport"]
+        assert native_stats["rx_frames"] >= 1
+        assert native_stats["decoder_errors"] == 0
+    finally:
+        comm.disconnect()
+        release_server.set()
+        server.join(timeout=1.0)
 
 
 def test_会话失效不把物理链路标成断开():
