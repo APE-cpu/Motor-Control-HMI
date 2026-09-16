@@ -1,7 +1,12 @@
 """主窗口：左侧导航 + 右侧 QStackedWidget。"""
-from PySide6.QtCore import Qt
+from PySide6.QtCore import (
+    Qt, QAbstractAnimation, QParallelAnimationGroup, QPropertyAnimation,
+    QEasingCurve,
+)
 from PySide6.QtWidgets import (
+    QGraphicsOpacityEffect,
     QHBoxLayout,
+    QLabel,
     QMainWindow,
     QFrame,
     QScrollArea,
@@ -151,7 +156,7 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.stack, 1)
         self.setCentralWidget(central)
 
-        self.nav.currentIndexChanged.connect(self.stack.setCurrentIndex)
+        self.nav.currentIndexChanged.connect(self._switch_page)
         self.nav.select_page(0)
 
         # 状态栏显示连接状态
@@ -162,6 +167,73 @@ class MainWindow(QMainWindow):
         )
         bar.showMessage("通信：未连接")
         logger.log("软件启动")
+
+    # ---------- 页面切换过渡:旧页左滑淡出 + 新页淡入 ----------
+    _TRANSITION_MS = 190
+
+    def _switch_page(self, index: int) -> None:
+        if index == self.stack.currentIndex():
+            return
+        # 快速连点时清理上一场未完成的过渡
+        old_overlay = getattr(self, "_page_overlay", None)
+        if old_overlay is not None:
+            old_overlay.deleteLater()
+            self._page_overlay = None
+
+        # QStackedWidget 的直接孩子是 QScrollArea(ResponsiveStack 包装)
+        old_page = QStackedWidget.currentWidget(self.stack)
+        pixmap = old_page.grab() if old_page is not None else None
+
+        overlay = None
+        if pixmap is not None and not pixmap.isNull():
+            overlay = QLabel(self.stack)
+            overlay.setPixmap(pixmap)
+            overlay.setScaledContents(True)
+            overlay.setGeometry(self.stack.rect())
+            overlay.setAttribute(Qt.WA_TransparentForMouseEvents)
+            overlay.show()
+            overlay.raise_()
+            self._page_overlay = overlay
+
+        self.stack.setCurrentIndex(index)
+
+        if overlay is not None:
+            effect = QGraphicsOpacityEffect(overlay)
+            overlay.setGraphicsEffect(effect)
+            rect = self.stack.rect()
+            slide = QPropertyAnimation(overlay, b"geometry", self)
+            slide.setDuration(self._TRANSITION_MS)
+            slide.setStartValue(rect)
+            slide.setEndValue(rect.translated(-28, 0))
+            slide.setEasingCurve(QEasingCurve.OutCubic)
+            fade = QPropertyAnimation(effect, b"opacity", self)
+            fade.setDuration(self._TRANSITION_MS)
+            fade.setStartValue(1.0)
+            fade.setEndValue(0.0)
+            group = QParallelAnimationGroup(self)
+            group.addAnimation(slide)
+            group.addAnimation(fade)
+
+            def _cleanup(ov=overlay):
+                if getattr(self, "_page_overlay", None) is ov:
+                    self._page_overlay = None
+                ov.deleteLater()
+
+            group.finished.connect(_cleanup)
+            group.start(QAbstractAnimation.DeleteWhenStopped)
+
+        # 新页淡入(结束后摘掉 effect,避免常驻影响重绘性能)
+        new_page = QStackedWidget.currentWidget(self.stack)
+        if new_page is not None:
+            effect = QGraphicsOpacityEffect(new_page)
+            new_page.setGraphicsEffect(effect)
+            fade_in = QPropertyAnimation(effect, b"opacity", self)
+            fade_in.setDuration(self._TRANSITION_MS)
+            fade_in.setStartValue(0.0)
+            fade_in.setEndValue(1.0)
+            fade_in.finished.connect(
+                lambda pg=new_page: pg.setGraphicsEffect(None))
+            fade_in.start(QAbstractAnimation.DeleteWhenStopped)
 
     def _on_runtime_telemetry(self, frame) -> None:
         """同步下位机主动受控停机 / 保护锁存，避免界面残留在 RUNNING。"""

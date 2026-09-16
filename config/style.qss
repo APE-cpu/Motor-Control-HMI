@@ -29,7 +29,7 @@ QLabel#TempHigh   { color: #ef5350; font-weight: bold; }
 
 /* ---------- 卡片式分组框 ---------- */
 QGroupBox {
-    background-color: #1d222c;
+    background-color: rgba(29, 34, 44, 0.90);
     border: 1px solid #2c3442;
     border-radius: 10px;
     margin-top: 14px;
@@ -205,6 +205,14 @@ QScrollBar::handle:horizontal:hover { background: #4fc3f7; }
 QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
 /* ---------- 侧边导航 ---------- */
+QLabel#NavHeaderLabel {
+    color: #4d5a6b;
+    font-size: 11px;
+    font-weight: bold;
+    letter-spacing: 1px;
+    background: transparent;
+    padding: 0;
+}
 QListWidget#SideNav {
     background-color: #10131a;
     border: none;
@@ -218,12 +226,12 @@ QListWidget#SideNav::item {
     border-radius: 8px;
     border-left: 3px solid transparent;
 }
-QListWidget#SideNav::item:disabled {      /* 分组标题 */
+QListWidget#SideNav::item:disabled {      /* 分组标题卡片:左右顶满 */
     color: #4d5a6b;
     font-size: 11px;
     font-weight: bold;
-    padding: 12px 6px 2px 6px;
-    margin: 4px 8px 0 8px;
+    padding: 0;
+    margin: 6px 0 0 0;
     background: transparent;
     border: none;
     border-bottom: 1px solid #232b38;

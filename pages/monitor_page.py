@@ -5,7 +5,7 @@ import math
 import os
 import time
 from collections import deque
-from PySide6.QtCore import Qt, QTimer, QPointF
+from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -236,6 +236,127 @@ class _AngleDial(QWidget):
         qp.setPen(QPen(QColor("#8fa3b8")))
         qp.drawText(0, int(cy + r + 16), w, 14, Qt.AlignHCenter,
                     f"累计 {self._revs:+.1f} 圈")
+
+
+class _EnergyOrb(QWidget):
+    """监控页背景层:电机剖面素材图(三态交叉淡入) + 动态光效叠加。
+
+    素材:assets/motor_bg_{stopped,running,fault}.png(带羽化 alpha)。
+    叠加层(40ms 实画,提供"活"的动感):
+    - running  绕转子轴心旋转的青色流光弧(两条对置),速度随转速略快;
+    - fault    红橙脉动光环(约 1.5Hz);
+    - stopped  无叠加,仅灰色静态图。
+    """
+
+    TICK_MS = 40
+    HUB_REL = (0.621, 0.50)      # 转子轴心在素材图中的相对位置
+    IMG_ASPECT = 795.0 / 941.0   # 素材宽/高
+    _IMG = {
+        "stopped": "motor_bg_stopped.png",
+        "running": "motor_bg_running.png",
+        "fault":   "motor_bg_fault.png",
+    }
+    _OVERLAY = {
+        "running": QColor("#4de8cf"),
+        "fault":   QColor("#ff7043"),
+    }
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_TransparentForMouseEvents)
+        self._state = "stopped"
+        self._rpm = 0.0
+        self._fade = {"stopped": 1.0, "running": 0.0, "fault": 0.0}
+        self._angle = 0.0      # 流光弧角度 °
+        self._t = 0.0
+        self._pixmaps = {}
+        from PySide6.QtGui import QPixmap
+        from runtime_paths import resource_path
+        for key, name in self._IMG.items():
+            pm = QPixmap(str(resource_path("assets", name)))
+            if not pm.isNull():
+                self._pixmaps[key] = pm
+        self._timer = QTimer(self)
+        self._timer.timeout.connect(self._tick)
+        self._timer.start(self.TICK_MS)
+
+    def set_state(self, state: str, rpm: float = 0.0) -> None:
+        if state not in self._IMG:
+            state = "stopped"
+        self._state = state
+        self._rpm = rpm
+
+    def _tick(self) -> None:
+        dt = self.TICK_MS / 1000.0
+        self._t += dt
+        # 三态交叉淡入淡出
+        for key in self._fade:
+            target = 1.0 if key == self._state else 0.0
+            self._fade[key] += (target - self._fade[key]) * 0.10
+        if self._state == "running":
+            # 流光弧:90°/s 起步,随转速加到约 200°/s
+            dps = 90.0 + min(abs(self._rpm), 3000.0) / 3000.0 * 110.0
+            self._angle = (self._angle + math.copysign(
+                dps * dt, self._rpm or 1.0)) % 360.0
+        if self.isVisible():
+            self.update()
+
+    def paintEvent(self, ev) -> None:  # noqa: N802 - Qt signature
+        if not self._pixmaps:
+            return
+        p = QPainter(self)
+        p.setRenderHint(QPainter.Antialiasing)
+        p.setRenderHint(QPainter.SmoothPixmapTransform)
+        rect = self.rect()
+        # ---------- 三态素材交叉淡入 ----------
+        for key, pm in self._pixmaps.items():
+            f = self._fade[key]
+            if f <= 0.01:
+                continue
+            p.setOpacity(f * 0.9)
+            p.drawPixmap(rect, pm)
+        p.setOpacity(1.0)
+
+        # ---------- 动态光效叠加 ----------
+        w, h = self.width(), self.height()
+        hub = QPointF(w * self.HUB_REL[0], h * self.HUB_REL[1])
+        r_ring = h * 0.285        # 贴近素材中光晕环的半径
+        if self._state == "running":
+            color = self._OVERLAY["running"]
+            # 两条对置的流光弧,拖尾渐隐
+            for base in (self._angle, self._angle + 180.0):
+                for j in range(16):
+                    a_deg = base - j * 4.0
+                    fade = (1.0 - j / 16.0) ** 2
+                    c = QColor(color)
+                    c.setAlphaF(0.55 * fade)
+                    p.setPen(QPen(c, max(2.0, h * 0.006),
+                                  Qt.SolidLine, Qt.RoundCap))
+                    p.setBrush(Qt.NoBrush)
+                    arc = QRectF(hub.x() - r_ring, hub.y() - r_ring,
+                                 r_ring * 2, r_ring * 2)
+                    start = int((90.0 - a_deg - 2.2) * 16)
+                    p.drawArc(arc, start, int(4.4 * 16))
+            # 轴心呼吸微光
+            breath = 0.10 + 0.06 * math.sin(self._t * 3.2)
+            c = QColor(color)
+            c.setAlphaF(breath)
+            p.setPen(Qt.NoPen)
+            p.setBrush(c)
+            r_hub = h * 0.10
+            p.drawEllipse(hub, r_hub, r_hub)
+        elif self._state == "fault":
+            color = self._OVERLAY["fault"]
+            pulse = 0.5 + 0.5 * math.sin(self._t * 9.4)
+            for rw, a in ((r_ring * 1.04, 0.14 + 0.30 * pulse),
+                          (r_ring * 1.10, 0.05 + 0.12 * pulse)):
+                c = QColor(color)
+                c.setAlphaF(a)
+                p.setPen(QPen(c, max(2.0, h * 0.008),
+                              Qt.SolidLine, Qt.RoundCap))
+                p.setBrush(Qt.NoBrush)
+                p.drawEllipse(hub, rw, rw)
+        p.end()
 
 
 class _StatItem(QWidget):
@@ -477,6 +598,10 @@ class MonitorPage(QWidget):
         tabs.addTab(burst_tab, "📸 抓取波形 (16kHz)")
         root.addWidget(tabs, 1)
 
+        # ---------- 背景层:电机剖面素材 + 动态光效(衬在右侧,低于所有内容) ----------
+        self._orb = _EnergyOrb(parent=self)
+        self._orb.lower()
+
         # ---------- 连接信号 ----------
         comm.telemetryReceived.connect(self._on_telemetry)
         comm.highRateTelemetryReceived.connect(self._on_high_rate_telemetry)
@@ -492,6 +617,14 @@ class MonitorPage(QWidget):
 
 
     # ---- slots ----
+    def resizeEvent(self, ev) -> None:  # noqa: N802 - Qt signature
+        # 背景电机图:按素材宽高比铺满右侧,垂直居中,右缘略出血
+        h = int(self.height() * 1.12)
+        w = int(h * _EnergyOrb.IMG_ASPECT)
+        self._orb.setGeometry(self.width() - int(w * 0.96),
+                              int((self.height() - h) / 2), w, h)
+        super().resizeEvent(ev)
+
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._latest = frame
         self._last_telemetry_time = datetime.datetime.now().timestamp()
@@ -635,13 +768,28 @@ class MonitorPage(QWidget):
         for curve, n in windows.items():
             curve.set_smoothing(n if on else 1)
 
+    def _orb_state(self) -> str:
+        """由状态机/母线状态推导能量灯带状态。"""
+        state_machine = getattr(self._ctrl, "_state_machine", None)
+        if state_machine is not None and state_machine.state.value == "fault_locked":
+            return "fault"
+        if self._latest.bus_state == "ov":
+            return "fault"
+        return ""
+
     def _refresh(self) -> None:
         import time
         idle = (time.time() - self._last_telemetry_time) > 1.0
         if idle:
             self._refresh_datasource_label("idle")
+            self._orb.set_state(self._orb_state() or "stopped")
             return
         f = self._latest
+        # 能量灯带三态:故障 > 运行(|转速|>5rpm) > 停止
+        orb_state = self._orb_state()
+        if not orb_state:
+            orb_state = "running" if abs(f.speed_actual) > 5.0 else "stopped"
+        self._orb.set_state(orb_state, f.speed_actual)
         high_rate = list(self._high_rate_samples)
         self._high_rate_samples.clear()
         self._speed_actual.set_value(f.speed_actual)
