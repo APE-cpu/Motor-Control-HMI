@@ -3,6 +3,7 @@ from experiments import (
     DeviceProfile, ExperimentReportGenerator, ExperimentSessionManager,
     ExperimentTemplateRepository,
 )
+from experiments.report import _build_svg
 
 
 def test_生成Markdown_HTML和SVG完整实验报告(tmp_path):
@@ -92,3 +93,22 @@ def test_报告支持无遥测且事件坏行隔离(tmp_path):
     assert "本实验没有遥测数据" in paths.markdown.read_text(encoding="utf-8")
     assert "无遥测数据" in paths.svg.read_text(encoding="utf-8")
     assert len(manager.repository.read_events(session.experiment_id)) == 2
+
+
+def test_SVG将遥测区间外的实验标记钉在最近边界():
+    rows = [
+        {"monotonic_s": 0.0, "speed_actual": 0.0},
+        {"monotonic_s": 1.0, "speed_actual": 1000.0},
+    ]
+    events = [{
+        "type": "experiment_marker",
+        "monotonic_s": 1.01,
+        "message": "末帧后的负载标记",
+        "details": {"category": "load_applied"},
+    }]
+
+    svg = _build_svg(rows, events)
+
+    assert 'x1="976.0"' in svg
+    assert "stroke-dasharray" in svg
+    assert "末帧后的负载标记" in svg

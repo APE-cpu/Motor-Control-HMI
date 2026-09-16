@@ -2,7 +2,7 @@
 
 原理（只用转速+电流遥测，以 ψf 为转矩锚点）：
   稳态：Kt·iq = B·ω + Tc，两个转速点解出 B、Tc（Kt = 1.5·p·ψf）
-  滑行：J·dω/dt = −(B·ω + Tc)，最小二乘拟合 J
+  滑行：J·dω/dt = −(B·ω + Tc)，解析衰减区间拟合 J
 注意：仅凭转速/电流数据转矩尺度不可观测，ψf 必须由铭牌或
 反电动势实验提供；仿真模式下可用虚拟电机真值验证辨识精度。
 """
@@ -90,7 +90,7 @@ class IdentifyPage(QWidget):
             "  1) 升速至转速点 1，等待稳态，采集 ω/iq 均值\n"
             "  2) 升速至转速点 2，等待稳态，采集 ω/iq 均值\n"
             "  3) 封管滑行，记录降速曲线\n"
-            "  4) 稳态两点解出 B、Tc；滑行曲线最小二乘拟合 J\n")
+            "  4) 稳态两点解出 B、Tc；滑行解析衰减区间拟合 J\n")
         rv.addWidget(self._report)
         root.addWidget(res_box, 1)
 
@@ -121,7 +121,13 @@ class IdentifyPage(QWidget):
 
     def _finish_steady2(self) -> None:
         self._steady2 = self._steady_average()
+        last_sample = self._records[-1] if self._records else None
         self._enter_phase("coast")
+        # 保留封管瞬间的初始转速。小惯量电机可能在下一帧 100 ms 遥测
+        # 到来前已下降大半，缺少该点会丢掉信息量最大的衰减区间。
+        if last_sample is not None:
+            self._records.append(
+                (time.time(), last_sample[1], last_sample[2]))
         self._comm.send_frame(encode_frame(CMD_STOP))
         QTimer.singleShot(6000, self._finish_coast)
 
@@ -181,7 +187,7 @@ class IdentifyPage(QWidget):
             f"实验时间：{time.strftime('%Y-%m-%d %H:%M')}\n"
             f"数据来源：{'数字孪生仿真' if self._comm.is_sim_running() else '真机'}\n"
             "实验原理：稳态 Kt·iq = B·ω + Tc 两点解 B/Tc；"
-            "滑行 J·dω/dt = −(B·ω + Tc) 最小二乘拟合 J\n"
+            "滑行 J·dω/dt = −(B·ω + Tc) 解析衰减区间拟合 J\n"
             f"实验配置：ψf={self._psi_f.value()} Wb，"
             f"极对数={self._pole_pairs.value()}，"
             f"稳态点 n1={self._n1.value()} rpm，n2={self._n2.value()} rpm，"

@@ -106,9 +106,12 @@ def test_外部负载降低稳态转速裕度并增大电流(sim):
     sim.start(2000.0)
     sim.step(4.0)
     iq_noload = sim.i_q
-    sim.set_load(0.3)          # 注入 0.3 N·m 负载
+    # 0.30 N·m 在当前 Kt/摩擦参数下需约 8.08 A，超过 8 A 限流；
+    # 用 0.28 N·m 验证“未饱和时闭环守速”的真实测试意图。
+    sim.set_load(0.28)
     sim.step(4.0)
     assert sim.i_q > iq_noload + 0.5   # 负载靠更大 q 轴电流克服
+    assert abs(sim.iq_ref) < sim.p.i_max
     assert sim.speed_rpm == pytest.approx(2000.0, rel=0.03)  # 闭环仍守住转速
 
 
@@ -134,7 +137,7 @@ def test_一次性负载阶跃到时自动撤除(sim):
 def test_突卸负载电流下降(sim):
     """在已有恒定负载上突卸（负扰动），电流应短暂下降。"""
     sim.start(2000.0)
-    sim.set_load(0.3)          # 不饱和的基础负载（0.5 会顶到 8A 限幅）
+    sim.set_load(0.28)         # 不饱和的基础负载（0.5 会顶到 8A 限幅）
     sim.step(4.0)
     iq_base = sim.i_q
     sim.pulse_load(-0.25, duration_s=1.0)  # 突卸 0.25 N·m（负扰动=助力）

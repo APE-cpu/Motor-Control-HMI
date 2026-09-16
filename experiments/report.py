@@ -319,9 +319,10 @@ def _build_svg(rows: list[dict[str, Any]], events: list[dict[str, Any]] | None =
             parts.append(f'<text x="{left - 7}" y="{y + 4:.1f}" text-anchor="end">{value:.3g}</text>')
         parts.append(f'<line class="axis" x1="{left}" y1="{y0}" x2="{left}" y2="{y0 + panel_h}"/>')
         for timestamp, message, category in markers:
-            if not t_min <= timestamp <= t_max:
-                continue
-            x = left + (timestamp - t_min) / (t_max - t_min) * plot_w
+            # 操作标记常发生在最后一帧遥测之后几毫秒。报告仍应展示它，
+            # 并钉在最近的时间轴边界，而不是因调度时序差异随机丢失。
+            marker_time = min(max(timestamp, t_min), t_max)
+            x = left + (marker_time - t_min) / (t_max - t_min) * plot_w
             color = _SVG_MARKER_COLORS.get(category, "#f9a825")
             parts.append(f'<line x1="{x:.1f}" y1="{y0}" x2="{x:.1f}" y2="{y0 + panel_h}" stroke="{color}" stroke-width="1.2" stroke-dasharray="5 4"/>')
             if panel_index == 0:
