@@ -7,6 +7,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication
 
 from communications.comm_manager import CommManager, TelemetryFrame
+from config.config import MONITOR_PLOT_REFRESH_MS
 from pages.monitor_page import MonitorPage
 
 
@@ -175,4 +176,44 @@ def test_rls_curves_use_the_same_1000_point_spec_as_standard_trends():
     assert page._c_rls_a1._times.maxlen == 1000
     assert page._c_rls_L._times.maxlen == 1000
     assert page._c_rls_R._times.maxlen == 1000
+    page.close()
+
+
+def test_hidden_tab_buffers_without_drawing_then_redraws_on_switch(monkeypatch):
+    _app()
+    page = MonitorPage(CommManager())
+    page._timer.stop()
+    page._latest = TelemetryFrame()
+    page._last_telemetry_time = time.time()
+    draw_calls = []
+    monkeypatch.setattr(page._c_voltage, "_draw",
+                        lambda: draw_calls.append(True))
+    page._on_high_rate_telemetry_columns({
+        "count": 2,
+        "rate_hz": 1000,
+        "angle_deg": [1.0, 2.0],
+        "speed_rpm": [10.0, 11.0],
+        "iq_a": [0.1, 0.2],
+        "iqref_a": [0.0, 0.0],
+        "ia_a": [1.0, 2.0],
+        "ib_a": [-1.0, -2.0],
+        "vd_raw": [3.0, 4.0],
+        "vq_raw": [5.0, 6.0],
+        "vbus_v": [48.0, 48.0],
+    })
+
+    page._refresh()
+
+    assert list(page._c_voltage._buffers["Vq"])[-2:] == [5.0, 6.0]
+    assert draw_calls == []
+    page._curve_tabs.setCurrentIndex(2)
+    assert draw_calls == [True]
+    page.close()
+
+
+def test_monitor_plot_timer_runs_at_about_30_hz():
+    _app()
+    page = MonitorPage(CommManager())
+    assert page._timer.interval() == MONITOR_PLOT_REFRESH_MS == 33
+    page._timer.stop()
     page.close()

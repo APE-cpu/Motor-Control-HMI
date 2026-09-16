@@ -77,6 +77,11 @@ class TrendCurve(QWidget):
         self._smooth_n = 1       # 显示平滑窗口（1=关）；仅平滑显示，不动缓冲
         self._disp: Dict[str, tuple] = {}   # 最近一次显示的 (times, values)，供Y量程
         self._view_window_s = 0.0  # >0 时只显示最近这么多秒（如相电流看几个电周期）
+        # 画线跟随 UI 帧率；量程和 FFT/THD 没必要每帧重算。
+        self._last_range_at = 0.0
+        self._last_stats_at = 0.0
+        self._range_interval_s = 0.10
+        self._stats_interval_s = 0.25
         if _PG_OK:
             self._plot = _YZoomPlot(self, title=title)
             self._plot.setBackground("#10131a")
@@ -87,7 +92,10 @@ class TrendCurve(QWidget):
             self._curves = {}
             for name, color in series.items():
                 pen = pg.mkPen(color=color, width=2)
-                self._curves[name] = self._plot.plot([], [], pen=pen, name=name)
+                curve = self._plot.plot([], [], pen=pen, name=name)
+                curve.setClipToView(True)
+                curve.setDownsampling(auto=True, method="peak")
+                self._curves[name] = curve
             layout.addWidget(self._plot)
             self._stats_label = QLabel("")
             self._stats_label.setStyleSheet("color: #90a4ae; font-size: 11px;")
@@ -95,7 +103,7 @@ class TrendCurve(QWidget):
         else:
             layout.addWidget(QLabel(f"[未安装 pyqtgraph]\n{title}"))
 
-    def append(self, values: Dict[str, float]) -> None:
+    def append(self, values: Dict[str, float], *, redraw: bool = True) -> None:
         now = time.time()
         if not self._times:
             self._t0 = now
@@ -104,15 +112,13 @@ class TrendCurve(QWidget):
         for name, v in values.items():
             if name in self._buffers:
                 self._buffers[name].append(float(v))
-        if _PG_OK:
-            self._draw()
-            self._apply_xview()
-            self._update_y_range()
-            self._update_stats()
+        if redraw:
+            self._render()
         for cb in self._popout_callbacks:
             cb(values)
 
-    def append_batch(self, samples: list[Dict[str, float]], interval_s: float) -> None:
+    def append_batch(self, samples: list[Dict[str, float]], interval_s: float,
+                     *, redraw: bool = True) -> None:
         """批量加入高速样本，只重绘一次，避免高频刷新阻塞界面。"""
         if not samples:
             return
@@ -124,16 +130,13 @@ class TrendCurve(QWidget):
             for name, value in values.items():
                 if name in self._buffers:
                     self._buffers[name].append(float(value))
-        if _PG_OK:
-            self._draw()
-            self._apply_xview()
-            self._update_y_range()
-            self._update_stats()
+        if redraw:
+            self._render()
         for cb in self._popout_batch_callbacks:
             cb(samples, interval_s)
 
-    def append_columns(self, columns: Dict[str, object],
-                       interval_s: float) -> None:
+    def append_columns(self, columns: Dict[str, object], interval_s: float,
+                       *, redraw: bool = True) -> None:
         """批量加入列式数据，不构造逐样本字典。"""
         active = [
             (name, values) for name, values in columns.items()
@@ -152,11 +155,8 @@ class TrendCurve(QWidget):
         for name, values in active:
             self._buffers[name].extend(float(values[index])
                                        for index in range(count))
-        if _PG_OK:
-            self._draw()
-            self._apply_xview()
-            self._update_y_range()
-            self._update_stats()
+        if redraw:
+            self._render()
         for cb in self._popout_columns_callbacks:
             cb(columns, interval_s)
 
@@ -185,6 +185,26 @@ class TrendCurve(QWidget):
             self._disp[name] = (tsu, yv)
             curve.setData(tsu, list(yv))
 
+    def _render(self, *, force_range: bool = False,
+                force_stats: bool = False) -> None:
+        """重绘曲线；低频更新量程和统计，避免 FFT 占用每一帧。"""
+        if not _PG_OK:
+            return
+        self._draw()
+        self._apply_xview()
+        now = time.monotonic()
+        if force_range or now - self._last_range_at >= self._range_interval_s:
+            self._update_y_range()
+            self._last_range_at = now
+        if force_stats or now - self._last_stats_at >= self._stats_interval_s:
+            self._update_stats()
+            self._last_stats_at = now
+
+    def redraw(self) -> None:
+        """把已缓冲的数据立即画出；用于隐藏页签切换为可见时。"""
+        if self._times:
+            self._render(force_range=True, force_stats=True)
+
     def set_smoothing(self, n: int) -> None:
         """设置显示平滑窗口（1=关）。仅影响显示，不动原始缓冲/导出/统计。"""
         new_n = max(1, int(n))
@@ -192,8 +212,7 @@ class TrendCurve(QWidget):
             return
         self._smooth_n = new_n
         if _PG_OK and self._times:
-            self._draw()
-            self._update_y_range()
+            self._render(force_range=True)
 
     def set_view_window(self, seconds: float) -> None:
         """>0 时时间轴只显示最近 seconds 秒（滚动跟随），0=显示全部缓冲。
@@ -303,6 +322,8 @@ class TrendCurve(QWidget):
         self._t0 = 0.0
         self._manual_x = False
         self._disp = {}
+        self._last_range_at = 0.0
+        self._last_stats_at = 0.0
         if _PG_OK:
             self._plot.getViewBox().enableAutoRange(x=True)
             for curve in self._curves.values():

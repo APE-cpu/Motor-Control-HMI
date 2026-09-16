@@ -52,3 +52,45 @@ def test_列式批次不构造逐样本字典且只重绘一次():
     assert list(curve._buffers["Ia"])[-2:] == [98.0, 99.0]
     assert list(curve._buffers["Ib"])[-2:] == [-98.0, -99.0]
     curve.close()
+
+
+def test_隐藏曲线只缓存且弹窗回调仍持续接收(monkeypatch):
+    _app()
+    curve = TrendCurve("current", {"Ia": "#fff"}, buffer_size=5000)
+    draw_calls = []
+    column_calls = []
+    monkeypatch.setattr(curve, "_draw", lambda: draw_calls.append(True))
+    curve.add_popout_columns_callback(
+        lambda columns, interval: column_calls.append((columns, interval)))
+
+    columns = {"Ia": [1.0, 2.0, 3.0]}
+    curve.append_columns(columns, 0.001, redraw=False)
+
+    assert list(curve._buffers["Ia"]) == [1.0, 2.0, 3.0]
+    assert draw_calls == []
+    assert column_calls == [(columns, 0.001)]
+
+    curve.redraw()
+    assert draw_calls == [True]
+    curve.close()
+
+
+def test_统计和量程计算按低频节流(monkeypatch):
+    _app()
+    curve = TrendCurve("current", {"Ia": "#fff"})
+    stats_calls = []
+    range_calls = []
+    monkeypatch.setattr(curve, "_update_stats",
+                        lambda: stats_calls.append(True))
+    monkeypatch.setattr(curve, "_update_y_range",
+                        lambda: range_calls.append(True))
+
+    curve.append({"Ia": 1.0})
+    curve.append({"Ia": 2.0})
+
+    assert len(stats_calls) == 1
+    assert len(range_calls) == 1
+    curve.redraw()
+    assert len(stats_calls) == 2
+    assert len(range_calls) == 2
+    curve.close()

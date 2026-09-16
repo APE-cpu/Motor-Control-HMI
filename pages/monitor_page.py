@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 
 from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import encode_frame
-from config.config import CMD_SET_PARAMS, MONITOR_REFRESH_MS
+from config.config import CMD_SET_PARAMS, MONITOR_PLOT_REFRESH_MS
 from widgets.trend_curve import TrendCurve
 from waveform_storage import category_for_control_mode, create_waveform_record_dir
 from widgets.temperature_label import TemperatureLabel
@@ -649,6 +649,16 @@ class MonitorPage(QWidget):
         tabs.addTab(position_tab, "🎯 位置三环")
         tabs.addTab(rls_tab, "🔬 在线辨识 (RLS)")
         tabs.addTab(burst_tab, "📸 抓取波形 (16kHz)")
+        self._curve_tabs = tabs
+        self._tab_curves = {
+            0: (self._c_speed, self._c_current, self._c_phase_current),
+            1: (self._c_angle, self._c_sensor_q),
+            2: (self._c_torque, self._c_voltage),
+            3: (self._c_position, self._c_position_speed,
+                self._c_position_state),
+            4: (self._c_rls_a1, self._c_rls_L, self._c_rls_R),
+        }
+        tabs.currentChanged.connect(self._on_curve_tab_changed)
         root.addWidget(tabs, 1)
 
         # 电机剖面背景衬在整张监控页右侧，低于所有内容。
@@ -668,13 +678,22 @@ class MonitorPage(QWidget):
         # ---------- 刷新定时器 ----------
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
-        self._timer.start(MONITOR_REFRESH_MS)
+        self._timer.start(MONITOR_PLOT_REFRESH_MS)
 
 
     # ---- slots ----
     def stop_visual_animations(self) -> None:
         """主窗口关闭前停止背景帧循环。"""
         self._orb._timer.stop()
+
+    def _curve_is_active(self, curve: TrendCurve) -> bool:
+        return curve in self._tab_curves.get(
+            self._curve_tabs.currentIndex(), ())
+
+    def _on_curve_tab_changed(self, index: int) -> None:
+        """隐藏页只积累数据，切回可见时一次性同步到最新缓冲。"""
+        for curve in self._tab_curves.get(index, ()):
+            curve.redraw()
 
     def resizeEvent(self, ev) -> None:  # noqa: N802 - Qt signature
         # 按素材宽高比铺满右侧，垂直居中并让右缘轻微出血。
@@ -771,12 +790,18 @@ class MonitorPage(QWidget):
 
         # a1：即使 updates=0 也画（暖启动 ~0.944），证明链路通
         if _finite(a1_d, -8.0, 8.0) and _finite(a1_q, -8.0, 8.0):
-            self._c_rls_a1.append({"a1_d": a1_d, "a1_q": a1_q})
+            self._c_rls_a1.append(
+                {"a1_d": a1_d, "a1_q": a1_q},
+                redraw=self._curve_is_active(self._c_rls_a1))
         # L/R：b≈0 时反解 inf，只在合理范围画
         if _finite(ld, 0.05, 10.0) and _finite(lq, 0.05, 10.0):
-            self._c_rls_L.append({"Ld": ld, "Lq": lq})
+            self._c_rls_L.append(
+                {"Ld": ld, "Lq": lq},
+                redraw=self._curve_is_active(self._c_rls_L))
         if _finite(rd, 0.01, 20.0) and _finite(rq, 0.01, 20.0):
-            self._c_rls_R.append({"Rd": rd, "Rq": rq})
+            self._c_rls_R.append(
+                {"Rd": rd, "Rq": rq},
+                redraw=self._curve_is_active(self._c_rls_R))
 
     # ------- 突发抓取波形 (16kHz) -------
     def _build_burst_tab(self) -> QWidget:
@@ -1046,48 +1071,57 @@ class MonitorPage(QWidget):
                 curve.resume_follow()
         self._curves_were_active = curves_active
         if curves_active:
-            self._c_speed.append({"实际": f.speed_actual, "给定": f.speed_target})
+            self._c_speed.append(
+                {"实际": f.speed_actual, "给定": f.speed_target},
+                redraw=self._curve_is_active(self._c_speed))
             if high_count:
                 interval_s = 1.0 / max(self._high_rate_rate_hz, 1)
                 self._c_current.append_columns({
                     "实际 Iq": high_columns["iq_a"],
                     "给定 Iq": high_columns["iqref_a"],
-                }, interval_s)
+                }, interval_s, redraw=self._curve_is_active(self._c_current))
                 self._c_phase_current.append_columns({
                     "Ia": high_columns["ia_a"],
                     "Ib": high_columns["ib_a"],
-                }, interval_s)
+                }, interval_s,
+                    redraw=self._curve_is_active(self._c_phase_current))
                 self._c_voltage.append_columns({
                     "Vd": high_columns["vd_raw"],
                     "Vq": high_columns["vq_raw"],
-                }, interval_s)
+                }, interval_s, redraw=self._curve_is_active(self._c_voltage))
             else:
                 self._c_current.append(
-                    {"实际 Iq": f.current_actual, "给定 Iq": f.current_target})
-            self._c_torque.append({"实际": f.torque_actual})
+                    {"实际 Iq": f.current_actual, "给定 Iq": f.current_target},
+                    redraw=self._curve_is_active(self._c_current))
+            self._c_torque.append(
+                {"实际": f.torque_actual},
+                redraw=self._curve_is_active(self._c_torque))
 
             if high_count:
                 self._c_angle.append_columns({
                     "高速电角度": high_columns["angle_deg"],
-                }, interval_s)
+                }, interval_s, redraw=self._curve_is_active(self._c_angle))
             elif time.time() - self._last_high_angle_time > 1.0:
-                self._c_angle.append({"高速电角度": f.angle_actual})
+                self._c_angle.append(
+                    {"高速电角度": f.angle_actual},
+                    redraw=self._curve_is_active(self._c_angle))
             self._c_sensor_q.append(
-                {"质量": f.sensor_quality, "收敛度": f.convergence})
+                {"质量": f.sensor_quality, "收敛度": f.convergence},
+                redraw=self._curve_is_active(self._c_sensor_q))
             if position_active:
                 self._c_position.append({
                     "实际位置": f.position_actual_deg,
                     "轨迹位置": f.position_trajectory_deg,
                     "目标位置": f.position_target_deg,
                     "位置误差": f.position_error_deg,
-                })
+                }, redraw=self._curve_is_active(self._c_position))
                 self._c_position_speed.append({
                     "速度给定": f.position_speed_target_rpm,
                     "速度前馈": f.position_speed_ff_rpm,
-                })
+                }, redraw=self._curve_is_active(self._c_position_speed))
                 self._c_position_state.append({
                     "速度限幅饱和": 1.0 if f.position_saturated else 0.0,
-                })
+                }, redraw=self._curve_is_active(self._c_position_state))
         self._refresh_datasource_label(getattr(f, "data_source", "sim"))
 
     @staticmethod
