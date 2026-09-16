@@ -1,0 +1,4 @@
+# Build-time dependencies for the optional C++ communication core.
+pybind11>=2.12
+scikit-build-core>=0.10
+cmake>=3.20

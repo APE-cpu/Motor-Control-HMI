@@ -31,7 +31,7 @@ goto :build
 
 :build
 echo.
-echo [0/3] Checking version consistency (APP_VERSION vs git tag)...
+echo [0/4] Checking version consistency (APP_VERSION vs git tag)...
 set APP_VERSION=
 for /f "tokens=3" %%v in ('findstr /b /c:"APP_VERSION" main_window.py') do set APP_VERSION=%%~v
 set GIT_TAG=
@@ -46,11 +46,21 @@ exit /b 1
 :version_ok
 set BUILD_NAME=%BUILD_NAME%-v%APP_VERSION%
 
-echo [1/3] Installing PyInstaller...
+echo [1/4] Building optional C++ communication core...
+set NATIVE_CORE=
+python -m pip install --force-reinstall ".\native_core"
+if errorlevel 1 (
+    echo   [!] Native core build failed; executable will use the Python fallback.
+) else (
+    set NATIVE_CORE=--hidden-import motor_core_cpp
+    echo   [+] Native communication core enabled.
+)
+
+echo [2/4] Installing PyInstaller...
 python -m pip install pyinstaller
 if errorlevel 1 goto :error
 
-echo [2/3] Building %BUILD_NAME%...
+echo [3/4] Building %BUILD_NAME%...
 
 rem 若项目根目录存在 ZLG 驱动，则一并打入 exe（放在 exe 同级可被加载）
 set ZLG_DLL=
@@ -73,6 +83,7 @@ if "%MODE%"=="lite" (
       --add-data "motor_anomaly.onnx;." ^
       %ZLG_DLL% ^
       %ZLG_ZCAN% ^
+      %NATIVE_CORE% ^
       --exclude-module torch ^
       --exclude-module torchvision ^
       --exclude-module torchaudio ^
@@ -96,11 +107,12 @@ if "%MODE%"=="lite" (
       --collect-data rapidocr_onnxruntime ^
       %ZLG_DLL% ^
       %ZLG_ZCAN% ^
+      %NATIVE_CORE% ^
       %ENTRY%
 )
 if errorlevel 1 goto :error
 
-echo [3/3] Done.
+echo [4/4] Done.
 echo Output: %CD%\dist\%BUILD_NAME%.exe
 pause
 exit /b 0

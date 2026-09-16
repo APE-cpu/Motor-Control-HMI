@@ -35,8 +35,12 @@ from .zlgcan_zcan_comm import ZlgCanZcanComm
 from .protocol_session import (
     CommandResult, ProtocolSession, ProtocolSessionState,
 )
+from .native_protocol import (
+    ProtocolStreamDecoder, create_v2_stream_decoder,
+    native_protocol_diagnostics,
+)
 from .protocol_v2 import (
-    MessageType, ProtocolV2Error, V2Frame, V2StreamDecoder,
+    MessageType, ProtocolV2Error, V2Frame,
     decode_v2_frame, encode_v2_frame,
 )
 from .v2_virtual_device import V2VirtualDevice
@@ -213,8 +217,8 @@ class CommManager(QObject):
         self._control_plane_warned = False
         self._v2_connection_lost_reported = False
         self._rx_backlog_warned_at = 0.0
-        self._v2_stream_decoder: V2StreamDecoder | None = None
-        self._v2_telem_decoder: V2StreamDecoder | None = None
+        self._v2_stream_decoder: ProtocolStreamDecoder | None = None
+        self._v2_telem_decoder: ProtocolStreamDecoder | None = None
         self._protocol_stats = self._new_protocol_stats()
         self._expected_device_identity = {
             "device_id": "", "hardware_version": "", "firmware_prefix": "",
@@ -258,7 +262,7 @@ class CommManager(QObject):
         self._protocol_stats = self._new_protocol_stats()
         session = ProtocolSession(address=address)
         self._v2_session = session
-        self._v2_stream_decoder = V2StreamDecoder()
+        self._v2_stream_decoder = create_v2_stream_decoder()
         self._v2_telem_decoder = None
         try:
             if kind == "CAN总线":
@@ -329,7 +333,7 @@ class CommManager(QObject):
                             local_host=str(cfg.get("local_host", "")),
                         )
                     self._telem_driver = telem_driver
-                    self._v2_telem_decoder = V2StreamDecoder()
+                    self._v2_telem_decoder = create_v2_stream_decoder()
                     self.logMessage.emit("[状态] 以太网波形已连接（测试/注入驱动）")
                 else:
                     try:
@@ -341,7 +345,7 @@ class CommManager(QObject):
                             local_host=str(cfg.get("local_host", "")),
                         )
                         self._telem_driver = telem
-                        self._v2_telem_decoder = V2StreamDecoder()
+                        self._v2_telem_decoder = create_v2_stream_decoder()
                         self.logMessage.emit(
                             f"[状态] 以太网波形已连接 {cfg.get('host')}:"
                             f"{cfg.get('tcp_port', 5000)}")
@@ -507,6 +511,9 @@ class CommManager(QObject):
             "control_rx_age_s": (
                 max(0.0, time.monotonic() - self._last_control_valid_at)
                 if self._last_control_valid_at > 0.0 else float("inf")),
+            "decoder_backend": getattr(
+                self._v2_stream_decoder, "backend", "not_active"),
+            "native_protocol": native_protocol_diagnostics(),
         }
 
     def telemetry_age_s(self) -> float:
@@ -797,8 +804,10 @@ class CommManager(QObject):
 
     def _process_v2_responses(
             self, responses: list[bytes], *, source: str = "control") -> list[object]:
-        outputs: list[object] = []
+        frames: list[tuple[V2Frame, bytes]] = []
         for raw in responses:
+            # 保留旧接口语义：收到的每个 wire frame（包括损坏帧）都计入 RX
+            # 并发给诊断页。真实流入口只把已经校验的帧交给下一层。
             self._protocol_stats["rx_frames"] += 1
             self.rawReceived.emit(0, raw)
             try:
@@ -807,6 +816,19 @@ class CommManager(QObject):
                 self._protocol_stats["crc_or_frame_errors"] += 1
                 self.logMessage.emit(f"[错误] v2响应无效：{exc}")
                 continue
+            frames.append((frame, raw))
+        return self._process_v2_frames(
+            frames, source=source, account_raw=False)
+
+    def _process_v2_frames(
+            self, frames: list[tuple[V2Frame, bytes]], *,
+            source: str = "control", account_raw: bool = True) -> list[object]:
+        """处理已校验帧，避免真实链路在流解码后再次做 Python CRC。"""
+        outputs: list[object] = []
+        for frame, raw in frames:
+            if account_raw:
+                self._protocol_stats["rx_frames"] += 1
+                self.rawReceived.emit(0, raw)
             now = time.monotonic()
             # 总链路活性用于遥测超时；控制面活性必须单独记账。混合通信下
             # 以太网F1持续到达，不能再掩盖RS-485心跳ACK已经消失。
@@ -1288,7 +1310,7 @@ class CommManager(QObject):
 
     def _decode_real_v2_chunk(
             self, chunk: bytes,
-            decoder: V2StreamDecoder | None = None,
+            decoder: ProtocolStreamDecoder | None = None,
             stream_name: str = "真实v2字节流") -> list[V2Frame]:
         if decoder is None:
             decoder = self._v2_stream_decoder
@@ -1430,8 +1452,9 @@ class CommManager(QObject):
                     ctrl_frames = self._decode_real_v2_chunk(
                         control, self._v2_stream_decoder, "串口/控制面")
                     if ctrl_frames:
-                        self._process_v2_responses(
-                            [encode_v2_frame(frame) for frame in ctrl_frames],
+                        self._process_v2_frames(
+                            [(frame, encode_v2_frame(frame))
+                             for frame in ctrl_frames],
                             source="control")
 
                 if session is not None:
@@ -1460,8 +1483,9 @@ class CommManager(QObject):
                     telem_frames = self._decode_real_v2_chunk(
                         telem, self._v2_telem_decoder, "以太网波形")
                     if telem_frames:
-                        self._process_v2_responses(
-                            [encode_v2_frame(frame) for frame in telem_frames],
+                        self._process_v2_frames(
+                            [(frame, encode_v2_frame(frame))
+                             for frame in telem_frames],
                             source="telemetry")
             # 有数据说明流量大，立即进入下一轮继续掏空；空闲才让出 CPU。
             if not control and not telem:
