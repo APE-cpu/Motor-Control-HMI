@@ -68,7 +68,9 @@ class MotorSim:
         self.trace.clear()
         self._trace_n = 0
         self.omega = 0.0          # 机械角速度 rad/s
-        self.theta = 0.0          # 机械角 rad（0~2π）
+        self.theta = 0.0          # 机械角 rad（0~2π，电磁模型用）
+        self.mechanical_angle_deg = 0.0  # 连续机械角（位置环用）
+        self._position_origin_deg = 0.0
         self.temp = self.p.t_amb
         self.enabled = False      # 逆变器使能
         self.vdc = self.p.Vdc     # 母线电压状态量 V
@@ -85,6 +87,21 @@ class MotorSim:
         self.p_fric = 0.0         # 摩擦/负载耗散
         self.p_kinetic = 0.0      # 动能变化率（加速为正）
         self.speed_ref_rpm = 0.0
+        self.position_mode = False
+        self.position_ref_deg = 0.0
+        self.position_kp = 8.0
+        self.position_kd = 0.20
+        self.position_kpf = 0.0
+        self.position_ff_lpf_hz = 8.0
+        self.position_speed_limit_rpm = 300.0
+        self.position_accel_limit_rpm_s = 60.0
+        self.position_speed_ff_rpm = 0.0
+        self.position_error_deg = 0.0
+        self.position_speed_cmd_rpm = 0.0
+        self.position_trajectory_deg = 0.0
+        self.position_trajectory_speed_rpm = 0.0
+        self._position_ff_filtered = 0.0
+        self._position_last_motion_sign = 0
         self.iq_ref = 0.0
         self.load_ext = 0.0       # 外部负载转矩 N·m（测功机/扫频注入）
         # 负载扰动：在 load_ext 之上叠加，用于突加/突卸测试与周期扰动
@@ -98,9 +115,22 @@ class MotorSim:
         self._int_q = 0.0
 
     # ---------- 虚拟下位机指令接口 ----------
-    def start(self, target_rpm: float = None) -> None:
+    def start(self, target_rpm: float = None, *, position_mode: bool = False,
+              position_target_deg: float = 0.0, **params) -> None:
         if target_rpm is not None:
             self.speed_ref_rpm = float(target_rpm)
+        self.configure_position_loop(**params)
+        self.position_mode = bool(position_mode)
+        if self.position_mode:
+            self.position_ref_deg = float(position_target_deg)
+            # Position commands are relative to the encoder capture point at
+            # START, matching the F407 implementation.
+            self._position_origin_deg = self.mechanical_angle_deg
+            self.position_trajectory_deg = 0.0
+            self.position_trajectory_speed_rpm = 0.0
+            self._position_ff_filtered = 0.0
+            self._position_last_motion_sign = 0
+            self._int_spd = 0.0
         self.ov_trip = False     # 重新使能视为故障复位
         self.enabled = True
 
@@ -144,6 +174,8 @@ class MotorSim:
         """封管停机：切断驱动，靠负载转矩自然滑行到零。"""
         self.enabled = False
         self.speed_ref_rpm = 0.0
+        self.position_mode = False
+        self.position_speed_cmd_rpm = 0.0
 
     def emergency_stop(self) -> None:
         self.stop()
@@ -151,6 +183,82 @@ class MotorSim:
 
     def set_speed_target(self, rpm: float) -> None:
         self.speed_ref_rpm = float(rpm)
+
+    def configure_position_loop(self, **params) -> None:
+        """配置位置最外环；未提供的参数保留当前值。"""
+        mapping = {
+            "kp_pos": "position_kp",
+            "kd_pos": "position_kd",
+            "kpf_pos": "position_kpf", "position_ff_lpf_hz": "position_ff_lpf_hz",
+            "position_speed_limit_rpm": "position_speed_limit_rpm",
+            "position_accel_limit_rpm_s": "position_accel_limit_rpm_s",
+            "position_speed_ff_rpm": "position_speed_ff_rpm",
+        }
+        for key, attr in mapping.items():
+            if key in params:
+                setattr(self, attr, float(params[key]))
+
+    def set_position_target(self, degrees: float) -> None:
+        self.position_ref_deg = float(degrees)
+
+    def _update_position_loop(self, dt: float) -> None:
+        """加速度受限位置轨迹 + 位置P + 轨迹速度前馈。"""
+        actual = self.mechanical_angle_deg - self._position_origin_deg
+        # angle_deg is a cumulative mechanical position in the dyno model.
+        # Keep the error continuous so multi-turn commands (e.g. 360/720°)
+        # do not collapse to the shortest path at +/-180°.
+        self.position_error_deg = self.position_ref_deg - actual
+        limit = max(abs(self.position_speed_limit_rpm), 1.0)
+        accel = max(abs(self.position_accel_limit_rpm_s), 1.0)
+        accel_step = accel * dt
+        remaining = self.position_ref_deg - self.position_trajectory_deg
+        direction = 1.0 if remaining >= 0.0 else -1.0
+        v = self.position_trajectory_speed_rpm
+        if abs(remaining) <= 0.01 and abs(v) <= accel_step:
+            self.position_trajectory_deg = self.position_ref_deg
+            v = 0.0
+        else:
+            if v * direction < 0.0:
+                if abs(v) <= accel_step:
+                    v = 0.0
+                else:
+                    v -= math.copysign(accel_step, v)
+            else:
+                stop_distance_deg = 3.0 * v * v / accel
+                if abs(remaining) <= stop_distance_deg + 6.0 * abs(v) * dt:
+                    v -= direction * accel_step
+                    if v * direction < 0.0:
+                        v = 0.0
+                else:
+                    v += direction * accel_step
+                    if abs(v) > limit:
+                        v = direction * limit
+            next_position = self.position_trajectory_deg + 6.0 * v * dt
+            if direction * (self.position_ref_deg - next_position) <= 0.0:
+                self.position_trajectory_deg = self.position_ref_deg
+                v = 0.0
+            else:
+                self.position_trajectory_deg = next_position
+        self.position_trajectory_speed_rpm = v
+        target_rate = 6.0 * v
+        ff_raw = self.position_kpf * target_rate + self.position_speed_ff_rpm
+        wc = 2.0 * math.pi * max(self.position_ff_lpf_hz, 0.1)
+        alpha = (wc * dt) / (1.0 + wc * dt)
+        self._position_ff_filtered += alpha * (ff_raw - self._position_ff_filtered)
+        tracking_error = self.position_trajectory_deg - actual
+        speed_cmd = (self.position_kp * tracking_error +
+                     self._position_ff_filtered -
+                     self.position_kd * self.speed_rpm)
+        if limit > 0.0 and abs(speed_cmd) > limit:
+            speed_cmd = math.copysign(limit, speed_cmd)
+        motion_sign = 1 if speed_cmd >= 10.0 else (-1 if speed_cmd <= -10.0 else 0)
+        if motion_sign:
+            if (self._position_last_motion_sign and
+                    motion_sign != self._position_last_motion_sign):
+                self._int_spd = 0.0
+            self._position_last_motion_sign = motion_sign
+        self.position_speed_cmd_rpm = speed_cmd
+        self.speed_ref_rpm = speed_cmd
 
     # ---------- 仿真步进 ----------
     def step(self, duration: float) -> None:
@@ -166,6 +274,8 @@ class MotorSim:
         vd = vq = 0.0
 
         if self.enabled:
+            if self.position_mode:
+                self._update_position_loop(dt)
             # --- 转速环（输出 iq 给定，带限幅抗饱和）---
             # PI 增益按 24V/0.59Ω/0.66mH/1.85e-5 kg·m² 电机重整：
             # Kt=1.5·p·ψf≈0.0423 N·m/A，J 比 48V 平台小 100×，
@@ -224,6 +334,7 @@ class MotorSim:
         domega = (te - t_load) / p.J
         self.omega += domega * dt
         self.theta = (self.theta + self.omega * dt) % (2.0 * math.pi)
+        self.mechanical_angle_deg += math.degrees(self.omega * dt)
 
         # --- 直流母线动力学：电源(内阻+防反灌二极管) + 电容 + 制动斩波器 ---
         # 逆变器直流侧电流 = 电机电功率 / 母线电压（忽略开关损耗）
@@ -288,6 +399,11 @@ class MotorSim:
     @property
     def angle_deg(self) -> float:
         return math.degrees(self.theta)
+
+    @property
+    def position_actual_deg(self) -> float:
+        """Continuous mechanical position relative to the latest START."""
+        return self.mechanical_angle_deg - self._position_origin_deg
 
     @property
     def bus_state(self) -> str:

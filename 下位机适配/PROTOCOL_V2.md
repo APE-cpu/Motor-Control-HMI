@@ -1,6 +1,6 @@
 # 上下位机通信协议 v2（迁移草案）
 
-> 状态：上位机编解码、流解析、能力协商、ACK跟踪、心跳重启检测、`virtual-v2`及真实串口/TCP的`negotiated-v2`已实现；尚未完成下位机v2固件和无功率级实测，也未替换默认v1。
+> 状态：上位机编解码、流解析、能力协商、ACK跟踪、心跳重启检测、`virtual-v2`及真实串口/TCP的`negotiated-v2`已实现；F407 加速度受限位置轨迹版本已于 2026-08-29 零警告编译，待烧录后进行低压实测，尚未宣称实机验证完成。
 
 ## 设计目标
 
@@ -83,8 +83,42 @@ NACK payload 当前采用 UTF-8 JSON：
 | 0x11 | CMD_STOP | 上位机→下位机 | 正常停机（允许在未就绪时发送） |
 | 0x12 | CMD_EMERGENCY_STOP | 上位机→下位机 | 紧急停机（允许在未就绪时发送） |
 | 0x13 | CMD_RESET_FAULT | 上位机→下位机 | 故障复位（保护条件未清除时必须 NACK） |
-| 0x20 | CMD_SET_PARAMS | 上位机→下位机 | 下发控制参数 |
+| 0x20 | CMD_SET_PARAMS | 上位机→下位机 | 下发速度/电流/位置三环及保护参数 |
 | 0x21 | CMD_SET_SENSOR | 上位机→下位机 | 下发位置传感器配置 |
+
+### 位置三环控制载荷
+
+位置模式使用 `CMD_START (0x10)` 或 `CMD_SET_PARAMS (0x20)` 的 UTF-8
+键值载荷：
+
+```text
+control_mode=position_closed;position_target_deg=5;
+kp_pos=8;kd_pos=0.2;kpf_pos=0.1;position_ff_lpf_hz=8;
+position_speed_limit_rpm=60;position_accel_limit_rpm_s=30;
+max_rpm=3000;max_current_a=1.887
+```
+
+下位机执行的是标准 PMSM 级联：
+
+```text
+最终目标 θ* → 加减速受限轨迹 (θr,nr)
+θr−θ → 位置 P − 实际速度阻尼 Kd·n + 轨迹速度前馈 Kpf·6nr → 速度限幅
+     → MCSDK 速度 PI → Iq* → MCSDK 电流 PI → PWM
+```
+
+`position_target_deg` 和反馈是相对启动捕获点的连续机械角（支持多圈），
+当前命令范围为 ±36000°（±100 个机械圈）。
+不是电角度；F407 固件用编码器电角度增量、按 4 极对换算机械角。位置环在
+500 Hz 中频任务内按 200 Hz 更新，速度环仍为 500 Hz，电流/PWM 仍为 16 kHz。
+运行中位置 Kp/Kpf 单次修改不得超过当前值的 ±10%，模式切换仍要求停机。
+旧版载荷中的 `ki_pos` 仅为向后兼容而接收，固件会忽略该值。
+
+位置环遥测字段采用 F0 JSON：`position_actual_cdeg`、
+`position_target_cdeg`、`position_error_cdeg`、`position_trajectory_cdeg`
+为厘度整数；
+`position_speed_target_rpm` 是送入速度 PI 的速度给定，
+`position_speed_ff_rpm` 是低通后的前馈分量，`position_saturated` 表示位置
+环速度限幅动作。未处于位置模式时这些字段为零。
 
 ## 遥测帧格式（v2 专用）
 

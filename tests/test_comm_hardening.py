@@ -65,3 +65,14 @@ def test_v2畸形数值字段被拒绝而不是传入UI():
     )
     with pytest.raises(Exception, match="speed_actual"):
         comm._parse_v2_telemetry(frame)
+
+
+def test_v2位置轨迹厘度转换为机械角度():
+    comm = CommManager()
+    frame = V2Frame(
+        MessageType.TELEMETRY,
+        payload=b'{"position_trajectory_cdeg":1234,"position_speed_ff_rpm":6}',
+    )
+    telemetry = comm._parse_v2_telemetry(frame)
+    assert telemetry.position_trajectory_deg == pytest.approx(12.34)
+    assert telemetry.position_speed_ff_rpm == pytest.approx(6.0)

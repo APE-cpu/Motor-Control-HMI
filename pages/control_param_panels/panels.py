@@ -6,7 +6,7 @@
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox,
-    QHBoxLayout, QLabel, QScrollArea, QSpinBox, QVBoxLayout, QWidget,
+    QHBoxLayout, QLabel, QScrollArea, QSizePolicy, QSpinBox, QVBoxLayout, QWidget,
 )
 
 from config.config import SENSORLESS_METHODS
@@ -57,8 +57,41 @@ def _loop_group(title: str, rows: list) -> tuple:
     box = QGroupBox(title)
     f = QFormLayout(box)
     for label, w in rows:
-        f.addRow(label, w)
+        f.addRow(label, _field_with_range(w))
     return box
+
+
+def _format_bound(value: float) -> str:
+    value = float(value)
+    if value == int(value):
+        return str(int(value))
+    return f"{value:g}"
+
+
+def _field_with_range(widget: QWidget, hint: str = "") -> QWidget:
+    """输入框在前、弱化的范围提示在后，避免参数名被范围文字淹没。"""
+    if not hint and isinstance(widget, (QDoubleSpinBox, QSpinBox)) \
+            and not widget.isReadOnly():
+        hint = (f"{_format_bound(widget.minimum())} ～ "
+                f"{_format_bound(widget.maximum())}")
+    if not hint:
+        return widget
+
+    field = QWidget()
+    field.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+    widget_policy = widget.sizePolicy()
+    widget_policy.setHorizontalPolicy(QSizePolicy.Expanding)
+    widget.setSizePolicy(widget_policy)
+    row = QHBoxLayout(field)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(8)
+    row.addWidget(widget, 1)
+    range_label = QLabel(hint)
+    range_label.setObjectName("RangeHintLabel")
+    range_label.setStyleSheet("color: #748291; font-size: 11px;")
+    range_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    row.addWidget(range_label)
+    return field
 
 
 def _dspin(mn, mx, val, decimals=4, step=None):
@@ -68,6 +101,8 @@ def _dspin(mn, mx, val, decimals=4, step=None):
     sp.setValue(val)
     if step:
         sp.setSingleStep(step)
+    sp.setToolTip(
+        f"可输入范围：{_format_bound(mn)} ～ {_format_bound(mx)}")
     return sp
 
 
@@ -133,30 +168,34 @@ class PIPanel(_FormulaPanel):
         super().__init__()
         self.kp_spd = _dspin(0, 1e4, 1752, 0)
         self.ki_spd = _dspin(0, 1e4, 121, 0)
+        for gain in (self.kp_spd, self.ki_spd):
+            gain.setToolTip("允许范围：0～10000；运行中单次热更新不得超过当前值±10%")
+        # 真机速度控制器是 PI；保留该对象只兼容旧配置/数字孪生，不再作为真机参数展示。
         self.kd_spd = _dspin(0, 1e4, 0.0)
         # 与顶部“电流限幅”同一物理量；恢复实验基线 1.887 A（约 4.5 A 硬件上限）。
         self.iq_max = _dspin(0.1, 4.49, 1.887, 3, 0.1)
         self.iq_max.setToolTip(
             "转速环输出限幅 i_qmax（A）。发送参数时同步为 max_current_a。"
-            "实验基线 1.887 A；可调到约 4.49 A。")
+            "允许范围：0.1～4.49 A；实验基线1.887 A。")
         self.dt_spd = _dspin(1e-6, 1.0, 0.002, 6)
         self.dt_spd.setReadOnly(True)
         self.dt_spd.setToolTip("下位机固定500 Hz；界面不可修改")
         self.left_v.insertWidget(0, _loop_group("转速环（外环）", [
-            ("比例 Kpω（下位机整数）", self.kp_spd),
-            ("积分 Kiω（下位机整数）", self.ki_spd),
-            ("微分 Kdω", self.kd_spd),
+            ("比例 Kpω", self.kp_spd),
+            ("积分 Kiω", self.ki_spd),
             ("输出限幅 iq_max (A)", self.iq_max),
             ("采样时间 (s)", self.dt_spd),
         ]))
         self.kp_cur = _dspin(0, 1e4, 2323, 0)
-        self.ki_cur = _dspin(0, 1e6, 2077, 0)
+        self.ki_cur = _dspin(0, 1e4, 2077, 0)
+        for gain in (self.kp_cur, self.ki_cur):
+            gain.setToolTip("允许范围：0～10000；仅电流环测试模式允许运行中更新，单次±10%")
         self.dt_cur = _dspin(1e-7, 1.0, 0.0000625, 7)
         self.dt_cur.setReadOnly(True)
         self.dt_cur.setToolTip("下位机固定16 kHz；每个PWM周期执行一次")
         self.left_v.insertWidget(1, _loop_group("电流环（内环）", [
-            ("比例 Kpi（下位机整数）", self.kp_cur),
-            ("积分 Kii（下位机整数）", self.ki_cur),
+            ("比例 Kpi", self.kp_cur),
+            ("积分 Kii", self.ki_cur),
             ("控制周期 (s，16 kHz固定)", self.dt_cur),
         ]))
         self.set_formula(_PI_FORMULA)
@@ -174,6 +213,76 @@ class PIPanel(_FormulaPanel):
             "kp": self.kp_spd.value(), "ki": self.ki_spd.value(),
             "kd": self.kd_spd.value(), "sample_time": self.dt_spd.value(),
         }
+
+
+# ─── PMSM 位置—速度—电流三级级联 ───────────────────────────
+_POSITION_FORMULA = (
+    _txt("<b>位置三级级联</b>：最外层位置环输出速度给定，下面复用速度 PI 和电流 PI。"
+         "位置环不直接驱动 PWM。")
+    + _sec("位置环（最外环，200 Hz）")
+    + _fx("e<sub>θ</sub> = θ* − θ（连续机械角，支持多圈）",
+          "θ<sub>r</sub>, n<sub>r</sub> = Trajectory(θ*, n<sub>lim</sub>, a<sub>lim</sub>)",
+          "n<sub>pos</sub> = K<sub>pθ</sub>(θ<sub>r</sub> − θ) − "
+          "K<sub>dθ</sub>n + LPF(K<sub>pfθ</sub>·6n<sub>r</sub>)",
+          "n* = sat(n<sub>pos</sub>, ±n<sub>lim</sub>)")
+    + _sec("速度环与电流环")
+    + _fx("i<sub>q</sub>* = PI<sub>ω</sub>(n* − n)",
+          "v<sub>dq</sub> = PI<sub>i</sub>(i<sub>dq</sub>* − i<sub>dq</sub>)"
+          " + dq 解耦前馈")
+    + _sec("对拖台架用法")
+    + _note(
+        "上位机仍输入最终角度；固件内部生成加减速受限轨迹，避免位置阶跃瞬间顶到速度限幅",
+        "首轮用 ±10°，速度限幅 60 rpm、轨迹加速度 30 rpm/s；确认轨迹与反馈方向正确后再提高",
+        "Kpfθ 作用于轨迹速度而非最终目标的数值跳变，因此运行中应能看到非零速度前馈",
+        "F407 当前固定：电流/PWM 16 kHz、速度 500 Hz；位置环在 500 Hz 任务中按 200 Hz 执行",
+        "位置最外环使用比例、实际速度阻尼与目标速度前馈；积分仍只由速度/电流内环承担",
+        "速度指令确认跨过±10 rpm并反向时，固件卸载一次速度PI积分，避免旧方向转矩加重滑动过冲"))
+
+
+class PositionPanel(PIPanel):
+    """位置环参数 + 现有速度/电流 PI 参数。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.kp_pos = _dspin(0.0, 1_000.0, 8.0, 3, 0.5)
+        self.kd_pos = _dspin(0.0, 10.0, 0.20, 3, 0.05)
+        self.kpf_pos = _dspin(-100.0, 100.0, 0.0, 3, 0.1)
+        self.kp_pos.setToolTip("允许范围：0～1000；运行中单次热更新不得超过当前值±10%")
+        self.kd_pos.setToolTip(
+            "机械速度阻尼，0=关闭；允许范围0～10；运行中单次热更新±10%")
+        self.kpf_pos.setToolTip("允许范围：-100～100；运行中单次热更新不得超过当前值±10%")
+        self.ff_lpf_hz = _dspin(0.1, 200.0, 8.0, 2, 0.5)
+        self.position_speed_limit_rpm = _dspin(1.0, 4_000.0, 300.0, 1, 10.0)
+        self.position_accel_limit_rpm_s = _dspin(1.0, 10_000.0, 60.0, 1, 10.0)
+        self.position_speed_limit_rpm.setToolTip(
+            "允许范围1～4000 rpm；实际值还不得超过顶部配置的最高转速")
+        self.position_accel_limit_rpm_s.setToolTip("允许范围：1～10000 rpm/s")
+        self.dt_pos = _dspin(1e-6, 1.0, 0.005, 6)
+        self.dt_pos.setReadOnly(True)
+        self.dt_pos.setToolTip("F407 当前按 500 Hz 中频任务每 2~3 拍执行，位置环 200 Hz")
+        self.left_v.insertWidget(0, _loop_group("位置环（最外环）", [
+            ("比例 Kpθ (rpm/deg)", self.kp_pos),
+            ("速度阻尼 Kdθ (rpm/rpm)", self.kd_pos),
+            ("速度前馈 Kpfθ", self.kpf_pos),
+            ("前馈低通频率 (Hz)", self.ff_lpf_hz),
+            ("位置环速度限幅 (rpm)", self.position_speed_limit_rpm),
+            ("轨迹加速度限幅 (rpm/s)", self.position_accel_limit_rpm_s),
+            ("采样时间 (s，200 Hz)", self.dt_pos),
+        ]))
+        self.set_formula(_POSITION_FORMULA)
+
+    def values(self) -> dict:
+        values = super().values()
+        values.update({
+            "kp_pos": self.kp_pos.value(),
+            "kd_pos": self.kd_pos.value(),
+            "kpf_pos": self.kpf_pos.value(),
+            "position_ff_lpf_hz": self.ff_lpf_hz.value(),
+            "position_speed_limit_rpm": self.position_speed_limit_rpm.value(),
+            "position_accel_limit_rpm_s": self.position_accel_limit_rpm_s.value(),
+            "pos_sample_time": self.dt_pos.value(),
+        })
+        return values
 
 
 # ─── 速度开环 / 电流闭环调试 ───────────────────────────────
@@ -201,13 +310,17 @@ class OpenLoopPanel(_FormulaPanel):
         self.kp_cur = _dspin(0, 10000, 2323, 0)
         self.ki_cur = _dspin(0, 10000, 2077, 0)
         self.ramp_ms = _dspin(100, 5000, 500, 0, 100)
-        self.form.addRow("Iqref (A)", self.iq_ref)
-        self.form.addRow("电流环 Kpi（下位机整数）", self.kp_cur)
-        self.form.addRow("电流环 Kii（下位机整数）", self.ki_cur)
+        self.iq_ref.setToolTip("电流环测试模式允许范围：-1.5～1.5 A")
+        for gain in (self.kp_cur, self.ki_cur):
+            gain.setToolTip("允许范围：0～10000；运行中单次热更新不得超过当前值±10%")
+        self.ramp_ms.setToolTip("允许范围：100～5000 ms")
+        self.form.addRow("Iqref (A)", _field_with_range(self.iq_ref))
+        self.form.addRow("电流环 Kpi", _field_with_range(self.kp_cur))
+        self.form.addRow("电流环 Kii", _field_with_range(self.ki_cur))
         period = QLabel("62.5 µs（16 kHz，每个PWM周期执行一次）")
         period.setStyleSheet("color: #4fc3f7; font-weight: bold;")
         self.form.addRow("电流环控制周期", period)
-        self.form.addRow("Iq 斜坡时间 (ms)", self.ramp_ms)
+        self.form.addRow("Iq 斜坡时间 (ms)", _field_with_range(self.ramp_ms))
         self.set_formula(_OPENLOOP_FORMULA)
 
     def values(self) -> dict:

@@ -28,7 +28,8 @@ class SerialComm(BaseComm):
 
     def open(self, port: str = "COM1", baudrate: int = 115200,
              bytesize: int = 8, stopbits: str = "1",
-             parity: str = "无", timeout: float = 1.0, **_) -> bool:
+             parity: str = "无", timeout: float = 1.0,
+             write_timeout: float = 0.5, **_) -> bool:
         if not _SERIAL_OK:
             raise RuntimeError("未安装 pyserial，无法使用串口通信")
         import serial as _s
@@ -39,6 +40,8 @@ class SerialComm(BaseComm):
             stopbits=float(stopbits),
             parity=_PARITY_MAP.get(parity, "N"),
             timeout=float(timeout),
+            # CH340/USB串口失效时不能让心跳写入永久阻塞轮询线程。
+            write_timeout=max(0.05, float(write_timeout)),
         )
         return self._ser.is_open
 

@@ -5,11 +5,13 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 import pytest
 from PySide6.QtWidgets import QApplication, QMessageBox
 
+import time
+
 from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import decode_frame
 from config.config import CMD_RESET_FAULT, CMD_START
 from core import RuntimeState, RuntimeStateMachine, TransitionError
-from pages.control_page import ControlPage
+from pages.control_page import ControlPage, firmware_runtime_payload
 from pages.experiment_page import ExperimentPage
 
 
@@ -40,6 +42,18 @@ def test_完整正常运行状态路径():
         RuntimeState.RUNNING, RuntimeState.STOPPING, RuntimeState.READY,
     ]
     assert len(transitions) == 6
+
+
+def test_设备离开RUN先进入STOPPING而非直接READY():
+    machine = RuntimeStateMachine()
+    _make_ready(machine)
+    machine.confirm_started()
+
+    machine.observe_device_stopping("MCSDK STOP")
+
+    assert machine.state is RuntimeState.STOPPING
+    machine.observe_device_stopped("MCSDK IDLE")
+    assert machine.state is RuntimeState.READY
 
 
 def test_非法转换被拒绝且状态不变():
@@ -148,6 +162,7 @@ def test_启动前用已停机遥测修复残留RUNNING(monkeypatch):
     frame.speed_target = 0.0
     frame.speed_actual = 0.0
     comm._latest_frame = frame
+    comm._last_valid_at = time.monotonic()
     monkeypatch.setattr(comm, "is_connected", lambda: True)
     monkeypatch.setattr(comm, "send_frame", lambda _data: True)
     machine = RuntimeStateMachine()
@@ -159,6 +174,101 @@ def test_启动前用已停机遥测修复残留RUNNING(monkeypatch):
 
     assert machine.state is RuntimeState.RUNNING
     assert any("修复残留运行状态" in item.reason for item in machine.history)
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
+def test_过期遥测不能修复残留RUNNING(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    frame = TelemetryFrame()
+    frame.mc_state = 0
+    frame.fault_code = 0
+    frame.speed_target = 0.0
+    frame.speed_actual = 0.0
+    comm._latest_frame = frame
+    comm._last_valid_at = 0.0
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(comm, "send_frame", lambda _data: True)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: None)
+    machine = RuntimeStateMachine()
+    _make_ready(machine)
+    machine.confirm_started("test")
+    page = ControlPage(comm, machine)
+
+    page._on_start()
+
+    assert machine.state is RuntimeState.RUNNING
+    assert not any("修复残留运行状态" in item.reason for item in machine.history)
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
+def test_位置三环参数帧不超过固件旧拷贝缓冲():
+    payload = firmware_runtime_payload({
+        "control_mode": "position_closed",
+        "target": 0.0,
+        "max_rpm": 4000,
+        "max_current_a": 1.887,
+        "iq_max": 1.887,
+        "kp_spd": 1752.0,
+        "ki_spd": 121.0,
+        "kp_cur": 2323.0,
+        "ki_cur": 2077.0,
+        "position_target_deg": 60.0,
+        "kp_pos": 8.0,
+        "kd_pos": 0.2,
+        "kpf_pos": 0.0,
+        "position_ff_lpf_hz": 8.0,
+        "position_speed_limit_rpm": 300.0,
+        "position_accel_limit_rpm_s": 60.0,
+        "motor": "永磁同步电机(PMSM)",
+        "mode": "位置三环控制",
+        "kp": 1752.0,
+        "sample_time": 0.002,
+    })
+    assert len(payload) < 384
+    assert b"control_mode=position_closed" in payload
+    assert b"position_target_deg=60" in payload
+    assert b"kd_pos=0.2" in payload
+    assert b"position_accel_limit_rpm_s=60" in payload
+    assert b"ki_pos=" not in payload
+    assert "永磁".encode("utf-8") not in payload
+    assert b"sample_time=" not in payload
+
+
+def test_位置三环真实v2启动只发START不夹带遥测配置(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    sent = []
+    pending = {"count": 0}
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(
+        comm, "protocol_status",
+        lambda: {"mode": "negotiated-v2", "pending_ack": pending["count"]})
+
+    def send(data):
+        sent.append(data)
+        pending["count"] += 1
+        return False
+
+    monkeypatch.setattr(comm, "send_frame", send)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: None)
+    machine = RuntimeStateMachine()
+    _make_ready(machine)
+    page = ControlPage(comm, machine)
+    page._select_mode("位置三环控制")
+    page._target_position.setValue(60.0)
+
+    page._on_start()
+
+    commands = [decode_frame(data)[0] for data in sent]
+    assert commands == [CMD_START]
+    start_payload = decode_frame(sent[-1])[1]
+    assert b"position_closed" in start_payload
+    assert b"position_target_deg=60" in start_payload
     page.close()
     page.deleteLater()
     app.processEvents()

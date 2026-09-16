@@ -111,6 +111,12 @@ class ProtocolSession:
         return next((sequence for sequence, item in self._pending.items()
                      if item[0] == command), None)
 
+    def drop_pending_for(self, command: int) -> None:
+        """丢弃指定在途命令，不把会话打成失效。解码器复位时清心跳用。"""
+        sequence = self.pending_sequence_for(command)
+        if sequence is not None:
+            self._pending.pop(sequence, None)
+
     def invalidate(self, reason: str) -> list[CommandResult]:
         """会话丢失：清理全部待应答命令并返回明确失败结果。"""
         self.session_lost_reason = reason

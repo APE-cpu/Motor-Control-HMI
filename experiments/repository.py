@@ -30,6 +30,8 @@ TELEMETRY_FIELDS = (
     "convergence",
     "low_speed_warn",
     "fault_code",
+    "fault_history_code",
+    "fault_history_text",
     "fault_text",
     "data_source",
 )
@@ -168,7 +170,7 @@ class ExperimentRepository:
             return []
         numeric = set(TELEMETRY_FIELDS) - {
             "timestamp", "bus_state", "sensor_source", "low_speed_warn",
-            "fault_text", "data_source",
+            "fault_text", "fault_history_text", "data_source",
         }
         rows: list[dict[str, Any]] = []
         with open(path, "r", encoding="utf-8-sig", newline="") as stream:

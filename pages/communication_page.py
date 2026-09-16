@@ -34,6 +34,27 @@ from runtime_paths import writable_path
 _COMM_CFG_FILE = writable_path("config", "comm_config.json")
 
 
+def _firmware_description(firmware: str) -> str:
+    """Return a concise, user-visible description of the reported firmware.
+
+    The firmware identity is supplied by the v2 CAPABILITIES handshake.
+    """
+    if not firmware or firmware == "—":
+        return "连接后读取；版本号相同不等于构建内容完全相同。"
+    if firmware == "0.7.5-faulthistory":
+        return (
+            "故障历史锁存版：包含 V2 跑飞/反转/通信保护与 F3 在线 RLS 辨识；"
+            "当前工作区同版本还修复 TCP 高速 F1 挤占队列导致 F3 不出帧的问题，"
+            "需重新烧录最新 HEX 才会生效。"
+        )
+    if firmware == "0.7.6-rls-si":
+        return (
+            "RLS物理量版：Id/Iq以A、Vd/Vq以V参与辨识，电压换算使用"
+            "实时滤波母线电压；含非零电机参数初值与F3 SI系数上报。"
+        )
+    return "未登记的固件标识；请核对源码版本与实际烧录的 HEX。"
+
+
 def _protocol_doc() -> str:
     """从 config 常量生成下位机对接协议速查文本（常量改动自动同步）。"""
     return f"""\
@@ -91,8 +112,9 @@ def _protocol_doc() -> str:
 
 【五、以太网 TCP】
 
-  STM32 作为服务端监听 5000；上位机作为客户端主动连接板卡 IP。
-  TCP 直接承载 v2 帧，支持握手、命令 ACK 和遥测解析。
+  方案一（推荐真机）：RS-485/串口走 HELLO、START/STOP、ACK、心跳；
+  以太网 5000 只发 JSON/F1/F2 波形。两条物理链路，互不抢发送缓冲。
+  通信类型选「RS-485+以太网」。仅串口时仍可控制，无高速波形。
 
 【六、下位机侧参考实现】
 
@@ -302,6 +324,50 @@ class _TcpPanel(QWidget):
         }
 
 
+class _SplitPanel(QWidget):
+    """RS-485/串口控制 + 以太网波形。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        root = QVBoxLayout(self)
+        root.setContentsMargins(0, 0, 0, 0)
+        hint = QLabel("命令/心跳走 485（115200），电流波形走以太网。以太网断了电机仍可启停。")
+        hint.setWordWrap(True)
+        hint.setStyleSheet("color:#90a4ae;")
+        root.addWidget(hint)
+        self._serial = _SerialPanel()
+        self._serial.baud.setCurrentText("115200")
+        self._tcp = _TcpPanel()
+        serial_box = QGroupBox("RS-485 控制")
+        sl = QVBoxLayout(serial_box)
+        sl.addWidget(self._serial)
+        tcp_box = QGroupBox("以太网波形")
+        tl = QVBoxLayout(tcp_box)
+        tl.addWidget(self._tcp)
+        root.addWidget(serial_box)
+        root.addWidget(tcp_box)
+        # load_cfg 用属性名找控件
+        self.port = self._serial.port
+        self.baud = self._serial.baud
+        self.databits = self._serial.databits
+        self.stopbits = self._serial.stopbits
+        self.parity = self._serial.parity
+        self.timeout = self._serial.timeout
+        self.host = self._tcp.host
+        self.tcp_port = self._tcp.port
+        self.local_host = self._tcp.local_host
+        self.tcp_timeout = self._tcp.timeout
+
+    def cfg(self) -> dict:
+        cfg = self._serial.cfg()
+        tcp = self._tcp.cfg()
+        cfg["host"] = tcp["host"]
+        cfg["tcp_port"] = tcp["port"]
+        cfg["tcp_timeout"] = tcp["timeout"]
+        cfg["local_host"] = tcp["local_host"]
+        return cfg
+
+
 class CommunicationPage(QWidget):
     def __init__(self, comm: CommManager) -> None:
         super().__init__()
@@ -341,10 +407,12 @@ class CommunicationPage(QWidget):
         self._serial_panel2 = _SerialPanel()
         self._can_panel = _CanPanel()
         self._tcp_panel = _TcpPanel()
+        self._split_panel = _SplitPanel()
         self._stack.addWidget(self._serial_panel)   # idx 0 -> RS-232
         self._stack.addWidget(self._serial_panel2)  # idx 1 -> RS-485
         self._stack.addWidget(self._can_panel)      # idx 2 -> CAN
         self._stack.addWidget(self._tcp_panel)      # idx 3 -> TCP
+        self._stack.addWidget(self._split_panel)    # idx 4 -> RS-485+以太网
         pv.addWidget(self._stack)
         root.addWidget(param_box)
 
@@ -378,6 +446,9 @@ class CommunicationPage(QWidget):
         self._session_state = QLabel("未激活")
         self._session_device = QLabel("—")
         self._session_version = QLabel("—")
+        self._session_description = QLabel(_firmware_description(""))
+        self._session_description.setWordWrap(True)
+        self._session_description.setStyleSheet("color: #8fa3b8;")
         self._session_expected_identity = QLabel("未配置")
         self._session_expected_identity.setWordWrap(True)
         self._session_identity_verdict = QLabel("未启用白名单")
@@ -390,6 +461,7 @@ class CommunicationPage(QWidget):
         sf.addRow("会话状态", self._session_state)
         sf.addRow("设备身份", self._session_device)
         sf.addRow("协议/固件", self._session_version)
+        sf.addRow("固件说明", self._session_description)
         sf.addRow("期望身份白名单", self._session_expected_identity)
         sf.addRow("身份验证", self._session_identity_verdict)
         sf.addRow("待ACK命令", self._session_pending)
@@ -454,7 +526,7 @@ class CommunicationPage(QWidget):
         self._tele_level = QComboBox()
         self._tele_level.addItem("省流·安全（最稳，只留相电流）", "eco")
         self._tele_level.addItem("标准（默认：相电流 + 采样诊断）", "std")
-        self._tele_level.addItem("辨识（开在线RLS，相电流降速给心跳腾队列）", "id")
+        self._tele_level.addItem("辨识（开在线RLS，相电流保持链路全速）", "id")
         self._tele_level.addItem("自定义", "custom")
         self._tele_level.setCurrentIndex(1)   # 标准 = 固件默认
         self._tele_level.currentIndexChanged.connect(self._on_tele_changed)
@@ -511,7 +583,9 @@ class CommunicationPage(QWidget):
         if key == "std":
             return 0x01, 0, 20, 100
         if key == "id":
-            return 0x03, 5, 20, 100
+            # 辨识不能牺牲电流波形采样率：0 表示使用当前传输链路默认值，
+            # TCP 为 1 kHz，串口为 200 Hz；F3 仍以 10 Hz 独立发送。
+            return 0x03, 0, 20, 100
         flags = ((0x01 if self._tele_f2_on.isChecked() else 0) |
                  (0x02 if self._tele_f3_on.isChecked() else 0))
         return (flags, int(self._tele_f1.currentData()),
@@ -569,8 +643,8 @@ class CommunicationPage(QWidget):
 
         # F3: RLS在线辨识 (2~10Hz, 阻抗)
         f3 = QLabel(
-            "🔹 <b>F3 RLS辨识</b> | 2~10 Hz | 8字节 (档位可关)\n"
-            "   dq轴阻抗 Rd/Rq (float32×2, 单位Ω)\n"
+            "🔹 <b>F3 RLS辨识</b> | 2~10 Hz | 72字节载荷 (档位可关)\n"
+            "   dq轴 ARX 系数、创新量、协方差、更新计数及反解的 Ld/Lq/Rd/Rq\n"
             "   <i>固件16kHz RLS递推实时估计；用于参数自适应与热态监测</i>")
         f3.setWordWrap(True)
         v.addWidget(f3)
@@ -612,7 +686,7 @@ class CommunicationPage(QWidget):
 
     # ------- slots -------
     def _on_kind_changed(self, idx: int) -> None:
-        # idx: 0=RS-232, 1=RS-485, 2=CAN, 3=TCP
+        # idx: 0=RS-232, 1=RS-485, 2=CAN, 3=TCP, 4=RS-485+以太网
         self._stack.setCurrentIndex(idx)
 
     def _on_protocol_mode_changed(self, _idx: int) -> None:
@@ -624,7 +698,8 @@ class CommunicationPage(QWidget):
             self._status_label.setToolTip("virtual-v2 不打开真实端口，仅用于协议联调")
         elif mode == "negotiated-v2":
             self._status_label.setToolTip(
-                "真实串口/TCP必须完成v2握手；经典CAN尚未定义分片协议")
+                "真实串口/TCP必须完成v2握手；经典CAN尚未定义分片协议。"
+                "RS-485+以太网时命令走串口、波形走网口")
         else:
             self._status_label.setToolTip("")
 
@@ -636,7 +711,9 @@ class CommunicationPage(QWidget):
             return self._serial_panel2.cfg()
         if idx == 2:
             return self._can_panel.cfg()
-        return self._tcp_panel.cfg()
+        if idx == 3:
+            return self._tcp_panel.cfg()
+        return self._split_panel.cfg()
 
     def _on_connect(self) -> None:
         if self._protocol_mode.currentData() == "virtual-v2":
@@ -659,8 +736,20 @@ class CommunicationPage(QWidget):
         self._comm.disconnect()
 
     def _on_save_cfg(self) -> None:
-        cfg = {"kind": self._kind.currentText(), "params": self._current_cfg(),
-               "protocol_mode": self._protocol_mode.currentData()}
+        cfg = {
+            "kind": self._kind.currentText(),
+            "params": self._current_cfg(),
+            "protocol_mode": self._protocol_mode.currentData(),
+            # 避免重启上位机后从“辨识”静默退回“标准”，导致 F3 无波形。
+            "telemetry_level": self._tele_level.currentData(),
+            "telemetry_custom": {
+                "f1_ms": int(self._tele_f1.currentData()),
+                "f2_enabled": self._tele_f2_on.isChecked(),
+                "f2_ms": int(self._tele_f2.currentData()),
+                "f3_enabled": self._tele_f3_on.isChecked(),
+                "f3_ms": int(self._tele_f3.currentData()),
+            },
+        }
         try:
             with open(_COMM_CFG_FILE, "w", encoding="utf-8") as f:
                 json.dump(cfg, f, ensure_ascii=False, indent=2)
@@ -681,7 +770,8 @@ class CommunicationPage(QWidget):
             if idx >= 0:
                 self._kind.setCurrentIndex(idx)
             params = cfg.get("params", {})
-            panel = [self._serial_panel, self._serial_panel2, self._can_panel, self._tcp_panel][self._kind.currentIndex()]
+            panel = [self._serial_panel, self._serial_panel2, self._can_panel,
+                     self._tcp_panel, self._split_panel][self._kind.currentIndex()]
             aliases = {"baudrate": "baud", "bytesize": "databits"}
             for key, val in params.items():
                 w = getattr(panel, aliases.get(key, key), None)
@@ -693,6 +783,23 @@ class CommunicationPage(QWidget):
                     w.setCurrentText(str(val))
                 elif hasattr(w, "setText"):
                     w.setText(str(val))
+            custom = cfg.get("telemetry_custom", {})
+            for combo, key in ((self._tele_f1, "f1_ms"),
+                               (self._tele_f2, "f2_ms"),
+                               (self._tele_f3, "f3_ms")):
+                if key in custom:
+                    tele_idx = combo.findData(int(custom[key]))
+                    if tele_idx >= 0:
+                        combo.setCurrentIndex(tele_idx)
+            if "f2_enabled" in custom:
+                self._tele_f2_on.setChecked(bool(custom["f2_enabled"]))
+            if "f3_enabled" in custom:
+                self._tele_f3_on.setChecked(bool(custom["f3_enabled"]))
+            tele_idx = self._tele_level.findData(
+                cfg.get("telemetry_level", "std"))
+            if tele_idx >= 0:
+                self._tele_level.setCurrentIndex(tele_idx)
+            self._update_tele_hint()
             if not silent:
                 self._append_log("[状态] 通信配置已加载")
         except FileNotFoundError:
@@ -780,7 +887,8 @@ class CommunicationPage(QWidget):
                     f"母线={values.get('vdc', '—')} V，"
                     f"温度={temperature_text}，"
                     f"温度ADC={values.get('temperature_adc', '—')}，"
-                    f"故障={values.get('fault_code', '—')}")
+                    f"当前故障={values.get('fault_code', '—')}，"
+                    f"历史故障={values.get('fault_history_code', '—')}")
             except (UnicodeDecodeError, json.JSONDecodeError):
                 self._append_log("[接收] 遥测帧（JSON无效）")
         elif frame.message_type is MessageType.ACK:
@@ -810,6 +918,7 @@ class CommunicationPage(QWidget):
             "ready": "READY（握手完成）",
             "hello_sent": "HELLO_SENT",
             "incompatible": "INCOMPATIBLE",
+            "idle": "IDLE（会话失效，串口/网口可能仍打开）",
             "not_active": "未激活",
         }.get(state, state))
         device = status.get("device_id") or "—"
@@ -819,6 +928,7 @@ class CommunicationPage(QWidget):
         firmware = status.get("firmware_version") or "—"
         self._session_version.setText(
             f"v{version} / 固件 {firmware}" if version is not None else "—")
+        self._session_description.setText(_firmware_description(firmware))
         expected = status.get("expected_identity", {})
         policy_active = bool(status.get("identity_policy_active"))
         if policy_active:

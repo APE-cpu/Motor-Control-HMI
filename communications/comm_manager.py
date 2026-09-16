@@ -42,6 +42,33 @@ from .protocol_v2 import (
 from .v2_virtual_device import V2VirtualDevice
 
 
+_MOTOR_FAULT_NAMES = (
+    (0x0001, "FOC执行超时(MC_FOC_DURATION)"),
+    (0x0002, "母线过压(MC_OVER_VOLT)"),
+    (0x0004, "母线欠压(MC_UNDER_VOLT)"),
+    (0x0008, "电机过温(MC_OVER_TEMP)"),
+    (0x0010, "启动失败(MC_START_UP)"),
+    (0x0020, "速度反馈故障(MC_SPEED_FDBK)"),
+    (0x0040, "BREAK输入/硬件过流(MC_BREAK_IN)"),
+    (0x0080, "MCSDK软件错误(MC_SW_ERROR)"),
+    (0x4000, "V2控制链路看门狗"),
+    (0x8000, "V2超速/跑飞保护"),
+)
+
+
+def decode_motor_fault_code(code: int) -> str:
+    """把F407/MCSDK故障位图展开；未知位仍以十六进制保留。"""
+    value = int(code) & 0xFFFF
+    names = [name for bit, name in _MOTOR_FAULT_NAMES if value & bit]
+    known_mask = 0
+    for bit, _name in _MOTOR_FAULT_NAMES:
+        known_mask |= bit
+    unknown = value & ~known_mask
+    if unknown:
+        names.append(f"未知故障位0x{unknown:04X}")
+    return "；".join(names)
+
+
 class TelemetryFrame:
     """一帧遥测数据（监控页面消费）。"""
 
@@ -62,13 +89,26 @@ class TelemetryFrame:
         "low_speed_warn",  # 低速段是否进入不可用区
         "fault_code",      # 下位机故障位掩码；0 表示无锁定故障
         "fault_text",      # 可读故障原因
+        "fault_history_code", # 本次/上次运行已发生故障的OR锁存位图
+        "fault_history_text", # 历史故障位图的可读展开，不参与保护锁定
         "mc_state",        # MCSDK状态机原始值；0=IDLE, 6=RUN, 11=FAULT_OVER
+        "stop_reason",     # 最近一次运行的持久停机原因码
+        "stop_command",    # 触发停机前最后解码的v2命令
+        "stop_rx_age_ms",  # 停机瞬间距最后控制链路字节的时间
+        "stop_run_ms",     # 本次启动到停机的时间
         "max_rpm",         # 下位机实际采用的最高转速限制
         "current_limit_a", # 下位机实际采用的Iq限流
         "runaway_limit_rpm", # 当前动态跑飞阈值
         "phase_current_a", # 相电流幅值，区别于current_actual(q轴电流)
         "speed_kp",        # 下位机速度环实际Kp数字量
         "speed_ki",        # 下位机速度环实际Ki数字量
+        "position_actual_deg",  # 位置环反馈（机械角，相对启动捕获点）
+        "position_target_deg",  # 位置环目标（机械角）
+        "position_error_deg",   # 位置环误差
+        "position_trajectory_deg",  # 加减速受限的位置轨迹给定
+        "position_speed_target_rpm",  # 位置环输出的速度给定
+        "position_speed_ff_rpm",      # 速度前馈分量
+        "position_saturated",         # 位置环速度限幅是否动作
         "data_source",     # "sim" / "real" / "real_partial"
     )
 
@@ -91,27 +131,40 @@ class TelemetryFrame:
         self.low_speed_warn = False
         self.fault_code = 0
         self.fault_text = ""
+        self.fault_history_code = 0
+        self.fault_history_text = ""
         self.mc_state = 0
+        self.stop_reason = 0
+        self.stop_command = 0
+        self.stop_rx_age_ms = 0
+        self.stop_run_ms = 0
         self.max_rpm = 0.0
         self.current_limit_a = 0.0
         self.runaway_limit_rpm = 0.0
         self.phase_current_a = 0.0
         self.speed_kp = 0
         self.speed_ki = 0
+        self.position_actual_deg = 0.0
+        self.position_target_deg = 0.0
+        self.position_error_deg = 0.0
+        self.position_trajectory_deg = 0.0
+        self.position_speed_target_rpm = 0.0
+        self.position_speed_ff_rpm = 0.0
+        self.position_saturated = False
         self.data_source = "sim"
 
 
 class CommManager(QObject):
     """通信管理器（线程安全），通过 Qt 信号将数据推给 UI。"""
 
-    # Heartbeat cadence must stay well inside the device PC-link watchdog
-    # (firmware 0.4.5: 15 s RX silence after a 3 s start arm).  ACK timeout
-    # used to be 3 s and false-killed the session whenever high-rate F1
-    # telemetry crowded the device TX queue and dropped a single heartbeat
-    # ACK; the motor then lost host traffic and tripped COMM_LOSS.  Keep
-    # heartbeats frequent, but tolerate multi-second ACK / telemetry gaps.
+    # Host heartbeat is only a liveness display.  Missing ACK must not tear
+    # down the negotiated session or stop host TX: the F407 already has a
+    # 15 s PC-link watchdog and will stop the motor itself if RX really dies.
     _V2_HEARTBEAT_INTERVAL_S = 0.5
     _V2_HEARTBEAT_ACK_TIMEOUT_S = 8.0
+    # 四个连续心跳周期都没有任何控制面有效帧时先报警。这里只提示，
+    # 不拆会话；下位机仍保留15秒独立看门狗作为最终安全边界。
+    _V2_CONTROL_RX_WARN_S = 2.0
     _V2_TELEMETRY_LIVENESS_S = 3.0
 
     statusChanged = Signal(bool, str)        # 连接状态 + 备注
@@ -130,6 +183,7 @@ class CommManager(QObject):
     def __init__(self) -> None:
         super().__init__()
         self._driver: Optional[BaseComm] = None
+        self._telem_driver: Optional[BaseComm] = None
         self._kind: str = ""
         self._cfg: dict = {}
         self._stop = threading.Event()
@@ -143,6 +197,7 @@ class CommManager(QObject):
         self._consecutive_read_errors = 0
         self._poll_started_at = 0.0
         self._last_valid_at = 0.0
+        self._last_control_valid_at = 0.0
         self._reported_faults: set[str] = set()
         self._protocol_mode = "legacy-v1"
         self._v2_session: ProtocolSession | None = None
@@ -153,9 +208,13 @@ class CommManager(QObject):
         self._v2_pending_legacy: dict[int, bytes] = {}
         self._v2_last_heartbeat_at = 0.0
         self._v2_heartbeat_ack_warned_at = 0.0
+        self._v2_decoder_resync_at = 0.0
+        self._heartbeat_missing = False
+        self._control_plane_warned = False
         self._v2_connection_lost_reported = False
         self._rx_backlog_warned_at = 0.0
         self._v2_stream_decoder: V2StreamDecoder | None = None
+        self._v2_telem_decoder: V2StreamDecoder | None = None
         self._protocol_stats = self._new_protocol_stats()
         self._expected_device_identity = {
             "device_id": "", "hardware_version": "", "firmware_prefix": "",
@@ -185,7 +244,8 @@ class CommManager(QObject):
     def connect_negotiated_v2(
             self, kind: str, *, address: int = 1,
             handshake_timeout_s: float = 1.5,
-            driver: BaseComm | None = None, **cfg) -> bool:
+            driver: BaseComm | None = None,
+            telem_driver: BaseComm | None = None, **cfg) -> bool:
         """在真实字节流驱动上建立v2会话；握手失败绝不降级到v1。
 
         ``driver`` 仅用于驱动级测试或外部适配器注入。经典CAN在定义分片协议前
@@ -199,11 +259,28 @@ class CommManager(QObject):
         session = ProtocolSession(address=address)
         self._v2_session = session
         self._v2_stream_decoder = V2StreamDecoder()
+        self._v2_telem_decoder = None
         try:
             if kind == "CAN总线":
                 raise ProtocolV2Error(
                     "经典CAN暂不支持v2：必须先定义8字节分片与重组协议")
-            self._driver = driver or self._open_driver(kind, cfg)
+            if kind == "RS-485+以太网":
+                handshake_timeout_s = max(float(handshake_timeout_s), 4.0)
+                serial_cfg = {k: v for k, v in cfg.items()
+                              if k in ("port", "baudrate", "bytesize",
+                                       "stopbits", "parity", "timeout")}
+                if driver is None:
+                    if not str(serial_cfg.get("port", "")).strip():
+                        raise ProtocolV2Error("未选择 RS-485/串口 COM 口")
+                    self._driver = self._open_driver("RS-485", serial_cfg)
+                    self.logMessage.emit(
+                        f"[状态] 串口控制已打开 {serial_cfg.get('port')} "
+                        f"{serial_cfg.get('baudrate')}bps")
+                else:
+                    self._driver = driver
+                    self.logMessage.emit("[状态] 串口控制已打开（注入驱动）")
+            else:
+                self._driver = driver or self._open_driver(kind, cfg)
             if driver is not None and not driver.is_open():
                 driver.open(**cfg)
 
@@ -235,9 +312,44 @@ class CommManager(QObject):
             now = time.monotonic()
             self._v2_last_heartbeat_at = now
             self._last_valid_at = now
+            self._last_control_valid_at = now
             self._v2_heartbeat_ack_warned_at = 0.0
+            self._v2_decoder_resync_at = 0.0
+            self._heartbeat_missing = False
+            self._control_plane_warned = False
             self._v2_connection_lost_reported = False
             self._protocol_stats["handshakes"] += 1
+            if kind == "RS-485+以太网" and self._telem_driver is None:
+                if telem_driver is not None:
+                    if not telem_driver.is_open():
+                        telem_driver.open(
+                            host=str(cfg.get("host", "192.168.1.50")),
+                            port=int(cfg.get("tcp_port", 5000)),
+                            timeout=float(cfg.get("tcp_timeout", 2.0)),
+                            local_host=str(cfg.get("local_host", "")),
+                        )
+                    self._telem_driver = telem_driver
+                    self._v2_telem_decoder = V2StreamDecoder()
+                    self.logMessage.emit("[状态] 以太网波形已连接（测试/注入驱动）")
+                else:
+                    try:
+                        telem = TCPComm()
+                        telem.open(
+                            host=str(cfg.get("host", "192.168.1.50")),
+                            port=int(cfg.get("tcp_port", 5000)),
+                            timeout=float(cfg.get("tcp_timeout", 2.0)),
+                            local_host=str(cfg.get("local_host", "")),
+                        )
+                        self._telem_driver = telem
+                        self._v2_telem_decoder = V2StreamDecoder()
+                        self.logMessage.emit(
+                            f"[状态] 以太网波形已连接 {cfg.get('host')}:"
+                            f"{cfg.get('tcp_port', 5000)}")
+                    except Exception as telem_exc:
+                        self._telem_driver = None
+                        self._v2_telem_decoder = None
+                        self.logMessage.emit(
+                            f"[警告] 以太网波形未连接（{telem_exc}），仅串口控制可用")
             self._stop.clear()
             self._thread = threading.Thread(
                 target=self._real_v2_poll_loop, daemon=True)
@@ -258,6 +370,13 @@ class CommManager(QObject):
                 except Exception:
                     pass
             self._driver = None
+            if self._telem_driver is not None:
+                try:
+                    self._telem_driver.close()
+                except Exception:
+                    pass
+                self._telem_driver = None
+            self._v2_telem_decoder = None
             self.logMessage.emit(f"[错误] negotiated-v2连接失败：{exc}；未降级到v1")
             self.statusChanged.emit(False, str(exc))
             self._emit_protocol_snapshot()
@@ -286,6 +405,9 @@ class CommManager(QObject):
             self._v2_device = virtual
             self._v2_now = 0.0
             self._v2_last_heartbeat_at = 0.0
+            self._last_control_valid_at = 0.0
+            self._heartbeat_missing = False
+            self._control_plane_warned = False
             self._v2_connection_lost_reported = False
             self._protocol_stats["handshakes"] += 1
             self._motor_sim.reset()
@@ -318,13 +440,23 @@ class CommManager(QObject):
             except Exception as exc:
                 self.logMessage.emit(f"[错误] 关闭失败：{exc}")
         self._driver = None
+        if self._telem_driver is not None:
+            try:
+                self._telem_driver.close()
+            except Exception:
+                pass
+            self._telem_driver = None
         self._v2_session = None
         self._v2_device = None
         self._v2_stream_decoder = None
+        self._v2_telem_decoder = None
         self._protocol_mode = "legacy-v1"
         self._last_command_result = None
         self._v2_pending_legacy.clear()
         self._rx_buf.clear()
+        self._last_control_valid_at = 0.0
+        self._heartbeat_missing = False
+        self._control_plane_warned = False
         self._emit_protocol_snapshot()
         self.statusChanged.emit(False, "已断开")
 
@@ -368,7 +500,20 @@ class CommManager(QObject):
                 self._protocol_mode == "negotiated-v2" and caps is not None and
                 policy_active and not identity_error),
             "identity_mismatch_reason": identity_error,
+            "heartbeat_missing": bool(
+                session is not None and
+                session.state is ProtocolSessionState.READY and
+                self._heartbeat_missing),
+            "control_rx_age_s": (
+                max(0.0, time.monotonic() - self._last_control_valid_at)
+                if self._last_control_valid_at > 0.0 else float("inf")),
         }
+
+    def telemetry_age_s(self) -> float:
+        """Seconds since the last valid v2 frame. inf if none received yet."""
+        if self._last_valid_at <= 0.0:
+            return float("inf")
+        return max(0.0, time.monotonic() - self._last_valid_at)
 
     def configure_expected_device_identity(
             self, device_id: str = "", hardware_version: str = "",
@@ -436,16 +581,34 @@ class CommManager(QObject):
         cmd, payload = decoded
         if cmd == CMD_START:
             target = None
+            position_mode = False
+            position_target = 0.0
+            params = {}
             try:
                 text = payload.decode("utf-8")
                 for part in text.split(";"):
-                    if part.startswith("target="):
-                        target = float(part.split("=", 1)[1])
+                    if "=" not in part:
+                        continue
+                    key, value = part.split("=", 1)
+                    if key == "target":
+                        target = float(value)
+                    elif key == "control_mode":
+                        position_mode = value == "position_closed"
+                    elif key == "position_target_deg":
+                        position_target = float(value)
+                    elif key in {"kp_pos", "kd_pos", "kpf_pos",
+                                  "position_ff_lpf_hz", "position_speed_limit_rpm",
+                                  "position_accel_limit_rpm_s",
+                                  "position_speed_ff_rpm"}:
+                        params[key] = float(value)
             except Exception:
                 pass
-            self._motor_sim.start(target)
+            self._motor_sim.start(target, position_mode=position_mode,
+                                   position_target_deg=position_target, **params)
             self.logMessage.emit(
-                f"[仿真] 虚拟电机启动，目标转速 {self._motor_sim.speed_ref_rpm:.0f} rpm")
+                (f"[仿真] 虚拟电机启动，目标位置 {position_target:.2f}°"
+                 if position_mode else
+                 f"[仿真] 虚拟电机启动，目标转速 {self._motor_sim.speed_ref_rpm:.0f} rpm"))
         elif cmd == CMD_STOP:
             self._motor_sim.stop()
             self.logMessage.emit("[仿真] 虚拟电机停止（滑行）")
@@ -461,8 +624,19 @@ class CommManager(QObject):
                     self._motor_sim.speed_ref_rpm = float(params["target"])
                     self.logMessage.emit(
                         f"[仿真] 在线目标转速已设为 {self._motor_sim.speed_ref_rpm:.0f} rpm")
-                else:
-                    self.logMessage.emit("[仿真] 参数已接收（无target字段）")
+                if "control_mode" in params and params["control_mode"] == "position_closed":
+                    self._motor_sim.position_mode = True
+                if "position_target_deg" in params:
+                    self._motor_sim.set_position_target(float(params["position_target_deg"]))
+                self._motor_sim.configure_position_loop(**{
+                    k: float(v) for k, v in params.items()
+                    if k in {"kp_pos", "kd_pos", "kpf_pos",
+                             "position_ff_lpf_hz", "position_speed_limit_rpm",
+                             "position_accel_limit_rpm_s",
+                             "position_speed_ff_rpm"}
+                })
+                if "target" not in params:
+                    self.logMessage.emit("[仿真] 位置/控制参数已接收")
             except (UnicodeDecodeError, ValueError) as exc:
                 self.logMessage.emit(f"[仿真] 参数解析失败：{exc}")
                 return False
@@ -621,7 +795,8 @@ class CommManager(QObject):
         self.logMessage.emit(f"[状态] 真实v2命令等待ACK SEQ={request.sequence}")
         return False
 
-    def _process_v2_responses(self, responses: list[bytes]) -> list[object]:
+    def _process_v2_responses(
+            self, responses: list[bytes], *, source: str = "control") -> list[object]:
         outputs: list[object] = []
         for raw in responses:
             self._protocol_stats["rx_frames"] += 1
@@ -632,12 +807,18 @@ class CommManager(QObject):
                 self._protocol_stats["crc_or_frame_errors"] += 1
                 self.logMessage.emit(f"[错误] v2响应无效：{exc}")
                 continue
+            now = time.monotonic()
+            # 总链路活性用于遥测超时；控制面活性必须单独记账。混合通信下
+            # 以太网F1持续到达，不能再掩盖RS-485心跳ACK已经消失。
+            self._last_valid_at = now
+            if source == "control":
+                self._last_control_valid_at = now
+                if self._heartbeat_missing or self._control_plane_warned:
+                    self._heartbeat_missing = False
+                    self._control_plane_warned = False
+                    self.logMessage.emit("[状态] RS-485控制面已恢复")
             if frame.message_type is MessageType.TELEMETRY:
                 self._protocol_stats["telemetry_frames"] += 1
-                # 真机持续遥测本身就是比单独心跳ACK更强的在线证据。高速
-                # F1/F2/F3可能占满下位机很小的TCP发送队列，导致心跳ACK
-                # 被丢弃，但只要遥测仍在到达就不能误判会话/电机已经失联。
-                self._last_valid_at = time.monotonic()
                 if frame.command == 0xF1:
                     payload_length = len(frame.payload)
                     # 每样本字节数：22（含施加电压 Vd/Vq 和母线 Vbus）、16（仅相
@@ -660,7 +841,8 @@ class CommManager(QObject):
                     f1_ms = getattr(self, "_f1_period_ms", 0)
                     if not f1_ms:   # 传输默认：TCP 1ms(1kHz)，其它 5ms(200Hz)
                         f1_ms = 1 if (len(chunks) > 1 or
-                                      self._kind == "以太网TCP") else 5
+                                      self._kind in (
+                                          "以太网TCP", "RS-485+以太网")) else 5
                     rate_hz = max(1, round(1000.0 / f1_ms))
                     decoded_samples = []
                     for chunk in chunks:
@@ -735,7 +917,8 @@ class CommManager(QObject):
                     outputs.append(sample)
                     continue
                 if frame.command == 0xF3:
-                    # 在线ARX/RLS辨识系数（固件跑在原始s16单位）。每轴7维：
+                    # 在线ARX/RLS辨识系数。0.7.6-rls-si起为A/V物理量；
+                    # 旧固件仍是s16 digit，根据握手固件标识兼容换算。每轴7维：
                     # [a1,a2,a3, b0,b1(本轴电压), b0,b1(交叉轴电压)]。
                     if len(frame.payload) != 72:
                         self._protocol_stats["crc_or_frame_errors"] += 1
@@ -744,14 +927,20 @@ class CommManager(QObject):
                         "<IIff", frame.payload[:16])
                     theta_d = struct.unpack("<7f", frame.payload[16:44])
                     theta_q = struct.unpack("<7f", frame.payload[44:72])
-                    # raw→SI：a系数无标度直接用；b_SI = b_raw * I_LSB/V_LSB。
-                    i_lsb = (3.30 / 2) / (0.01 * 8.0) / 32767.0   # 6.2944e-4 A/digit
-                    v_lsb = 24.0 / (3 ** 0.5) / 32767.0           # 4.2288e-4 V/digit
-                    b2si = i_lsb / v_lsb
                     ts = 1.0 / 16000.0
                     a1_d, a1_q = theta_d[0], theta_q[0]
-                    b_dd0 = theta_d[3] * b2si      # d轴电流对d轴电压
-                    b_qq0 = theta_q[5] * b2si      # q轴电流对q轴电压
+                    caps = (self._v2_session.capabilities
+                            if self._v2_session is not None else None)
+                    firmware = caps.firmware_version if caps is not None else ""
+                    coeffs_are_si = firmware.startswith("0.7.6-rls-si")
+                    if coeffs_are_si:
+                        b_dd0 = theta_d[3]         # A/V，d轴电流对d轴电压
+                        b_qq0 = theta_q[5]         # A/V，q轴电流对q轴电压
+                    else:
+                        i_lsb = (3.30 / 2) / (0.01 * 8.0) / 32767.0
+                        v_lsb = 24.0 / (3 ** 0.5) / 32767.0
+                        b_dd0 = theta_d[3] * i_lsb / v_lsb
+                        b_qq0 = theta_q[5] * i_lsb / v_lsb
                     # 反解物理参数：L=Ts/b0，R=(1-a1)/b0_SI（a1受电流噪声影响大）
                     ld_est = ts / b_dd0 if b_dd0 > 1e-9 else float("nan")
                     lq_est = ts / b_qq0 if b_qq0 > 1e-9 else float("nan")
@@ -759,7 +948,10 @@ class CommManager(QObject):
                     rq_est = (1 - a1_q) / b_qq0 if b_qq0 > 1e-9 else float("nan")
                     sample = {
                         "tick_ms": tick_ms, "updates": updates,
-                        "innov_rms_digit": innov_rms, "p_trace": p_trace,
+                        "innov_rms_a": (innov_rms if coeffs_are_si
+                                        else float("nan")),
+                        "innov_rms_digit": (float("nan") if coeffs_are_si
+                                             else innov_rms),
                         "theta_d": theta_d, "theta_q": theta_q,
                         "a1_d": a1_d, "a1_q": a1_q,
                         "b_dd0_si": b_dd0, "b_qq0_si": b_qq0,
@@ -825,7 +1017,11 @@ class CommManager(QObject):
                 else:
                     self._protocol_stats["nacks"] += 1
                 if result.command == 0:  # HEARTBEAT
-                    if not result.success:
+                    if result.success:
+                        if self._heartbeat_missing:
+                            self._heartbeat_missing = False
+                            self.logMessage.emit("[状态] 会话心跳已恢复")
+                    else:
                         self._handle_v2_session_loss(
                             result.message or "设备心跳拒绝，可能已经重启")
                     outputs.append(result)
@@ -856,8 +1052,46 @@ class CommManager(QObject):
             "torque_actual", "torque_target", "angle_actual", "temperature",
             "vdc", "sensor_quality", "angle_raw", "convergence", "max_rpm",
             "current_limit_a", "runaway_limit_rpm", "phase_current_a",
+            "position_actual_deg", "position_target_deg", "position_error_deg",
+            "position_trajectory_deg",
+            "position_speed_target_rpm", "position_speed_ff_rpm",
         }
-        integer_fields = {"fault_code", "mc_state", "speed_kp", "speed_ki"}
+        integer_fields = {
+            "fault_code", "fault_history_code", "mc_state", "speed_kp", "speed_ki",
+            "stop_reason", "stop_command", "stop_rx_age_ms", "stop_run_ms",
+        }
+        # F407 uses signed centidegrees on the wire to avoid float formatting
+        # in the telemetry task; expose ordinary degrees to all UI pages.
+        for raw_field, field in {
+                "position_actual_cdeg": "position_actual_deg",
+                "position_target_cdeg": "position_target_deg",
+                "position_error_cdeg": "position_error_deg",
+                "position_trajectory_cdeg": "position_trajectory_deg"}.items():
+            if raw_field in values:
+                try:
+                    setattr(telemetry, field, float(values[raw_field]) / 100.0)
+                except (TypeError, ValueError) as exc:
+                    raise ProtocolV2Error(f"v2遥测字段{raw_field}类型无效") from exc
+        for raw_field, field in {
+                "position_speed_target_rpm": "position_speed_target_rpm",
+                "position_speed_ff_rpm": "position_speed_ff_rpm"}.items():
+            if raw_field in values:
+                try:
+                    setattr(telemetry, field, float(values[raw_field]))
+                except (TypeError, ValueError) as exc:
+                    raise ProtocolV2Error(f"v2遥测字段{raw_field}类型无效") from exc
+        def _parse_bool(value):
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)) and value in (0, 1):
+                return bool(value)
+            if isinstance(value, str) and value.strip().lower() in {
+                    "0", "1", "false", "true", "no", "yes"}:
+                return value.strip().lower() in {"1", "true", "yes"}
+            raise ValueError("布尔字段必须为0/1或true/false")
+
+        if "position_saturated" in values:
+            telemetry.position_saturated = _parse_bool(values["position_saturated"])
         for field in TelemetryFrame.__slots__:
             if field not in values:
                 continue
@@ -867,15 +1101,21 @@ class CommManager(QObject):
                     value = float(value)
                 elif field in integer_fields:
                     value = int(value)
-                elif field in {"low_speed_warn"}:
-                    value = bool(value)
-                elif field in {"sensor_source", "fault_text", "bus_state"}:
+                elif field in {"low_speed_warn", "position_saturated"}:
+                    value = _parse_bool(value)
+                elif field in {"sensor_source", "fault_text", "fault_history_text",
+                               "bus_state"}:
                     value = str(value)
                 elif field == "powers" and not isinstance(value, dict):
                     raise TypeError("powers必须为对象")
                 setattr(telemetry, field, value)
             except (TypeError, ValueError) as exc:
                 raise ProtocolV2Error(f"v2遥测字段{field}类型无效") from exc
+        telemetry.fault_history_text = decode_motor_fault_code(
+            telemetry.fault_history_code)
+        if (telemetry.fault_code and
+                telemetry.fault_text in {"", "MCSDK fault active"}):
+            telemetry.fault_text = decode_motor_fault_code(telemetry.fault_code)
         telemetry.data_source = (
             "sim" if self._protocol_mode == "virtual-v2" else "real")
         return telemetry
@@ -909,7 +1149,6 @@ class CommManager(QObject):
                         self._v2_pending_legacy.pop(result.sequence, None)
                         self._protocol_stats["timeouts"] += 1
                         if result.command == 0:
-                            self._handle_v2_session_loss("设备心跳ACK超时，会话已失效")
                             continue
                         self._last_command_result = result
                         self.commandResult.emit(result)
@@ -923,6 +1162,34 @@ class CommManager(QObject):
     def _emit_protocol_snapshot(self) -> None:
         self.protocolSessionChanged.emit(self.protocol_status())
 
+    def _physical_link_open(self) -> bool:
+        return self._driver is not None and self._driver.is_open()
+
+    def _note_heartbeat_missing(self) -> None:
+        """串口心跳写入失败时立即标记控制面缺失。"""
+        if self._heartbeat_missing:
+            return
+        self._heartbeat_missing = True
+        self.logMessage.emit("[警告] 会话心跳发送失败（串口写失败）")
+
+    def _update_control_plane_health(self, now: float) -> None:
+        """控制面无响应的早期告警；不改变协议会话或电机状态。"""
+        session = self._v2_session
+        if (session is None or
+                session.state is not ProtocolSessionState.READY or
+                self._last_control_valid_at <= 0.0):
+            return
+        age = max(0.0, now - self._last_control_valid_at)
+        if age < self._V2_CONTROL_RX_WARN_S:
+            return
+        self._heartbeat_missing = True
+        if not self._control_plane_warned:
+            self._control_plane_warned = True
+            self.logMessage.emit(
+                f"[警告] RS-485控制面已 {age:.1f} 秒无有效帧；"
+                "以太网遥测在线不代表控制链路在线，设备将在15秒空窗后安全停机")
+            self._emit_protocol_snapshot()
+
     def _handle_v2_session_loss(self, reason: str) -> None:
         if self._v2_connection_lost_reported or self._v2_session is None:
             return
@@ -933,8 +1200,29 @@ class CommManager(QObject):
             self._v2_pending_legacy.pop(result.sequence, None)
             if result.command != 0:
                 self.commandResult.emit(result)
-        self.logMessage.emit(f"[错误] v2会话失效：{reason}，必须重新握手")
-        self.statusChanged.emit(False, f"v2会话失效：{reason}")
+        ctrl_err = (self._v2_stream_decoder.error_count
+                    if self._v2_stream_decoder is not None else 0)
+        telem_err = (self._v2_telem_decoder.error_count
+                     if self._v2_telem_decoder is not None else 0)
+        telem_open = (self._telem_driver is not None and
+                      self._telem_driver.is_open())
+        link_open = self._physical_link_open()
+        self.logMessage.emit(
+            f"[错误] v2会话失效：{reason}；"
+            f"控制面CRC={ctrl_err} 波形CRC={telem_err} "
+            f"遥测帧={self._protocol_stats['telemetry_frames']} "
+            f"ACK={self._protocol_stats['acks']} "
+            f"距上次有效={self.telemetry_age_s():.1f}s "
+            f"串口={'开' if link_open else '关'} "
+            f"网口={'开' if telem_open else '关'}")
+        # 会话失效 ≠ 拔线。COM/TCP 保持打开，才能继续发 STOP，也避免
+        # 上位机停心跳后下位机 15s 看门狗把还在转的电机 COMM_LOSS。
+        self.faultDetected.emit(f"v2会话失效：{reason}")
+        if link_open:
+            self.logMessage.emit(
+                "[状态] 串口/网口未关闭，可发停止；重新握手前不能再启动")
+        else:
+            self.statusChanged.emit(False, f"v2会话失效：{reason}")
         self._emit_protocol_snapshot()
 
     @staticmethod
@@ -998,38 +1286,78 @@ class CommManager(QObject):
             raise RuntimeError(f"v2帧未完整发送：{sent}/{len(wire)}字节")
         self._protocol_stats["tx_frames"] += 1
 
-    def _decode_real_v2_chunk(self, chunk: bytes) -> list[V2Frame]:
-        if self._v2_stream_decoder is None:
+    def _decode_real_v2_chunk(
+            self, chunk: bytes,
+            decoder: V2StreamDecoder | None = None,
+            stream_name: str = "真实v2字节流") -> list[V2Frame]:
+        if decoder is None:
+            decoder = self._v2_stream_decoder
+        if decoder is None or not chunk:
             return []
-        before = self._v2_stream_decoder.error_count
-        frames = self._v2_stream_decoder.feed(chunk)
-        errors = self._v2_stream_decoder.error_count - before
+        before = decoder.error_count
+        frames = decoder.feed(chunk)
+        errors = decoder.error_count - before
         if errors:
             self._protocol_stats["crc_or_frame_errors"] += errors
-            self.logMessage.emit(f"[错误] 真实v2字节流丢弃{errors}个损坏帧")
+            self.logMessage.emit(f"[错误] {stream_name}丢弃{errors}个损坏帧")
         return frames
 
-    # 单次 recv 块大小 / 单轮读取总量上限。上限保证心跳节奏不被超大积压拖死：
-    # 256 KB 在 1 kHz 遥测（约 20-30 KB/s）下相当于近 10 秒的积压，正常永远达不到。
+    # 单次 recv 块大小 / 单轮读取总量上限。
+    # 串口可以一次掏空；以太网 F1 必须限量，否则本轮解波形会把下一轮
+    # 串口心跳ACK拖过 8 秒，界面就显示「心跳缺失」。
     _RX_DRAIN_CHUNK = 4096
     _RX_DRAIN_MAX_BYTES = 256 * 1024
+    _TELEM_DRAIN_MAX_BYTES = 16 * 1024
 
-    def _drain_rx(self) -> tuple[bytes, bool]:
-        """把驱动接收缓冲读空（带上限），返回 (字节, 是否触顶仍有剩余)。
+    def _drain_driver(self, driver: BaseComm | None,
+                      first_timeout: float,
+                      max_bytes: int | None = None) -> tuple[bytes, bool]:
+        """把单个驱动的接收缓冲读空（带上限），返回 (字节, 是否触顶仍有剩余)。
 
-        首次 recv 用 0.05s 超时等数据；后续用 1ms 超时非阻塞式掏空。
+        首次 recv 用 first_timeout 等数据；后续用 1ms 超时非阻塞式掏空。
         不能用 timeout=0：TCP 会进非阻塞模式抛 BlockingIOError 而不是超时。
         """
+        if driver is None or not driver.is_open():
+            return b"", False
+        limit = self._RX_DRAIN_MAX_BYTES if max_bytes is None else max_bytes
         chunks = []
         total = 0
-        chunk = self._driver.recv(size=self._RX_DRAIN_CHUNK, timeout=0.05)
+        chunk = driver.recv(size=self._RX_DRAIN_CHUNK, timeout=first_timeout)
         while chunk:
             chunks.append(chunk)
             total += len(chunk)
-            if total >= self._RX_DRAIN_MAX_BYTES:
+            if total >= limit:
                 return b"".join(chunks), True
-            chunk = self._driver.recv(size=self._RX_DRAIN_CHUNK, timeout=0.001)
+            chunk = driver.recv(size=self._RX_DRAIN_CHUNK, timeout=0.001)
         return b"".join(chunks), False
+
+    def _drain_rx(self) -> tuple[bytes, bytes, bool]:
+        """分别掏空控制面（串口/单链路）和以太网波形，绝不把两路字节拼在一起。
+
+        v2 流解码器按字节连续组帧。RS-485 ACK 与 TCP F1 是两条独立流，
+        任一路在包边界留下半帧时，拼接会把另一路字节塞进半帧中间，CRC
+        连续失败，看起来像心跳 ACK 停了、遥测也中断。
+        返回 (控制字节, 波形字节, 是否触顶仍有剩余)。
+        """
+        # 分路时不要每次先空等串口 50ms，否则 1kHz F1 在主机侧堆积。
+        serial_wait = 0.01 if getattr(self, "_telem_driver", None) else 0.05
+        control, capped = self._drain_driver(self._driver, serial_wait)
+        telem = b""
+        telem_drv = getattr(self, "_telem_driver", None)
+        if telem_drv is not None and telem_drv.is_open():
+            try:
+                telem, tcap = self._drain_driver(
+                    telem_drv, 0.001, max_bytes=self._TELEM_DRAIN_MAX_BYTES)
+                capped = capped or tcap
+            except Exception as exc:
+                self.logMessage.emit(f"[警告] 以太网波形断开：{exc}")
+                try:
+                    telem_drv.close()
+                except Exception:
+                    pass
+                self._telem_driver = None
+                self._v2_telem_decoder = None
+        return control, telem, capped
 
     def _real_v2_poll_loop(self) -> None:
         """真实串口/TCP v2轮询；所有状态推进只依据有效帧和ACK。"""
@@ -1043,7 +1371,7 @@ class CommManager(QObject):
                     self._handle_v2_session_loss("真实通信链路已关闭")
                 break
             try:
-                data, rx_capped = self._drain_rx()
+                control, telem, rx_capped = self._drain_rx()
             except Exception as exc:
                 with self._v2_lock:
                     self._handle_v2_session_loss(f"真实v2读取失败：{exc}")
@@ -1077,14 +1405,34 @@ class CommManager(QObject):
                         self._send_real_v2_wire(encode_v2_frame(heartbeat))
                         self._v2_last_heartbeat_at = now
                     except Exception as exc:
+                        self._note_heartbeat_missing()
+                        self._handle_v2_session_loss(f"心跳发送失败：{exc}")
+                        break
+                elif (self._physical_link_open() and
+                      (session is None or
+                       session.state is not ProtocolSessionState.READY) and
+                      now - self._v2_last_heartbeat_at >=
+                      self._V2_HEARTBEAT_INTERVAL_S):
+                    # 协议会话已经失效，但串口还在。继续喂下位机看门狗，
+                    # 否则 15s 后电机会 COMM_LOSS，界面也像“连线断了”。
+                    try:
+                        keepalive = V2Frame(
+                            MessageType.HEARTBEAT, address=1,
+                            sequence=0xFFFE, version=2)
+                        self._send_real_v2_wire(encode_v2_frame(keepalive))
+                        self._v2_last_heartbeat_at = now
+                    except Exception as exc:
+                        self._note_heartbeat_missing()
                         self._handle_v2_session_loss(f"心跳发送失败：{exc}")
                         break
 
-                if data:
-                    frames = self._decode_real_v2_chunk(data)
-                    if frames:
+                if control:
+                    ctrl_frames = self._decode_real_v2_chunk(
+                        control, self._v2_stream_decoder, "串口/控制面")
+                    if ctrl_frames:
                         self._process_v2_responses(
-                            [encode_v2_frame(frame) for frame in frames])
+                            [encode_v2_frame(frame) for frame in ctrl_frames],
+                            source="control")
 
                 if session is not None:
                     expired = session.expire_commands(
@@ -1095,23 +1443,6 @@ class CommManager(QObject):
                         self._v2_pending_legacy.pop(result.sequence, None)
                         self._protocol_stats["timeouts"] += 1
                         if result.command == 0:
-                            # 下位机通信看门狗要求 RUN 期间持续收到上位机数据，
-                            # 因此心跳必须一直发。设备侧 TX 队列被 F1 占满时
-                            # 心跳 ACK 可能丢失，但下行 RX 与上行遥测仍正常：
-                            # 把“近期收到过任意有效帧”当作会话存活证据，只
-                            # 告警、不拆会话，避免连锁触发下位机 COMM_LOSS。
-                            # 仅当遥测也长时间消失时才按真正断链处理。
-                            if (now - self._last_valid_at <
-                                    self._V2_TELEMETRY_LIVENESS_S):
-                                if (now - self._v2_heartbeat_ack_warned_at >=
-                                        10.0):
-                                    self._v2_heartbeat_ack_warned_at = now
-                                    self.logMessage.emit(
-                                        "[警告] 心跳ACK超时，但实时遥测持续到达；"
-                                        "会话保持，不触发通信保护")
-                                continue
-                            self._handle_v2_session_loss(
-                                "设备心跳ACK超时且遥测中断，会话已失效")
                             continue
                         self._last_command_result = result
                         self.commandResult.emit(result)
@@ -1120,8 +1451,20 @@ class CommManager(QObject):
                             f"CMD=0x{result.command:02X}")
                     if expired:
                         self._emit_protocol_snapshot()
+
+                self._update_control_plane_health(now)
+
+                # 波形放在心跳ACK判定之后：F1解包/刷界面再慢也不能把
+                # 串口ACK拖过超时时限。
+                if telem:
+                    telem_frames = self._decode_real_v2_chunk(
+                        telem, self._v2_telem_decoder, "以太网波形")
+                    if telem_frames:
+                        self._process_v2_responses(
+                            [encode_v2_frame(frame) for frame in telem_frames],
+                            source="telemetry")
             # 有数据说明流量大，立即进入下一轮继续掏空；空闲才让出 CPU。
-            if not data:
+            if not control and not telem:
                 time.sleep(0.02)
 
     # ------------------ 内部 ------------------
@@ -1178,6 +1521,15 @@ class CommManager(QObject):
             self._report_fault_once(
                 f"device_{int(frame.fault_code):x}",
                 frame.fault_text or f"下位机故障位 0x{int(frame.fault_code):X}")
+        history_code = int(getattr(frame, "fault_history_code", 0) or 0)
+        if history_code:
+            key = f"device_history_{history_code:x}"
+            if key not in self._reported_faults:
+                self._reported_faults.add(key)
+                history_text = (getattr(frame, "fault_history_text", "") or
+                                decode_motor_fault_code(history_code))
+                self.logMessage.emit(
+                    f"[故障记录] 历史故障=0x{history_code:04X}：{history_text}")
 
     def _report_fault_once(self, key: str, message: str) -> None:
         if key in self._reported_faults:
@@ -1349,6 +1701,15 @@ class CommManager(QObject):
         self._log_bus_transition(f.bus_state, sim.vdc)
         base_angle = sim.angle_deg
         f.angle_actual = base_angle
+        f.position_actual_deg = sim.position_actual_deg if sim.position_mode else 0.0
+        f.position_target_deg = sim.position_ref_deg if sim.position_mode else 0.0
+        f.position_error_deg = sim.position_error_deg if sim.position_mode else 0.0
+        f.position_trajectory_deg = sim.position_trajectory_deg if sim.position_mode else 0.0
+        f.position_speed_target_rpm = sim.position_speed_cmd_rpm if sim.position_mode else 0.0
+        f.position_speed_ff_rpm = sim._position_ff_filtered if sim.position_mode else 0.0
+        f.position_saturated = bool(
+            sim.position_mode and abs(sim.position_speed_cmd_rpm) >=
+            max(abs(sim.position_speed_limit_rpm) - 1e-6, 0.0))
         f.sensor_source = self._active_sensor_name
         f.data_source = "sim"
         self._fill_sensor_specific(f, base_angle)

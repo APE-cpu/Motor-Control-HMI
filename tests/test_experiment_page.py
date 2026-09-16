@@ -30,6 +30,24 @@ def test_实验管理默认使用真机档案和真机方案(tmp_path):
     page.shutdown()
 
 
+def test_实验管理状态机旁显示心跳缺失():
+    _app()
+    comm = CommManager()
+    machine = RuntimeStateMachine()
+    page = ExperimentPage(comm, runtime_state=machine)
+    comm.protocolSessionChanged.emit({
+        "session_state": "ready",
+        "heartbeat_missing": True,
+    })
+    assert page._heartbeat_value.text() == "缺失"
+    comm.protocolSessionChanged.emit({
+        "session_state": "ready",
+        "heartbeat_missing": False,
+    })
+    assert page._heartbeat_value.text() == "正常"
+    page.shutdown()
+
+
 def test_界面可以完成创建记录与正常结束(tmp_path, monkeypatch):
     _app()
     comm = CommManager()

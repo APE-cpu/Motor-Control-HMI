@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QFileDialog, QGridLayout, QGroupBox, QLabel, QPus
                                QVBoxLayout, QWidget)
 
 from widgets.trend_curve import TrendCurve
-from runtime_paths import writable_path
+from waveform_storage import create_waveform_record_dir
 
 
 class CurrentSamplingPage(QWidget):
@@ -95,11 +95,12 @@ class CurrentSamplingPage(QWidget):
             curve.clear()
 
     def _save_csv(self) -> None:
-        default = str(writable_path(
-            "波形记录", f"电流采样诊断_{datetime.now():%Y%m%d_%H%M%S}.csv"))
+        record_dir = create_waveform_record_dir("电流采样诊断", datetime.now())
+        default = str(record_dir / "原始数据.csv")
         path, _ = QFileDialog.getSaveFileName(self, "保存电流采样诊断", default,
                                                "CSV (*.csv)")
         if not path:
+            record_dir.rmdir()
             return
         fields = ("tick_ms", "adc1_raw", "adc2_raw", "offset_a", "offset_b",
                   "sector", "duty_a", "duty_b", "duty_c", "sample_point",

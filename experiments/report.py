@@ -246,6 +246,10 @@ def _summarize_faults(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         code_value = _num(row.get("fault_code"))
         code = int(code_value or 0)
         text = str(row.get("fault_text") or "").strip()
+        if code == 0:
+            history_value = _num(row.get("fault_history_code"))
+            code = int(history_value or 0)
+            text = str(row.get("fault_history_text") or "").strip()
         if code == 0 and not text:
             continue
         key = (code, text)

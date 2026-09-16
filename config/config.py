@@ -21,6 +21,7 @@ MOTOR_TYPES: List[str] = ["永磁同步电机(PMSM)", "双凸极电机", "直线
 # ============ 控制方式 ============
 PMSM_CONTROL_MODES: List[str] = [
     "闭环PI控制",
+    "位置三环控制",
     "开环控制",
     "模型预测控制(MPC)",
 ]
@@ -57,7 +58,7 @@ POSITION_SENSORS: List[str] = [
 
 
 # ============ 通信方式 ============
-COMM_TYPES: List[str] = ["RS-232", "RS-485", "CAN总线", "以太网TCP"]
+COMM_TYPES: List[str] = ["RS-232", "RS-485", "CAN总线", "以太网TCP", "RS-485+以太网"]
 BAUD_RATES_SERIAL: List[int] = [9600, 19200, 38400, 57600, 115200, 230400]
 BAUD_RATES_CAN: List[int] = [125_000, 250_000, 500_000, 1_000_000]
 PARITY_OPTIONS: List[str] = ["无", "奇校验", "偶校验"]

@@ -173,3 +173,92 @@ def test_自定义参数生效():
     sim2.start(1500.0)
     sim2.step(0.5)
     assert slow < sim2.speed_rpm   # 惯量大 2.5 倍，加速必然更慢
+
+
+def test_位置三环阶跃收敛到机械角目标():
+    """位置P输出速度给定，最终由速度/电流内环把角度拉到目标。"""
+    sim = MotorSim()
+    sim.start(position_mode=True, position_target_deg=5.0,
+              kp_pos=8.0, kpf_pos=0.0,
+              position_speed_limit_rpm=300.0)
+    sim.step(1.0)
+    assert sim.position_actual_deg == pytest.approx(5.0, abs=0.05)
+    assert abs(sim.position_error_deg) < 0.05
+    assert abs(sim.position_speed_cmd_rpm) < 5.0
+
+
+def test_位置速度阻尼抵消同方向机械速度():
+    """Kdθ 应从位置环速度指令中扣除实际机械速度，形成主动制动。"""
+    plain = MotorSim()
+    damped = MotorSim()
+    common = dict(position_mode=True, position_target_deg=90.0,
+                  kp_pos=8.0, kpf_pos=0.0,
+                  position_speed_limit_rpm=300.0)
+    plain.start(kd_pos=0.0, **common)
+    damped.start(kd_pos=0.20, **common)
+    omega_100rpm = 100.0 * math.pi / 30.0
+    plain.omega = damped.omega = omega_100rpm
+    plain._update_position_loop(0.005)
+    damped._update_position_loop(0.005)
+    assert plain.position_speed_cmd_rpm - damped.position_speed_cmd_rpm == pytest.approx(20.0)
+
+
+def test_位置速度指令确认换向时卸载速度积分():
+    """跨过±10 rpm确认带后只在真实换向时清除旧方向速度积分。"""
+    sim = MotorSim()
+    sim.start(position_mode=True, position_target_deg=90.0,
+              kp_pos=8.0, kd_pos=0.0,
+              position_speed_limit_rpm=300.0)
+    sim.position_trajectory_deg = 90.0
+    sim.position_trajectory_speed_rpm = 0.0
+    sim._update_position_loop(0.005)
+    assert sim._position_last_motion_sign == 1
+    sim._int_spd = 123.0
+    sim.position_ref_deg = -90.0
+    sim.position_trajectory_deg = -90.0
+    sim._update_position_loop(0.005)
+    assert sim._position_last_motion_sign == -1
+    assert sim._int_spd == 0.0
+
+
+def test_旧ki_pos字段不再改变位置环输出():
+    """兼容旧配置但不得恢复积分；ki_pos不同不得改变同一轨迹的输出。"""
+    a = MotorSim()
+    b = MotorSim()
+    common = dict(kp_pos=2.0, kpf_pos=0.0,
+                  position_speed_limit_rpm=300.0,
+                  position_accel_limit_rpm_s=60.0)
+    a.start(position_mode=True, position_target_deg=10.0,
+            ki_pos=0.0, **common)
+    b.start(position_mode=True, position_target_deg=10.0,
+            ki_pos=999.0, **common)
+    a.step(0.5)
+    b.step(0.5)
+    assert a.position_speed_cmd_rpm == pytest.approx(b.position_speed_cmd_rpm)
+    assert a.position_actual_deg == pytest.approx(b.position_actual_deg)
+
+
+def test_位置轨迹限制启动速度并产生有效前馈():
+    """最终角度仍是阶跃输入，但内部轨迹应从零加速，Kpf不再恒为零。"""
+    sim = MotorSim()
+    sim.start(position_mode=True, position_target_deg=90.0,
+              kp_pos=8.0, kpf_pos=0.1,
+              position_speed_limit_rpm=60.0,
+              position_accel_limit_rpm_s=30.0)
+    sim.step(0.005)
+    assert 0.0 < sim.position_trajectory_deg < 0.01
+    assert sim.position_trajectory_speed_rpm == pytest.approx(0.15, rel=0.02)
+    assert 0.0 < sim._position_ff_filtered < 1.0
+    assert abs(sim.position_speed_cmd_rpm) < 1.0
+    sim.step(0.495)
+    assert sim.position_trajectory_deg < sim.position_ref_deg
+    assert sim._position_ff_filtered > 1.0
+
+
+def test_位置三环支持多圈目标():
+    """连续机械角不能在±180°处折返，360°目标应完成一整圈。"""
+    sim = MotorSim()
+    sim.start(position_mode=True, position_target_deg=360.0,
+              position_speed_limit_rpm=300.0)
+    sim.step(4.0)
+    assert sim.position_actual_deg == pytest.approx(360.0, abs=1.0)

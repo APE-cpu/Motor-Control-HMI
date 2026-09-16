@@ -120,13 +120,21 @@ class RuntimeStateMachine(QObject):
             self._require(RuntimeState.RUNNING, "设备不在运行状态")
             self._transition(RuntimeState.STOPPING, reason)
 
+    def observe_device_stopping(self, reason: str = "遥测确认设备正在停机") -> None:
+        """设备已离开RUN，但尚未回到IDLE；此时不能重新启动。"""
+        with self._lock:
+            if self._state is RuntimeState.STOPPING:
+                return
+            self._require(RuntimeState.RUNNING, "设备不在运行状态")
+            self._transition(RuntimeState.STOPPING, reason)
+
     def confirm_stopped(self, reason: str = "停机命令已执行") -> None:
         with self._lock:
             self._require(RuntimeState.STOPPING, "当前没有待确认的停机过程")
             self._transition(RuntimeState.READY, reason)
 
     def observe_device_stopped(self, reason: str = "遥测确认设备已停机") -> None:
-        """设备安全逻辑可在没有上位机STOP命令时主动受控停机。"""
+        """设备已实际回到IDLE；只有此证据才能恢复READY。"""
         with self._lock:
             if self._state not in (RuntimeState.RUNNING, RuntimeState.STOPPING):
                 return

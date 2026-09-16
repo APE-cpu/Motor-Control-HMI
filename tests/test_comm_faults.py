@@ -1,6 +1,10 @@
+import json
 import struct
 
-from communications.comm_manager import CommManager, TelemetryFrame
+from communications.comm_manager import (
+    CommManager, TelemetryFrame, decode_motor_fault_code,
+)
+from communications.protocol_v2 import MessageType, V2Frame
 from config.config import (
     TELEM_FLAG_DRIVER_FAULT, TELEM_FLAG_EMERGENCY_FAULT,
     TELEM_FLAG_LOW_SPEED_WARN, TELEM_FLAG_OVERCURRENT_FAULT, TELEM_FMT,
@@ -127,3 +131,48 @@ def test_真实设备遥测超时只告警不锁定故障(monkeypatch):
 
     assert faults == []
     assert any("遥测连续 2 秒超时" in item for item in logs)
+
+
+def test_MCSDK故障位解码包含具体名称和未知位():
+    text = decode_motor_fault_code(0x0024 | 0x0100)
+
+    assert "母线欠压" in text
+    assert "速度反馈故障" in text
+    assert "未知故障位0x0100" in text
+
+
+def test_v2历史故障锁存解析但不触发当前故障锁定():
+    comm = CommManager()
+    faults = []
+    logs = []
+    comm.faultDetected.connect(faults.append)
+    comm.logMessage.connect(logs.append)
+    payload = json.dumps({
+        "fault_code": 0,
+        "fault_history_code": 0x0040,
+        "fault_text": "",
+    }).encode("utf-8")
+
+    frame = comm._parse_v2_telemetry(V2Frame(
+        MessageType.TELEMETRY, command=0x30, payload=payload))
+    comm._inspect_frame_fault(frame)
+    comm._inspect_frame_fault(frame)
+
+    assert frame.fault_history_code == 0x0040
+    assert "硬件过流" in frame.fault_history_text
+    assert faults == []
+    assert len([item for item in logs if "历史故障=0x0040" in item]) == 1
+
+
+def test_v2通用MCSDK文本会被具体故障码替换():
+    comm = CommManager()
+    payload = json.dumps({
+        "fault_code": 0x0010,
+        "fault_history_code": 0x0010,
+        "fault_text": "MCSDK fault active",
+    }).encode("utf-8")
+
+    frame = comm._parse_v2_telemetry(V2Frame(
+        MessageType.TELEMETRY, command=0x30, payload=payload))
+
+    assert "启动失败" in frame.fault_text

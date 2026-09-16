@@ -199,7 +199,8 @@ class ExperimentSessionManager:
             "torque_actual", "torque_target", "angle_actual", "temperature",
             "vdc", "bus_state", "sensor_source", "sensor_quality", "convergence",
             "low_speed_warn", "data_source",
-            "fault_code", "fault_text",
+            "fault_code", "fault_text", "fault_history_code",
+            "fault_history_text",
         ):
             if isinstance(frame, dict):
                 row[field] = frame.get(field, "")

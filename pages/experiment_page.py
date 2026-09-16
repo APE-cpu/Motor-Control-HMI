@@ -92,12 +92,14 @@ class ExperimentPage(QWidget):
         self.recorder.recordingError.connect(self._on_recording_error)
         if self._runtime_state is not None:
             self._runtime_state.stateChanged.connect(self._on_runtime_state_changed)
+        self._comm.protocolSessionChanged.connect(self._on_protocol_session)
         self._refresh_templates()
         self._refresh_equipment_profiles()
         self._apply_selected_equipment()
         self._apply_selected_template()
         self._apply_snapshot_preview()
         self._refresh_runtime_state()
+        self._refresh_heartbeat()
         self._refresh_status()
         self._refresh_history()
 
@@ -205,6 +207,14 @@ class ExperimentPage(QWidget):
         self._btn_reset_fault.clicked.connect(self._reset_fault)
         row.addWidget(QLabel("当前状态："))
         row.addWidget(self._runtime_value)
+        row.addSpacing(16)
+        row.addWidget(QLabel("心跳："))
+        self._heartbeat_value = QLabel("—")
+        self._heartbeat_value.setStyleSheet("font-size: 16px; font-weight: 600;")
+        self._heartbeat_value.setToolTip(
+            "只显示会话心跳是否收到ACK，缺失不会拆会话；"
+            "真断线由下位机看门狗停机。")
+        row.addWidget(self._heartbeat_value)
         row.addStretch(1)
         row.addWidget(self._btn_precheck)
         row.addWidget(self._btn_reset_fault)
@@ -675,6 +685,29 @@ class ExperimentPage(QWidget):
         self._refresh_runtime_state()
         self._precheck_detail.setText(reason)
 
+    def _on_protocol_session(self, status: dict) -> None:
+        self._refresh_heartbeat(status)
+
+    def _refresh_heartbeat(self, status: dict | None = None) -> None:
+        if not hasattr(self, "_heartbeat_value"):
+            return
+        if status is None:
+            status = (self._comm.protocol_status() if self._comm is not None else {})
+        state = str(status.get("session_state", "") or "")
+        missing = bool(status.get("heartbeat_missing"))
+        if state == "ready" and missing:
+            self._heartbeat_value.setText("缺失")
+            self._heartbeat_value.setStyleSheet(
+                "font-size: 16px; font-weight: 600; color: #ffa726;")
+        elif state == "ready":
+            self._heartbeat_value.setText("正常")
+            self._heartbeat_value.setStyleSheet(
+                "font-size: 16px; font-weight: 600; color: #66bb6a;")
+        else:
+            self._heartbeat_value.setText("—")
+            self._heartbeat_value.setStyleSheet(
+                "font-size: 16px; font-weight: 600; color: #b8c6d8;")
+
     def _refresh_runtime_state(self) -> None:
         if self._runtime_state is None:
             self._runtime_value.setText("未启用")
@@ -1105,6 +1138,8 @@ class ExperimentPage(QWidget):
             "temperature": latest.temperature,
             "fault_code": latest.fault_code,
             "fault_text": latest.fault_text,
+            "fault_history_code": latest.fault_history_code,
+            "fault_history_text": latest.fault_history_text,
         }
         try:
             message = note if category == "custom" else label
@@ -1167,6 +1202,7 @@ class ExperimentPage(QWidget):
                 for field in (
                     "speed_actual", "speed_target", "current_actual", "vdc",
                     "temperature", "bus_state", "fault_code", "fault_text",
+                    "fault_history_code", "fault_history_text",
                     "data_source",
                 )
             },

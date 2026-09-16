@@ -5,7 +5,7 @@ from datetime import datetime
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QComboBox, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
-    QInputDialog, QLineEdit, QMessageBox, QPushButton, QSpinBox,
+    QInputDialog, QLineEdit, QMessageBox, QPushButton, QSizePolicy, QSpinBox,
     QStackedWidget, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
 )
 
@@ -22,11 +22,12 @@ from controllers.current_chopping_controller import CurrentChoppingController
 from controllers.mpc_controller import MPCController
 from controllers.openloop_controller import OpenLoopController
 from controllers.pi_controller import PIController
+from controllers.position_controller import PositionController
 from controllers.sensorless_controller import SensorlessController
 from controllers.voltage_control_controller import VoltageControlController
 from pages.control_param_panels import (
     AnglePositionPanel, CurrentChoppingPanel, EKFPanel, HFIPanel, HallPanel,
-    MPCPanel, MRASPanel, OpenLoopPanel, PIPanel, QEPPanel, ResolverPanel,
+    MPCPanel, MRASPanel, OpenLoopPanel, PIPanel, PositionPanel, QEPPanel, ResolverPanel,
     SMOPanel, SensorlessPanel, VoltageControlPanel,
 )
 from widgets.motor_info_dialog import MotorInfoDialog, load_motor_info
@@ -38,10 +39,105 @@ from runtime_paths import writable_path
 _PI_PROFILE_FILE = "config/pi_parameter_profiles.json"
 _BUILTIN_PI_PROFILE = "稳定基线（1752/121，2323/2077）"
 
+_PROFILE_WIDGET_ALIASES = {
+    "spd_sample_time": "dt_spd",
+    "cur_sample_time": "dt_cur",
+    "pos_sample_time": "dt_pos",
+    "position_ff_lpf_hz": "ff_lpf_hz",
+    "iq_ref_a": "iq_ref",
+    "iq_ramp_ms": "ramp_ms",
+    "replaced_loop": "loop",
+    "prediction_horizon": "N",
+    "control_horizon": "M",
+    "weight_q": "q",
+    "weight_r": "r",
+    "u_min": "umin",
+    "u_max": "umax",
+    "delta_u_max": "dumax",
+    "x_min": "xmin",
+    "x_max": "xmax",
+    "observer_gain": "gain",
+    "start_current": "start_curr",
+    "current_upper": "i_up",
+    "current_lower": "i_low",
+    "chopping_frequency": "f_chop",
+    "hysteresis_band": "band",
+    "turn_on_angle": "theta_on",
+    "turn_off_angle": "theta_off",
+    "advance_angle": "theta_adv",
+    "current_limit": "i_limit",
+    "dc_bus_voltage": "vdc",
+    "pwm_frequency": "f_pwm",
+    "voltage_limit": "v_limit",
+}
+
+# F407 apply_runtime_params only parses these keys. Sending Chinese UI meta
+# plus duplicate kp/ki/sample_time fields used to push SET_PARAMS over the
+# 384-byte firmware copy buffer, so the whole apply was NACKed.
+_FIRMWARE_RUNTIME_KEYS = (
+    "control_mode",
+    "target",
+    "max_rpm",
+    "max_current_a",
+    "iq_max",
+    "kp_spd",
+    "ki_spd",
+    "kp_cur",
+    "ki_cur",
+    "position_target_deg",
+    "kp_pos",
+    "kd_pos",
+    "kpf_pos",
+    "position_ff_lpf_hz",
+    "position_speed_limit_rpm",
+    "position_accel_limit_rpm_s",
+    "position_speed_ff_rpm",
+    "iq_ref_a",
+    "iq_ramp_ms",
+)
+_TELEMETRY_FRESH_S = 1.5
+# Eco telemetry (F1 200 Hz, F2/F3 off). Must NOT be sent in the same click as
+# START: stacking 0x22 + 0x10 made START miss its 1 s ACK window in lab.
+
+
+def firmware_runtime_payload(values: dict) -> bytes:
+    """Compact SET_PARAMS/START body the F407 parser can copy and apply."""
+    parts = []
+    for key in _FIRMWARE_RUNTIME_KEYS:
+        if key not in values:
+            continue
+        value = values[key]
+        if isinstance(value, float):
+            text = f"{value:.6g}"
+        else:
+            text = str(value)
+        parts.append(f"{key}={text}")
+    return ";".join(parts).encode("utf-8")
+
+
+def _field_with_hint(widget: QWidget, hint: str) -> QWidget:
+    """在输入框右侧显示低对比度的范围说明。"""
+    field = QWidget()
+    field.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
+    widget_policy = widget.sizePolicy()
+    widget_policy.setHorizontalPolicy(QSizePolicy.Expanding)
+    widget.setSizePolicy(widget_policy)
+    row = QHBoxLayout(field)
+    row.setContentsMargins(0, 0, 0, 0)
+    row.setSpacing(8)
+    row.addWidget(widget, 1)
+    range_label = QLabel(hint)
+    range_label.setObjectName("RangeHintLabel")
+    range_label.setStyleSheet("color: #748291; font-size: 11px;")
+    range_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+    row.addWidget(range_label)
+    return field
+
 
 # 控制方式名称 → (控制器类, 参数面板类) 映射
 _MODE_REGISTRY = {
     "闭环PI控制":          (PIController,            PIPanel),
+    "位置三环控制":        (PositionController,      PositionPanel),
     "开环控制":            (OpenLoopController,      OpenLoopPanel),
     "模型预测控制(MPC)":    (MPCController,           MPCPanel),
     "无位置传感器控制":     (SensorlessController,    SensorlessPanel),
@@ -69,6 +165,9 @@ _MODE_DESCRIPTIONS = {
     "闭环PI控制":
         "转速/电流双闭环 PI，工业标配：参数少、易整定、稳态精度高。"
         "适合绝大多数调速场景。",
+    "位置三环控制":
+        "PMSM 位置—速度—电流级联：位置比例加目标速度前馈输出速度给定，"
+        "复用现有速度 PI 与电流 PI；用于对拖台架的位置阶跃和轨迹跟踪。",
     "开环控制":
         "速度环旁路、d/q电流环闭环，直接给定受限 Iqref。"
         "专用于电流环 PI 整定，不是普通 V/f 开环。",
@@ -142,9 +241,11 @@ class ControlPage(QWidget):
         self._motor_model = QLineEdit(saved.get("model", "野火 78W PMSM"))
         self._pole_pairs = QSpinBox(); self._pole_pairs.setRange(1, 64)
         self._pole_pairs.setValue(int(saved.get("pole_pairs", 4)))
-        self._max_rpm = QSpinBox(); self._max_rpm.setRange(1, 100000)
+        self._max_rpm = QSpinBox(); self._max_rpm.setRange(1, 4000)
         # 野火 78 W PMSM 额定最高转速为 4000 rpm；若档案已保存上限则优先使用。
         self._max_rpm.setValue(int(saved.get("max_rpm", 4000)))
+        self._max_rpm.setToolTip(
+            "允许范围：1～4000 rpm；不是建议长期运行转速")
         self._current_limit = QDoubleSpinBox()
         # 恢复实验基线：3000 digit ≈ 1.887 A（NOMINAL 上限约 4.49 A）。
         self._current_limit.setRange(0.1, 4.49)
@@ -165,14 +266,15 @@ class ControlPage(QWidget):
 
         f.addRow("电机类型", self._motor_type)
         f.addRow("电机型号", self._motor_model)
-        f.addRow("极对数", self._pole_pairs)
-        f.addRow("最高转速 (rpm)", self._max_rpm)
-        f.addRow("电流限幅", self._current_limit)
+        f.addRow("极对数", _field_with_hint(self._pole_pairs, "1 ～ 64"))
+        f.addRow("最高转速", _field_with_hint(self._max_rpm, "1 ～ 4000 rpm"))
+        f.addRow("电流限幅", _field_with_hint(self._current_limit, "0.1 ～ 4.49 A"))
         self._device_limits = QLabel("下位机回读：等待遥测")
         self._device_limits.setWordWrap(True)
         self._device_limits.setToolTip("下位机实际采用的最高转速、Iq限流和动态跑飞阈值")
         f.addRow("保护回读", self._device_limits)
-        f.addRow("额定工作点温度", self._rated_temperature)
+        f.addRow("额定工作点温度",
+                 _field_with_hint(self._rated_temperature, "0 ～ 250 °C"))
 
         btn_detail = QPushButton("电机详情（额定/实测/描述）…")
         btn_detail.clicked.connect(self._on_motor_detail)
@@ -259,8 +361,23 @@ class ControlPage(QWidget):
 
         # 目标转速统一在监控页设置；监控页构造时会把它的转速框注入进来
         self._target_speed = QSpinBox()
-        self._target_speed.setRange(-100000, 100000)
+        self._target_speed.setRange(-4000, 4000)
         self._target_speed.setValue(1000)
+        self._target_position = QDoubleSpinBox()
+        self._target_position.setRange(-36000.0, 36000.0)
+        self._target_position.setDecimals(2)
+        self._target_position.setSingleStep(1.0)
+        self._target_position.setValue(90.0)
+        self._target_position.setSuffix(" °")
+        self._target_position.setToolTip(
+            "相对启动时捕获点的连续机械角；允许 ±100 圈。"
+            "大角度实验仍应从低限速、低加速度开始。")
+        self._target_position_label = QLabel("位置目标（仅位置三环）")
+        self._target_position_field = _field_with_hint(
+            self._target_position, "−36000° ～ +36000°（±100 圈）")
+        v.addWidget(self._target_position_label)
+        v.addWidget(self._target_position_field)
+        self._set_position_target_visible(False)
 
         v.addWidget(self._build_load_box())
         v.addStretch(1)
@@ -441,13 +558,13 @@ class ControlPage(QWidget):
         box = QGroupBox("控制参数调整")
         v = QVBoxLayout(box)
         profile_row = QHBoxLayout()
-        profile_row.addWidget(QLabel("PI参数方案"))
+        profile_row.addWidget(QLabel("控制参数方案"))
         self._pi_profile_combo = QComboBox()
         self._pi_profile_combo.setToolTip(
             "选择后点击“加载到界面”；加载不会自动发送，确认数值后再发送到下位机。")
         profile_row.addWidget(self._pi_profile_combo, 1)
         self._btn_profile_load = QPushButton("加载到界面")
-        self._btn_profile_save = QPushButton("保存当前PI方案")
+        self._btn_profile_save = QPushButton("保存当前方案")
         self._btn_profile_delete = QPushButton("删除方案")
         self._btn_profile_load.clicked.connect(self._on_load_pi_profile)
         self._btn_profile_save.clicked.connect(self._on_save_pi_profile)
@@ -477,6 +594,8 @@ class ControlPage(QWidget):
     @staticmethod
     def _builtin_pi_profile() -> dict:
         return {
+            "profile_version": 2,
+            "control_mode": "闭环PI控制",
             "kp_spd": 1752.0, "ki_spd": 121.0,
             "kp_cur": 2323.0, "ki_cur": 2077.0,
             "iq_max": 1.887, "max_current_a": 1.887,
@@ -512,10 +631,11 @@ class ControlPage(QWidget):
                 self._pi_profile_combo.setCurrentIndex(index)
 
     def _on_save_pi_profile(self) -> None:
-        panel = self._panels["闭环PI控制"]
+        mode = self._current_mode()
+        panel = self._panels[mode]
         name, ok = QInputDialog.getText(
-            self, "保存PI参数方案", "方案名称：",
-            text=datetime.now().strftime("PI方案 %Y-%m-%d %H-%M"))
+            self, "保存控制参数方案", "方案名称：",
+            text=datetime.now().strftime("控制方案 %Y-%m-%d %H-%M"))
         name = name.strip()
         if not ok or not name:
             return
@@ -526,30 +646,61 @@ class ControlPage(QWidget):
         if name in profiles and QMessageBox.question(
                 self, "覆盖方案", f"“{name}”已存在，是否覆盖？") != QMessageBox.Yes:
             return
-        values = panel.values()
+        values = dict(panel.values())
         profiles[name] = {
-            "kp_spd": values["kp_spd"], "ki_spd": values["ki_spd"],
-            "kp_cur": values["kp_cur"], "ki_cur": values["ki_cur"],
-            "iq_max": values["iq_max"],
+            **values,
+            "profile_version": 2,
+            "control_mode": mode,
+            "target_speed_rpm": self._target_speed.value(),
+            "target_position_deg": self._target_position.value(),
             "max_current_a": self._current_limit.value(),
             "max_rpm": self._max_rpm.value(),
             "saved_at": datetime.now().isoformat(timespec="seconds"),
         }
         self._write_pi_profiles(profiles)
         self._reload_pi_profiles(name)
-        logger.log("保存PI参数方案", f"方案={name} 参数={profiles[name]}")
+        logger.log("保存控制参数方案",
+                   f"方案={name} 模式={mode} 参数={profiles[name]}")
         QMessageBox.information(
             self, "已保存", "方案已保存在本机。\n尚未发送到下位机。")
+
+    @staticmethod
+    def _apply_profile_to_panel(panel: QWidget, values: dict) -> list[str]:
+        """把档案中的参数恢复到对应面板，返回实际恢复的参数键。"""
+        loaded = []
+        redundant_aliases = {"kp", "ki", "kd", "sample_time"}
+        for key, value in values.items():
+            if key in redundant_aliases:
+                continue
+            attr = _PROFILE_WIDGET_ALIASES.get(key, key)
+            widget = getattr(panel, attr, None)
+            if widget is None:
+                continue
+            try:
+                if isinstance(widget, QComboBox):
+                    index = widget.findText(str(value))
+                    if index < 0:
+                        continue
+                    widget.setCurrentIndex(index)
+                elif hasattr(widget, "setValue"):
+                    widget.setValue(float(value))
+                else:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            loaded.append(key)
+        return loaded
 
     def _on_load_pi_profile(self) -> None:
         values = self._pi_profile_combo.currentData()
         if not isinstance(values, dict):
             return
-        panel = self._panels["闭环PI控制"]
-        for key in ("kp_spd", "ki_spd", "kp_cur", "ki_cur", "iq_max"):
-            widget = getattr(panel, key, None)
-            if widget is not None and key in values:
-                widget.setValue(float(values[key]))
+        saved_mode = values.get("control_mode")
+        # 旧版方案未记录控制方式：保持用户当前页面，绝不再强制跳到闭环 PI。
+        mode = saved_mode if saved_mode in self._panels else self._current_mode()
+        self._select_mode(mode)
+        panel = self._panels[mode]
+        loaded = self._apply_profile_to_panel(panel, values)
         # iq_max / max_current_a / 顶部电流限幅三者统一
         if "max_current_a" in values:
             self._current_limit.setValue(float(values["max_current_a"]))
@@ -559,11 +710,17 @@ class ControlPage(QWidget):
             panel.iq_max.setValue(self._current_limit.value())
         if "max_rpm" in values:
             self._max_rpm.setValue(int(values["max_rpm"]))
-        self._select_mode("闭环PI控制")
-        logger.log("加载PI参数方案", self._pi_profile_combo.currentText())
+        if "target_speed_rpm" in values:
+            self._target_speed.setValue(int(values["target_speed_rpm"]))
+        if "target_position_deg" in values:
+            self._target_position.setValue(float(values["target_position_deg"]))
+        logger.log(
+            "加载控制参数方案",
+            f"方案={self._pi_profile_combo.currentText()} 模式={mode} "
+            f"恢复参数={','.join(loaded) or '无'}")
         QMessageBox.information(
             self, "已加载到界面",
-            "参数已填入闭环PI页面，但尚未发送。\n"
+            f"参数已填入“{mode}”页面，但尚未发送。\n"
             "核对后请点击“发送当前参数到下位机”。")
 
     def _on_delete_pi_profile(self) -> None:
@@ -575,7 +732,8 @@ class ControlPage(QWidget):
         if name not in profiles:
             return
         if QMessageBox.question(
-                self, "删除PI方案", f"确定删除“{name}”吗？") != QMessageBox.Yes:
+                self, "删除控制参数方案",
+                f"确定删除“{name}”吗？") != QMessageBox.Yes:
             return
         del profiles[name]
         self._write_pi_profiles(profiles)
@@ -621,6 +779,7 @@ class ControlPage(QWidget):
                 break
         self._stack.setCurrentIndex(self._panel_index[target])
         self._update_mode_desc()
+        self._set_position_target_visible(target == "位置三环控制")
 
     def _on_motor_type_changed(self, _idx: int) -> None:
         self._refresh_modes_for_motor()
@@ -631,6 +790,14 @@ class ControlPage(QWidget):
         if mode in self._panel_index:
             self._stack.setCurrentIndex(self._panel_index[mode])
         self._update_mode_desc()
+        self._set_position_target_visible(mode == "位置三环控制")
+
+    def _set_position_target_visible(self, visible: bool) -> None:
+        """位置目标的标题、输入框和范围提示始终一起显示/隐藏。"""
+        if hasattr(self, "_target_position_label"):
+            self._target_position_label.setVisible(visible)
+        if hasattr(self, "_target_position_field"):
+            self._target_position_field.setVisible(visible)
 
     def _update_mode_desc(self) -> None:
         if not hasattr(self, "_mode_desc"):
@@ -749,6 +916,7 @@ class ControlPage(QWidget):
                 "motor_type": self._motor_type.currentText(),
                 "control_mode": mode,
                 "target_speed_rpm": self._target_speed.value(),
+                "target_position_deg": self._target_position.value(),
                 "mode_params": mode_params,
                 "sensor_params": sensor_params,
                 "mechanical_load": mechanical,
@@ -758,23 +926,24 @@ class ControlPage(QWidget):
 
     def _wire_iq_limit_sync(self) -> None:
         """电流限幅 ↔ 转速环 iq_max 双向同步，避免界面上出现两个互相打架的上限。"""
-        pi = self._panels.get("闭环PI控制")
-        if pi is None or not hasattr(pi, "iq_max"):
+        panels = [panel for panel in self._panels.values()
+                  if hasattr(panel, "iq_max")]
+        if not panels:
             return
-        # 以顶部电流限幅为初始权威值，覆盖 PI 面板旧默认 1.887。
-        pi.iq_max.setValue(self._current_limit.value())
+        # 以顶部电流限幅为初始权威值，覆盖各级联面板旧默认值。
+        for panel in panels:
+            panel.iq_max.setValue(self._current_limit.value())
+            panel.iq_max.valueChanged.connect(self._on_pi_iq_max_changed)
         self._current_limit.valueChanged.connect(self._on_top_current_limit_changed)
-        pi.iq_max.valueChanged.connect(self._on_pi_iq_max_changed)
 
     def _on_top_current_limit_changed(self, value: float) -> None:
         if self._syncing_iq_limit:
             return
-        pi = self._panels.get("闭环PI控制")
-        if pi is None or not hasattr(pi, "iq_max"):
-            return
         self._syncing_iq_limit = True
         try:
-            pi.iq_max.setValue(float(value))
+            for panel in self._panels.values():
+                if hasattr(panel, "iq_max"):
+                    panel.iq_max.setValue(float(value))
         finally:
             self._syncing_iq_limit = False
 
@@ -821,13 +990,24 @@ class ControlPage(QWidget):
                 except Exception:
                     pass
 
-        # 2) 再下发控制方式参数帧 CMD_SET_PARAMS（保持原文本格式）
+        # 2) 再下发控制方式参数帧 CMD_SET_PARAMS（只发固件认得的键）
         meta = {"motor": self._motor_type.currentText(),
                 "mode": mode,
-                "sensors": "|".join(sensors)}
-        payload_parts = [f"{k}={v}" for k, v in {
-            **meta, **params, "max_current_a": current_limit}.items()]
-        payload = ";".join(payload_parts).encode("utf-8")
+                "sensors": "|".join(sensors),
+                "control_mode": (
+                    "position_closed" if mode == "位置三环控制" else
+                    "current_loop_test" if mode == "开环控制" else
+                    "speed_closed"),
+                "target": self._target_speed.value(),
+                "position_target_deg": self._target_position.value()}
+        payload = firmware_runtime_payload({
+            **params,
+            "control_mode": meta["control_mode"],
+            "target": meta["target"],
+            "position_target_deg": meta["position_target_deg"],
+            "max_rpm": self._max_rpm.value(),
+            "max_current_a": current_limit,
+        })
         pending_before = self._comm.protocol_status().get("pending_ack", 0)
         sent = self._comm.send_frame(encode_frame(CMD_SET_PARAMS, payload))
         pending_after = self._comm.protocol_status().get("pending_ack", 0)
@@ -837,7 +1017,7 @@ class ControlPage(QWidget):
                    f"电机={meta['motor']} 控制方式={mode} "
                    f"传感器={meta['sensors'] or '无'} 电流限幅={current_limit:.2f}A")
         downstream_note = (
-            "真机已应用：速度PI、电流PI、最高转速与Iq限流；模式和传感器参数仍未由固件解析。"
+            "真机已应用：位置/速度/电流PI、速度前馈、位置速度限幅、最高转速与Iq限流。"
             if self._comm.is_connected() and not self._comm.is_sim_running()
             else "数字孪生已应用全部界面参数。")
         QMessageBox.information(
@@ -881,8 +1061,10 @@ class ControlPage(QWidget):
                 self._state_machine.state in
                 (RuntimeState.RUNNING, RuntimeState.STOPPING)):
             latest = self._comm.latest_frame()
+            telemetry_fresh = self._comm.telemetry_age_s() <= _TELEMETRY_FRESH_S
             device_stopped = (
-                int(getattr(latest, "mc_state", 0) or 0) not in (6, 11) and
+                telemetry_fresh and
+                int(getattr(latest, "mc_state", 0) or 0) == 0 and
                 int(getattr(latest, "fault_code", 0) or 0) == 0 and
                 abs(float(getattr(latest, "speed_target", 0.0) or 0.0)) < 0.5 and
                 abs(float(getattr(latest, "speed_actual", 0.0) or 0.0)) < 30.0
@@ -911,20 +1093,47 @@ class ControlPage(QWidget):
         if getattr(self._comm.latest_frame(), "mc_state", 0) == 11:
             logger.log("启动时FAULT_OVER待确认", "由下位机START流程自动确认")
 
+        mode = self._current_mode()
         target = float(self._target_speed.value())
         max_rpm = float(self._max_rpm.value())
-        if abs(target) > max_rpm:
+        mode_params = self._panels[mode].values()
+        position_target = float(self._target_position.value())
+        if mode != "位置三环控制" and abs(target) > max_rpm:
             QMessageBox.warning(self, "参数越界",
                                 f"目标转速 {target} rpm 超过最高转速 {max_rpm} rpm，请修改后重试。")
             return
-        mode_params = self._panels[self._current_mode()].values()
-        start_parts = [f"target={target}", f"max_rpm={max_rpm}",
-                       f"max_current_a={self._current_limit.value():.3f}"]
-        if self._current_mode() == "开环控制":
-            start_parts.extend(f"{k}={v}" for k, v in mode_params.items())
+        if mode == "位置三环控制":
+            speed_limit = float(mode_params.get("position_speed_limit_rpm", 0.0))
+            if speed_limit <= 0.0 or speed_limit > max_rpm:
+                QMessageBox.warning(
+                    self, "位置环限幅无效",
+                    f"位置环速度限幅必须在 1..{max_rpm:.0f} rpm 内。")
+                return
+        if mode == "位置三环控制":
+            start_parts = [
+                "control_mode=position_closed",
+                f"position_target_deg={position_target:.3f}",
+                f"kp_pos={mode_params.get('kp_pos', 8.0):.3f}",
+                f"kd_pos={mode_params.get('kd_pos', 0.20):.3f}",
+                f"kpf_pos={mode_params.get('kpf_pos', 0.0):.3f}",
+                f"position_ff_lpf_hz={mode_params.get('position_ff_lpf_hz', 8.0):.3f}",
+                f"position_speed_limit_rpm={mode_params.get('position_speed_limit_rpm', 300.0):.1f}",
+                f"position_accel_limit_rpm_s={mode_params.get('position_accel_limit_rpm_s', 60.0):.1f}",
+                f"max_rpm={max_rpm:.0f}",
+                f"max_current_a={self._current_limit.value():.3f}",
+            ]
         else:
-            start_parts.append("control_mode=speed_closed")
+            start_parts = [
+                f"target={target}",
+                f"max_rpm={max_rpm:.0f}",
+                f"max_current_a={self._current_limit.value():.3f}",
+            ]
+            if mode == "开环控制":
+                start_parts.extend(f"{k}={v}" for k, v in mode_params.items())
+            else:
+                start_parts.append("control_mode=speed_closed")
         payload = ";".join(start_parts).encode("utf-8")
+        logger.log("START载荷", f"{len(payload)}B {payload.decode('utf-8', 'replace')}")
         pending_before = self._comm.protocol_status().get("pending_ack", 0)
         sent = self._comm.send_frame(encode_frame(CMD_START, payload))
         pending_after = self._comm.protocol_status().get("pending_ack", 0)
@@ -937,7 +1146,7 @@ class ControlPage(QWidget):
         if not sent and not submitted_async:
             return
         logger.log("启动电机命令已提交",
-                   f"目标转速={target} rpm 控制方式={self._current_mode()} "
+                   f"目标={'位置 '+str(position_target)+' deg' if mode == '位置三环控制' else str(target)+' rpm'} 控制方式={mode} "
                    f"等待设备ACK={submitted_async}")
         if self._state_machine is not None:
             # negotiated-v2 的“已提交”绝不等于“设备已启动”。真实设备只能由
@@ -955,7 +1164,7 @@ class ControlPage(QWidget):
                     QMessageBox.warning(self, "状态转换失败", str(exc))
                     return
         logger.log("启动电机",
-                   f"目标转速={target} rpm 控制方式={self._current_mode()} "
+                   f"目标={'位置 '+str(position_target)+' deg' if mode == '位置三环控制' else str(target)+' rpm'} 控制方式={mode} "
                    f"传感器={'|'.join(self._selected_sensors()) or '无'}")
 
     def _on_stop(self) -> None:

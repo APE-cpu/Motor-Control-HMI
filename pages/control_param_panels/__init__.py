@@ -7,6 +7,7 @@ from .panels import (
     MPCPanel,
     MRASPanel,
     OpenLoopPanel,
+    PositionPanel,
     PIPanel,
     QEPPanel,
     ResolverPanel,
@@ -16,7 +17,7 @@ from .panels import (
 )
 
 __all__ = [
-    "PIPanel", "OpenLoopPanel", "MPCPanel", "SensorlessPanel",
+    "PIPanel", "PositionPanel", "OpenLoopPanel", "MPCPanel", "SensorlessPanel",
     "CurrentChoppingPanel", "AnglePositionPanel", "VoltageControlPanel",
     "HallPanel", "QEPPanel", "ResolverPanel", "SMOPanel",
     "EKFPanel", "MRASPanel", "HFIPanel",

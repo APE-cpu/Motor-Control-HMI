@@ -1,8 +1,24 @@
 {
-  "kind": "CAN总线",
+  "kind": "RS-485+以太网",
   "params": {
-    "channel": "COM9",
-    "bitrate": 250000,
-    "interface": "slcan"
+    "port": "COM7",
+    "baudrate": 115200,
+    "bytesize": 8,
+    "stopbits": "1",
+    "parity": "无",
+    "timeout": 1.0,
+    "host": "192.168.1.50",
+    "tcp_port": 5000,
+    "tcp_timeout": 10.0,
+    "local_host": "192.168.1.15"
+  },
+  "protocol_mode": "negotiated-v2",
+  "telemetry_level": "id",
+  "telemetry_custom": {
+    "f1_ms": 1,
+    "f2_enabled": true,
+    "f2_ms": 20,
+    "f3_enabled": true,
+    "f3_ms": 100
   }
 }

@@ -64,6 +64,32 @@ def test_流解码支持噪声分包粘包和坏帧恢复():
     assert decoder.error_count == 1
 
 
+def test_双链路半包不能拼进同一个流解码器():
+    """RS-485 ACK 和以太网 F1 是两条独立字节流。
+
+    解码器若在 F1 半包后吃进串口 ACK，会把 ACK 当成 F1 的剩余载荷，CRC
+    失败并把两路都解乱。分路解码则两边都能完整恢复。
+    """
+    ack = encode_v2_frame(make_ack(
+        V2Frame(MessageType.HEARTBEAT, sequence=9)))
+    f1 = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF1,
+        payload=b"\x00" * 22, sequence=10))
+    mixed = V2StreamDecoder()
+    assert mixed.feed(f1[:20]) == []
+    mixed.feed(ack + f1[20:])
+    assert mixed.error_count > 0
+
+    serial = V2StreamDecoder()
+    telem = V2StreamDecoder()
+    assert telem.feed(f1[:20]) == []
+    serial_frames = serial.feed(ack)
+    telem_frames = telem.feed(f1[20:])
+    assert [frame.sequence for frame in serial_frames] == [9]
+    assert [frame.sequence for frame in telem_frames] == [10]
+    assert serial.error_count == 0 and telem.error_count == 0
+
+
 def test_ACK与NACK保留原命令和序号():
     request = V2Frame(MessageType.COMMAND, 0x10, sequence=42, address=2)
     ack = make_ack(request)

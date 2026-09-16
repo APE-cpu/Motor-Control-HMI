@@ -58,7 +58,11 @@ class V2VirtualDevice:
                       CMD_SET_PARAMS, CMD_SET_SENSOR],
             telemetry_fields=[
                 "speed_actual", "speed_target", "current_actual", "temperature",
-                "vdc", "bus_state", "fault_code", "fault_text",
+                "vdc", "bus_state", "fault_code", "fault_history_code",
+                "fault_text",
+                "position_actual_deg", "position_target_deg", "position_error_deg",
+                "position_speed_target_rpm", "position_speed_ff_rpm",
+                "position_saturated",
             ],
         )
         self.state = VirtualDeviceState.BOOT
@@ -73,6 +77,7 @@ class V2VirtualDevice:
         self._schedule_order = 0
         self._telemetry_sequence = 1
         self.fault_code = 0
+        self.fault_history_code = 0
         self.fault_text = ""
 
     def receive_bytes(self, data: bytes, now_s: float = 0.0) -> list[bytes]:
@@ -104,6 +109,7 @@ class V2VirtualDevice:
     def inject_fault(self, error_code: int, message: str,
                      now_s: float = 0.0) -> None:
         self.fault_code = int(error_code)
+        self.fault_history_code |= int(error_code)
         self.fault_text = message
         self.state = VirtualDeviceState.FAULT_LOCKED
         if self.handshake_complete:
@@ -117,6 +123,7 @@ class V2VirtualDevice:
         self._scheduled.clear()
         self._next_nack = None
         self.fault_code = 0
+        self.fault_history_code = 0
         self.fault_text = ""
 
     def emit_telemetry(self, values: dict | None = None,
@@ -148,6 +155,7 @@ class V2VirtualDevice:
         if frame.command == CMD_EMERGENCY_STOP:
             self.state = VirtualDeviceState.FAULT_LOCKED
             self.fault_code = 1
+            self.fault_history_code |= self.fault_code
             self.fault_text = "虚拟设备急停锁定"
             return make_ack(frame)
         if frame.command == CMD_RESET_FAULT:
@@ -163,6 +171,7 @@ class V2VirtualDevice:
             if self.state is not VirtualDeviceState.READY:
                 return make_nack(frame, 112, "设备不在 READY")
             self.state = VirtualDeviceState.RUNNING
+            self.fault_history_code = 0
         elif frame.command == CMD_STOP:
             if self.state is not VirtualDeviceState.RUNNING:
                 return make_nack(frame, 113, "设备不在 RUNNING")
@@ -193,6 +202,7 @@ class V2VirtualDevice:
             "vdc": 24.0,
             "bus_state": "normal",
             "fault_code": self.fault_code,
+            "fault_history_code": self.fault_history_code,
             "fault_text": self.fault_text,
             "device_state": self.state.value,
         }

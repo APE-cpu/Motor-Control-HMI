@@ -66,6 +66,7 @@ if "%MODE%"=="lite" (
     pyinstaller --noconfirm --clean --onefile --windowed ^
       --name "%BUILD_NAME%" ^
       --add-data "config/style.qss;config" ^
+      --add-data "assets;assets" ^
       --add-data "README.md;." ^
       --add-data "使用说明书.md;." ^
       --add-data "软件介绍.md;." ^
@@ -87,6 +88,7 @@ if "%MODE%"=="lite" (
     pyinstaller --noconfirm --clean --onefile --windowed ^
       --name "%BUILD_NAME%" ^
       --add-data "config/style.qss;config" ^
+      --add-data "assets;assets" ^
       --add-data "README.md;." ^
       --add-data "使用说明书.md;." ^
       --add-data "软件介绍.md;." ^
