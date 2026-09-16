@@ -288,6 +288,14 @@ std::vector<F1Sample> TcpV2Receiver::drain_f1(std::size_t max_samples) {
     return telemetry_.drain_f1(max_samples);
 }
 
+std::vector<F2Sample> TcpV2Receiver::drain_f2(std::size_t max_samples) {
+    return telemetry_.drain_f2(max_samples);
+}
+
+std::vector<F3Sample> TcpV2Receiver::drain_f3(std::size_t max_samples) {
+    return telemetry_.drain_f3(max_samples);
+}
+
 std::vector<BurstCapture> TcpV2Receiver::drain_bursts(
         std::size_t max_bursts) {
     return telemetry_.drain_bursts(max_bursts);
@@ -295,6 +303,10 @@ std::vector<BurstCapture> TcpV2Receiver::drain_bursts(
 
 void TcpV2Receiver::set_f1_rate_hz(std::uint32_t value) noexcept {
     telemetry_.set_f1_rate_hz(value);
+}
+
+void TcpV2Receiver::set_rls_coefficients_si(bool value) noexcept {
+    telemetry_.set_rls_coefficients_si(value);
 }
 
 void TcpV2Receiver::set_telemetry_processing_enabled(bool enabled) noexcept {
@@ -334,9 +346,9 @@ void TcpV2Receiver::receive_loop(std::uintptr_t socket_value) noexcept {
                 ordinary_frames.reserve(frames.size());
                 for (auto& frame : frames) {
                     if (telemetry_processing_enabled_.load() &&
-                        frame.message_type == 6U &&
-                        telemetry_.ingest(frame.command, frame.payload.data(),
-                                          frame.payload.size())) {
+                        frame.message_type == 6U && telemetry_.ingest(
+                            frame.command, frame.payload.data(),
+                            frame.payload.size())) {
                         continue;
                     }
                     ordinary_frames.push_back(std::move(frame));

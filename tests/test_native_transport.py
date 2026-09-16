@@ -1,4 +1,5 @@
 import socket
+import struct
 import threading
 import time
 
@@ -67,6 +68,12 @@ def test_对端关闭后先排空原生队列再释放接收器(monkeypatch):
         def drain_f1(self, max_samples):
             return []
 
+        def drain_f2(self, max_samples):
+            return []
+
+        def drain_f3(self, max_samples):
+            return []
+
         def drain_bursts(self, max_bursts):
             return []
 
@@ -116,7 +123,8 @@ def test_Cpp线程接收分包粘包并批量取帧():
     try:
         receiver.start(
             "127.0.0.1", port, local_host="127.0.0.1", timeout_s=1.0)
-        assert _wait_until(lambda: receiver.stats()["rx_frames"] == len(frames))
+        assert _wait_until(
+            lambda: receiver.stats()["telemetry"]["f1_frames"] == len(frames))
         actual = receiver.drain_f1(100)
         stats = receiver.stats()
     finally:
@@ -129,6 +137,44 @@ def test_Cpp线程接收分包粘包并批量取帧():
     assert stats["decoder_errors"] == 0
     assert stats["dropped_frames"] == 0
     assert stats["telemetry"]["f1_frames"] == len(frames)
+
+
+@pytest.mark.skipif(
+    not native_tcp_transport_available(), reason="尚未构建 C++ TCP 接收器")
+def test_Cpp接收线程直接分流F2_F3_F4():
+    f2_payload = struct.pack(
+        "<IHHHHBHHHH", 20, 100, 200, 300, 400, 2, 10, 11, 12, 13)
+    theta_d = [0.9, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0]
+    theta_q = [0.8, 0.0, 0.0, 0.0, 0.0, 0.04, 0.0]
+    f3_payload = struct.pack(
+        "<IIff14f", 21, 22, 0.1, 0.2, *(theta_d + theta_q))
+    f4_payload = struct.pack("<HHHhhH", 1, 0, 1, 7, -8, 9)
+    frames = [
+        V2Frame(MessageType.TELEMETRY, 0xF2, f2_payload, sequence=1),
+        V2Frame(MessageType.TELEMETRY, 0xF3, f3_payload, sequence=2),
+        V2Frame(MessageType.TELEMETRY, 0xF4, f4_payload, sequence=3),
+    ]
+    port, server = _start_server([b"".join(map(encode_v2_frame, frames))])
+    receiver = NativeTcpV2Receiver()
+    receiver.set_rls_coefficients_si(True)
+    try:
+        receiver.start(
+            "127.0.0.1", port, local_host="127.0.0.1", timeout_s=1.0)
+        assert _wait_until(
+            lambda: receiver.stats()["telemetry"]["completed_bursts"] == 1)
+        f2_samples = receiver.drain_f2()
+        f3_samples = receiver.drain_f3()
+        bursts = receiver.drain_bursts()
+        stats = receiver.stats()["telemetry"]
+    finally:
+        receiver.stop()
+        server.join(timeout=1.0)
+
+    assert f2_samples[0]["sector"] == 2
+    assert f3_samples[0]["b_dd0_si"] == pytest.approx(0.05)
+    assert bursts[0]["ia"] == [7]
+    assert (stats["f2_frames"], stats["f3_frames"], stats["f4_frames"]) == (
+        1, 1, 1)
 
 
 @pytest.mark.skipif(

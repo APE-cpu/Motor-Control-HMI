@@ -1,8 +1,8 @@
 # Native communication core
 
 This directory contains the native communication data path: CRC-16/CCITT,
-protocol-v2 streaming decode, a bounded-queue TCP telemetry receiver, F1 sample
-conversion, and F4 burst reassembly. The TCP socket, stream decoder, telemetry
+protocol-v2 streaming decode, a bounded-queue TCP telemetry receiver, F1/F2/F3
+sample conversion, and F4 burst reassembly. The TCP socket, stream decoder, telemetry
 parsing, and bounded buffers run in C++; the existing Python session state
 machine and Qt signals consume converted data in batches.
 

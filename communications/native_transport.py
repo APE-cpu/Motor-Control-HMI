@@ -85,11 +85,20 @@ class NativeTcpV2Receiver:
     def drain_f1(self, max_samples: int = 8192) -> list[dict]:
         return list(self._receiver.drain_f1(max(1, int(max_samples))))
 
+    def drain_f2(self, max_samples: int = 512) -> list[dict]:
+        return list(self._receiver.drain_f2(max(1, int(max_samples))))
+
+    def drain_f3(self, max_samples: int = 512) -> list[dict]:
+        return list(self._receiver.drain_f3(max(1, int(max_samples))))
+
     def drain_bursts(self, max_bursts: int = 1) -> list[dict]:
         return list(self._receiver.drain_bursts(max(1, int(max_bursts))))
 
     def set_f1_rate_hz(self, rate_hz: int) -> None:
         self._receiver.set_f1_rate_hz(max(1, int(rate_hz)))
+
+    def set_rls_coefficients_si(self, enabled: bool) -> None:
+        self._receiver.set_rls_coefficients_si(bool(enabled))
 
     def set_telemetry_processing_enabled(self, enabled: bool) -> None:
         self._receiver.set_telemetry_processing_enabled(bool(enabled))

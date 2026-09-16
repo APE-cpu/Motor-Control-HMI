@@ -39,8 +39,11 @@ public:
     void stop() noexcept;
     std::vector<Frame> drain(std::size_t max_frames = 512);
     std::vector<F1Sample> drain_f1(std::size_t max_samples = 8192);
+    std::vector<F2Sample> drain_f2(std::size_t max_samples = 512);
+    std::vector<F3Sample> drain_f3(std::size_t max_samples = 512);
     std::vector<BurstCapture> drain_bursts(std::size_t max_bursts = 1);
     void set_f1_rate_hz(std::uint32_t value) noexcept;
+    void set_rls_coefficients_si(bool value) noexcept;
     void set_telemetry_processing_enabled(bool enabled) noexcept;
     void reset_burst();
     ReceiverStats stats() const;

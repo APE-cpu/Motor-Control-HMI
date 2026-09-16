@@ -1,3 +1,4 @@
+import math
 import struct
 
 import pytest
@@ -58,6 +59,55 @@ def test_F1非法长度计入解析错误且不产生样本():
     assert processor.ingest(0xF1, b"bad")
     assert processor.drain_f1() == []
     assert processor.stats()["parse_errors"] == 1
+
+
+def test_F2原生解析标定窗口和VDDA():
+    processor = NativeTelemetryProcessor()
+    base = struct.pack(
+        "<IHHHHBHHHH", 2000, 16400, 16390, 32800, 32780,
+        4, 2600, 2610, 2620, 5249)
+    calibration = struct.pack("<HHHHH", 16380, 16420, 16370, 16410, 3295)
+
+    assert processor.ingest(0xF2, base + calibration)
+    sample = processor.drain_f2()[0]
+
+    assert sample["tick_ms"] == 2000
+    assert sample["sector"] == 4
+    assert sample["cal_adc1_pp"] == 40
+    assert sample["cal_adc2_pp"] == 40
+    assert sample["vdda_v"] == pytest.approx(3.295)
+    assert sample["adc1_v"] == pytest.approx(16400 * 3.3 / 32768.0)
+
+
+def test_F3原生解析SI系数并反解电机参数():
+    processor = NativeTelemetryProcessor()
+    processor.set_rls_coefficients_si(True)
+    theta_d = [0.9, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0]
+    theta_q = [0.8, 0.0, 0.0, 0.0, 0.0, 0.04, 0.0]
+    payload = struct.pack(
+        "<IIff14f", 123, 456, 0.125, 99.0, *(theta_d + theta_q))
+
+    assert processor.ingest(0xF3, payload)
+    sample = processor.drain_f3()[0]
+
+    assert sample["tick_ms"] == 123
+    assert sample["updates"] == 456
+    assert sample["innov_rms_a"] == pytest.approx(0.125)
+    assert math.isnan(sample["innov_rms_digit"])
+    assert sample["b_dd0_si"] == pytest.approx(0.05)
+    assert sample["b_qq0_si"] == pytest.approx(0.04)
+    assert sample["ld_mh"] == pytest.approx(1.25)
+    assert sample["lq_mh"] == pytest.approx(1.5625)
+
+
+def test_F2_F3非法长度均计入解析错误():
+    processor = NativeTelemetryProcessor()
+    assert processor.ingest(0xF2, b"bad")
+    assert processor.ingest(0xF3, b"bad")
+    stats = processor.stats()
+    assert stats["f2_frames"] == 1
+    assert stats["f3_frames"] == 1
+    assert stats["parse_errors"] == 2
 
 
 def _f4_chunk(total, start, samples):

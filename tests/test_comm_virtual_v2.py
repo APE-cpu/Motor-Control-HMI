@@ -3,6 +3,8 @@ import struct
 import threading
 import time
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
@@ -166,6 +168,28 @@ def test_F4乱序分片由通讯管理器重组并发出完整抓取():
     }
     assert outputs == [expected]
     assert captures == [expected]
+
+
+def test_F3根据握手固件标识解码SI系数():
+    comm = CommManager()
+    session = ProtocolSession()
+    session.capabilities = DeviceCapabilities(
+        "DEVICE", "0.7.6-rls-si-test")
+    comm._v2_session = session
+    received = []
+    comm.rlsCoeffReceived.connect(received.append)
+    theta_d = [0.9, 0.0, 0.0, 0.05, 0.0, 0.0, 0.0]
+    theta_q = [0.8, 0.0, 0.0, 0.0, 0.0, 0.04, 0.0]
+    payload = struct.pack(
+        "<IIff14f", 123, 456, 0.125, 99.0, *(theta_d + theta_q))
+    raw = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF3, payload=payload))
+
+    outputs = comm._process_v2_responses([raw])
+
+    assert outputs[0]["innov_rms_a"] == pytest.approx(0.125)
+    assert outputs[0]["b_dd0_si"] == pytest.approx(0.05)
+    assert received == outputs
 
 
 def test_通信页静默接受1kHz批量F1且限制日志长度():

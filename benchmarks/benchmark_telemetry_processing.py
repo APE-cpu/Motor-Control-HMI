@@ -103,7 +103,8 @@ def main() -> None:
     print(f"native core: {native_ingest_rate:,.0f} samples/s")
     print(f"native + Python dict export: {native_end_to_end_rate:,.0f} samples/s")
     print(f"core speedup: {native_ingest_rate / python_rate:.2f}x")
-    print(f"UI-compatible speedup: {native_end_to_end_rate / python_rate:.2f}x")
+    print(f"UI-compatible throughput ratio: "
+          f"{native_end_to_end_rate / python_rate:.2f}x")
 
 
 if __name__ == "__main__":

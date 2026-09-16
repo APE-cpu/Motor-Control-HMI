@@ -100,17 +100,89 @@ py::list bursts_to_python(
     return output;
 }
 
+py::list f2_samples_to_python(
+        const std::vector<motor_core::F2Sample>& samples) {
+    py::list output;
+    for (const auto& sample : samples) {
+        py::dict item;
+        item["tick_ms"] = sample.tick_ms;
+        item["adc1_raw"] = sample.adc1_raw;
+        item["adc2_raw"] = sample.adc2_raw;
+        item["offset_a"] = sample.offset_a;
+        item["offset_b"] = sample.offset_b;
+        item["sector"] = sample.sector;
+        item["duty_a"] = sample.duty_a;
+        item["duty_b"] = sample.duty_b;
+        item["duty_c"] = sample.duty_c;
+        item["sample_point"] = sample.sample_point;
+        item["adc1_v"] = sample.adc1_v;
+        item["adc2_v"] = sample.adc2_v;
+        item["zero_a_v"] = sample.zero_a_v;
+        item["zero_b_v"] = sample.zero_b_v;
+        item["adc1_delta_a"] = sample.adc1_delta_a;
+        item["adc2_delta_a"] = sample.adc2_delta_a;
+        if (sample.has_calibration) {
+            item["cal_adc1_min"] = sample.cal_adc1_min;
+            item["cal_adc1_max"] = sample.cal_adc1_max;
+            item["cal_adc2_min"] = sample.cal_adc2_min;
+            item["cal_adc2_max"] = sample.cal_adc2_max;
+            item["cal_adc1_pp"] = sample.cal_adc1_max - sample.cal_adc1_min;
+            item["cal_adc2_pp"] = sample.cal_adc2_max - sample.cal_adc2_min;
+        }
+        if (sample.has_vdda) {
+            item["vdda_v"] = sample.vdda_v;
+        }
+        output.append(std::move(item));
+    }
+    return output;
+}
+
+py::list f3_samples_to_python(
+        const std::vector<motor_core::F3Sample>& samples) {
+    py::list output;
+    for (const auto& sample : samples) {
+        py::dict item;
+        py::tuple theta_d(sample.theta_d.size());
+        py::tuple theta_q(sample.theta_q.size());
+        for (std::size_t index = 0; index < sample.theta_d.size(); ++index) {
+            theta_d[index] = sample.theta_d[index];
+            theta_q[index] = sample.theta_q[index];
+        }
+        item["tick_ms"] = sample.tick_ms;
+        item["updates"] = sample.updates;
+        item["innov_rms_a"] = sample.innov_rms_a;
+        item["innov_rms_digit"] = sample.innov_rms_digit;
+        item["theta_d"] = std::move(theta_d);
+        item["theta_q"] = std::move(theta_q);
+        item["a1_d"] = sample.a1_d;
+        item["a1_q"] = sample.a1_q;
+        item["b_dd0_si"] = sample.b_dd0_si;
+        item["b_qq0_si"] = sample.b_qq0_si;
+        item["ld_mh"] = sample.ld_mh;
+        item["lq_mh"] = sample.lq_mh;
+        item["rd_ohm"] = sample.rd_ohm;
+        item["rq_ohm"] = sample.rq_ohm;
+        output.append(std::move(item));
+    }
+    return output;
+}
+
 py::dict telemetry_stats_to_python(
         const motor_core::TelemetryProcessorStats& stats) {
     py::dict output;
     output["f1_frames"] = stats.f1_frames;
+    output["f2_frames"] = stats.f2_frames;
+    output["f3_frames"] = stats.f3_frames;
     output["f4_frames"] = stats.f4_frames;
     output["f1_samples"] = stats.f1_samples;
     output["completed_bursts"] = stats.completed_bursts;
     output["parse_errors"] = stats.parse_errors;
     output["dropped_samples"] = stats.dropped_samples;
     output["dropped_bursts"] = stats.dropped_bursts;
+    output["dropped_diagnostics"] = stats.dropped_diagnostics;
     output["queued_samples"] = stats.queued_samples;
+    output["queued_f2"] = stats.queued_f2;
+    output["queued_f3"] = stats.queued_f3;
     output["queued_bursts"] = stats.queued_bursts;
     return output;
 }
@@ -154,9 +226,10 @@ PYBIND11_MODULE(motor_core_cpp, module) {
                                &motor_core::StreamDecoder::buffered_bytes);
 
     py::class_<motor_core::TelemetryProcessor>(module, "TelemetryProcessor")
-        .def(py::init<std::size_t, std::size_t>(),
+        .def(py::init<std::size_t, std::size_t, std::size_t>(),
              py::arg("max_f1_samples") = 131072,
-             py::arg("max_bursts") = 4)
+             py::arg("max_bursts") = 4,
+             py::arg("max_diagnostics") = 4096)
         .def(
             "ingest",
             [](motor_core::TelemetryProcessor& processor, std::uint8_t command,
@@ -171,6 +244,8 @@ PYBIND11_MODULE(motor_core_cpp, module) {
             py::arg("command"), py::arg("payload"))
         .def("set_f1_rate_hz",
              &motor_core::TelemetryProcessor::set_f1_rate_hz)
+        .def("set_rls_coefficients_si",
+             &motor_core::TelemetryProcessor::set_rls_coefficients_si)
         .def(
             "drain_f1",
             [](motor_core::TelemetryProcessor& processor,
@@ -183,6 +258,30 @@ PYBIND11_MODULE(motor_core_cpp, module) {
                 return f1_samples_to_python(samples);
             },
             py::arg("max_samples") = 8192)
+        .def(
+            "drain_f2",
+            [](motor_core::TelemetryProcessor& processor,
+               std::size_t max_samples) {
+                std::vector<motor_core::F2Sample> samples;
+                {
+                    py::gil_scoped_release release;
+                    samples = processor.drain_f2(max_samples);
+                }
+                return f2_samples_to_python(samples);
+            },
+            py::arg("max_samples") = 512)
+        .def(
+            "drain_f3",
+            [](motor_core::TelemetryProcessor& processor,
+               std::size_t max_samples) {
+                std::vector<motor_core::F3Sample> samples;
+                {
+                    py::gil_scoped_release release;
+                    samples = processor.drain_f3(max_samples);
+                }
+                return f3_samples_to_python(samples);
+            },
+            py::arg("max_samples") = 512)
         .def(
             "drain_bursts",
             [](motor_core::TelemetryProcessor& processor,
@@ -245,6 +344,30 @@ PYBIND11_MODULE(motor_core_cpp, module) {
             },
             py::arg("max_samples") = 8192)
         .def(
+            "drain_f2",
+            [](motor_core::TcpV2Receiver& receiver,
+               std::size_t max_samples) {
+                std::vector<motor_core::F2Sample> samples;
+                {
+                    py::gil_scoped_release release;
+                    samples = receiver.drain_f2(max_samples);
+                }
+                return f2_samples_to_python(samples);
+            },
+            py::arg("max_samples") = 512)
+        .def(
+            "drain_f3",
+            [](motor_core::TcpV2Receiver& receiver,
+               std::size_t max_samples) {
+                std::vector<motor_core::F3Sample> samples;
+                {
+                    py::gil_scoped_release release;
+                    samples = receiver.drain_f3(max_samples);
+                }
+                return f3_samples_to_python(samples);
+            },
+            py::arg("max_samples") = 512)
+        .def(
             "drain_bursts",
             [](motor_core::TcpV2Receiver& receiver,
                std::size_t max_bursts) {
@@ -257,6 +380,8 @@ PYBIND11_MODULE(motor_core_cpp, module) {
             },
             py::arg("max_bursts") = 1)
         .def("set_f1_rate_hz", &motor_core::TcpV2Receiver::set_f1_rate_hz)
+        .def("set_rls_coefficients_si",
+             &motor_core::TcpV2Receiver::set_rls_coefficients_si)
         .def("set_telemetry_processing_enabled",
              &motor_core::TcpV2Receiver::set_telemetry_processing_enabled)
         .def("reset_burst", &motor_core::TcpV2Receiver::reset_burst)
