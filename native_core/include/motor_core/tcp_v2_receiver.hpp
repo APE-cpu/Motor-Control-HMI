@@ -44,6 +44,8 @@ public:
     std::vector<BurstCapture> drain_bursts(std::size_t max_bursts = 1);
     void set_f1_rate_hz(std::uint32_t value) noexcept;
     void set_rls_coefficients_si(bool value) noexcept;
+    void set_host_rls_enabled(bool enabled, bool reset = true);
+    bool host_rls_enabled() const noexcept;
     void set_telemetry_processing_enabled(bool enabled) noexcept;
     void reset_burst();
     ReceiverStats stats() const;

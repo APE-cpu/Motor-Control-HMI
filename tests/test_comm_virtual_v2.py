@@ -251,7 +251,34 @@ def test_F3根据握手固件标识解码SI系数():
 
     assert outputs[0]["innov_rms_a"] == pytest.approx(0.125)
     assert outputs[0]["b_dd0_si"] == pytest.approx(0.05)
+    assert outputs[0]["rd_ohm"] == pytest.approx(2.0)
+    assert outputs[0]["ld_mh"] == pytest.approx(1.25)
     assert received == outputs
+
+
+def test_F3用完整ARX系数换算等效电阻电感():
+    comm = CommManager()
+    comm._native_telemetry_processor = None
+    session = ProtocolSession()
+    session.capabilities = DeviceCapabilities(
+        "DEVICE", "0.7.6-rls-si-test")
+    comm._v2_session = session
+
+    # 物理一阶模型 a=0.9、b=0.05（R=2Ω、L=1.25mH）乘上
+    # 可约消因子 (1-0.4z^-1)。传递函数未变，但 a1/b0 已不再能换算 R/L。
+    theta_d = [1.3, -0.36, 0.0, 0.05, -0.02, 0.0, 0.0]
+    theta_q = [1.3, -0.36, 0.0, 0.0, 0.0, 0.05, -0.02]
+    payload = struct.pack(
+        "<IIff14f", 123, 456, 0.125, 99.0, *(theta_d + theta_q))
+    raw = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF3, payload=payload))
+
+    sample = comm._process_v2_responses([raw])[0]
+
+    assert sample["rd_ohm"] == pytest.approx(2.0, rel=1e-5)
+    assert sample["rq_ohm"] == pytest.approx(2.0, rel=1e-5)
+    assert sample["ld_mh"] == pytest.approx(1.25, rel=1e-5)
+    assert sample["lq_mh"] == pytest.approx(1.25, rel=1e-5)
 
 
 def test_通信页静默接受1kHz批量F1且限制日志长度():

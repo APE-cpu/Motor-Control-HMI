@@ -1,5 +1,6 @@
 """电机控制页面：电机信息、位置传感器、控制方式、参数面板、控制按钮。"""
 import json
+import math
 import time
 from datetime import datetime
 from PySide6.QtCore import Qt
@@ -94,8 +95,12 @@ _FIRMWARE_RUNTIME_KEYS = (
     "position_speed_ff_rpm",
     "iq_ref_a",
     "iq_ramp_ms",
+    "current_filter_enabled",
+    "current_filter_alpha_q15",
+    "speed_fifo_depth",
 )
 _TELEMETRY_FRESH_S = 1.5
+_CURRENT_LOOP_SAMPLE_RATE_HZ = 16000.0
 # Eco telemetry (F1 200 Hz, F2/F3 off). Must NOT be sent in the same click as
 # START: stacking 0x22 + 0x10 made START miss its 1 s ACK window in lab.
 
@@ -113,6 +118,25 @@ def firmware_runtime_payload(values: dict) -> bytes:
             text = str(value)
         parts.append(f"{key}={text}")
     return ";".join(parts).encode("utf-8")
+
+
+def current_filter_alpha_q15(cutoff_hz: float) -> int:
+    """把一阶低通截止频率转换成 y=alpha*x+(1-alpha)*y1 的Q15系数。"""
+    cutoff = float(cutoff_hz)
+    if not math.isfinite(cutoff) or not 1000.0 <= cutoff <= 4000.0:
+        raise ValueError("电流反馈滤波截止频率必须在1000..4000 Hz")
+    alpha = 1.0 - math.exp(
+        -2.0 * math.pi * cutoff / _CURRENT_LOOP_SAMPLE_RATE_HZ)
+    return max(1, min(32767, round(alpha * 32768.0)))
+
+
+def current_filter_cutoff_hz(alpha_q15: int) -> float:
+    """把固件回读Q15系数还原为16 kHz采样下的等效截止频率。"""
+    alpha = int(alpha_q15) / 32768.0
+    if not 0.0 < alpha < 1.0:
+        return 0.0
+    return (-_CURRENT_LOOP_SAMPLE_RATE_HZ / (2.0 * math.pi)
+            * math.log(1.0 - alpha))
 
 
 def _field_with_hint(widget: QWidget, hint: str) -> QWidget:
@@ -198,6 +222,7 @@ class ControlPage(QWidget):
         self._current_sensor_name = POSITION_SENSORS[1]
         self._start_command_pending = False
         self._start_retry_not_before = 0.0
+        self._simulation_snapshot_provider = None
 
         # 为所有可能的控制方式各建一份控制器和面板（懒加载亦可，这里为简洁全建）
         self._controllers = {name: cls() for name, (cls, _) in _MODE_REGISTRY.items()}
@@ -379,180 +404,129 @@ class ControlPage(QWidget):
         v.addWidget(self._target_position_field)
         self._set_position_target_visible(False)
 
-        v.addWidget(self._build_load_box())
+        filter_box = QGroupBox("固件 Id/Iq 反馈滤波")
+        filter_form = QFormLayout(filter_box)
+        self._current_filter_mode = QComboBox()
+        self._current_filter_mode.addItem("旁路（原始反馈）", False)
+        self._current_filter_mode.addItem("一阶 IIR（参与电流 PI）", True)
+        self._current_filter_mode.currentIndexChanged.connect(
+            self._on_current_filter_mode_changed)
+        self._current_filter_cutoff = QSpinBox()
+        self._current_filter_cutoff.setRange(1000, 4000)
+        self._current_filter_cutoff.setSingleStep(100)
+        self._current_filter_cutoff.setValue(2500)
+        self._current_filter_cutoff.setSuffix(" Hz")
+        self._current_filter_cutoff.setToolTip(
+            "16 kHz电流环的一阶低通截止频率。越低降噪越强，"
+            "但相位滞后越大；运行中禁止修改。")
+        self._current_filter_status = QLabel("固件回读：等待遥测")
+        self._current_filter_status.setWordWrap(True)
+        self._current_filter_status.setStyleSheet("color:#90a4ae;")
+        self._btn_apply_current_filter = QPushButton("单独下发滤波设置")
+        self._btn_apply_current_filter.clicked.connect(
+            self._on_apply_current_filter)
+        filter_form.addRow("方式", self._current_filter_mode)
+        filter_form.addRow(
+            "截止频率",
+            _field_with_hint(self._current_filter_cutoff, "1 ～ 4 kHz"))
+        filter_form.addRow("实际状态", self._current_filter_status)
+        filter_form.addRow("", self._btn_apply_current_filter)
+        v.addWidget(filter_box)
+        self._on_current_filter_mode_changed()
+
+        speed_fifo_box = QGroupBox("编码器速度反馈 FIFO")
+        speed_fifo_form = QFormLayout(speed_fifo_box)
+        self._speed_fifo_depth = QComboBox()
+        for depth in (1, 2, 4, 8, 16):
+            delay_ms = (depth - 1) / 2.0 / 500.0 * 1000.0
+            self._speed_fifo_depth.addItem(
+                f"{depth} 点（约 {delay_ms:g} ms 群延迟）", depth)
+        self._speed_fifo_depth.setCurrentIndex(
+            self._speed_fifo_depth.findData(16))
+        self._speed_fifo_depth.setToolTip(
+            "MCSDK编码器速度在500 Hz下的滑动平均窗口。窗口越小延迟越低，"
+            "但编码器量化噪声越明显；只允许停机时修改。")
+        self._speed_fifo_status = QLabel("固件回读：等待遥测")
+        self._speed_fifo_status.setWordWrap(True)
+        self._speed_fifo_status.setStyleSheet("color:#90a4ae;")
+        self._btn_apply_speed_fifo = QPushButton("单独下发 FIFO 设置")
+        self._btn_apply_speed_fifo.clicked.connect(self._on_apply_speed_fifo)
+        speed_fifo_form.addRow("平均窗口", self._speed_fifo_depth)
+        speed_fifo_form.addRow("实际状态", self._speed_fifo_status)
+        speed_fifo_form.addRow("", self._btn_apply_speed_fifo)
+        v.addWidget(speed_fifo_box)
+
         v.addStretch(1)
         return box
 
-    def _build_load_box(self) -> QGroupBox:
-        """负载与机械：负载类型 + B/Tc/J，可应用到数字孪生（仿真下真实生效）。"""
-        box = QGroupBox("负载与机械")
-        f = QFormLayout(box)
-        sp = self._comm.motor_sim_params()
+    def _on_current_filter_mode_changed(self, _index: int = -1) -> None:
+        enabled = bool(self._current_filter_mode.currentData())
+        self._current_filter_cutoff.setEnabled(enabled)
+        cutoff = float(self._current_filter_cutoff.value())
+        alpha = current_filter_alpha_q15(cutoff)
+        self._current_filter_mode.setToolTip(
+            (f"IIR将参与Id/Iq电流PI；当前α={alpha}/32768"
+             if enabled else
+             "完全旁路：Id/Iq原始反馈直接进入电流PI"))
 
-        self._load_type = QComboBox()
-        self._load_type.addItems([
-            "空载", "恒转矩负载", "风机/泵类 (∝ω²)", "对拖系统 (可正负/回馈)"])
-        self._load_type.currentIndexChanged.connect(self._on_load_type_changed)
-        self._load_value = QDoubleSpinBox()
-        self._load_value.setRange(-100.0, 100.0)
-        self._load_value.setDecimals(3)
-        self._load_value.setSingleStep(0.05)
-        self._load_value.setValue(0.0)
-        self._load_value.setEnabled(False)     # 默认空载
-        self._load_value.setToolTip(
-            "恒转矩/对拖：负载转矩 N·m（对拖可为负=助力/回馈）；\n"
-            "风机泵类：额定转速下的负载系数（实际负载 ∝ 转速²）。")
+    def _current_filter_runtime_values(self) -> dict:
+        return {
+            "current_filter_enabled": (
+                1 if bool(self._current_filter_mode.currentData()) else 0),
+            "current_filter_alpha_q15": current_filter_alpha_q15(
+                self._current_filter_cutoff.value()),
+        }
 
-        self._visc_b = self._mech_spin(sp.B, 6, 0.0005)
-        self._coulomb = self._mech_spin(sp.T_coulomb, 4, 0.01)
-        self._inertia = self._mech_spin(sp.J, 6, 0.0005)
+    def _on_apply_current_filter(self) -> None:
+        if not self._comm.is_connected():
+            QMessageBox.warning(self, "无法下发", "请先连接真实F407控制器。")
+            return
+        if int(getattr(self._comm.latest_frame(), "mc_state", 0)) == 6:
+            QMessageBox.warning(
+                self, "运行中禁止修改",
+                "请先停机再切换旁路或调整截止频率，避免闭环相位发生突变。")
+            return
+        values = self._current_filter_runtime_values()
+        payload = firmware_runtime_payload(values)
+        pending_before = self._comm.protocol_status().get("pending_ack", 0)
+        sent = self._comm.send_frame(encode_frame(CMD_SET_PARAMS, payload))
+        pending_after = self._comm.protocol_status().get("pending_ack", 0)
+        submitted = sent or pending_after > pending_before
+        self._current_filter_status.setText(
+            "设置已提交，等待固件遥测回读"
+            if submitted else "未发送：请检查v2连接与固件能力")
+        logger.log(
+            "下发电流反馈滤波",
+            f"enabled={values['current_filter_enabled']} "
+            f"alpha_q15={values['current_filter_alpha_q15']} "
+            f"cutoff={self._current_filter_cutoff.value()}Hz")
 
-        f.addRow("负载类型", self._load_type)
-        f.addRow("负载转矩/系数", self._load_value)
-        f.addRow("粘滞摩擦 B (N·m·s/rad)", self._visc_b)
-        f.addRow("库仑摩擦 Tc (N·m)", self._coulomb)
-        f.addRow("转动惯量 J (kg·m²)", self._inertia)
+    def _speed_fifo_runtime_values(self) -> dict:
+        return {"speed_fifo_depth": int(self._speed_fifo_depth.currentData())}
 
-        btn_apply = QPushButton("应用到数字孪生")
-        btn_apply.setToolTip("把负载与机械参数写入虚拟电机（仿真运行时立即生效）")
-        btn_apply.clicked.connect(self._on_apply_mechanical)
-        f.addRow("", btn_apply)
-
-        # ---- 负载扰动：让运行曲线更丰富 ----
-        self._disturb_amp = QDoubleSpinBox()
-        self._disturb_amp.setRange(0.01, 100.0)
-        self._disturb_amp.setDecimals(3)
-        self._disturb_amp.setSingleStep(0.05)
-        self._disturb_amp.setValue(0.3)
-        self._disturb_amp.setToolTip("扰动幅值 N·m：叠加在当前负载之上的转矩变化量")
-        self._disturb_dur = QDoubleSpinBox()
-        self._disturb_dur.setRange(0.1, 60.0)
-        self._disturb_dur.setDecimals(1)
-        self._disturb_dur.setSingleStep(0.5)
-        self._disturb_dur.setValue(1.0)
-        self._disturb_dur.setToolTip("突加/突卸持续时间 s：到时自动撤除")
-        self._disturb_period = QDoubleSpinBox()
-        self._disturb_period.setRange(0.2, 60.0)
-        self._disturb_period.setDecimals(1)
-        self._disturb_period.setSingleStep(0.5)
-        self._disturb_period.setValue(2.0)
-        self._disturb_period.setToolTip("周期扰动的方波周期 s")
-        f.addRow("扰动幅值 (N·m)", self._disturb_amp)
-
-        db = QHBoxLayout()
-        self._btn_pulse_add = QPushButton("突加负载")
-        self._btn_pulse_add.setToolTip("在当前负载上瞬间叠加 +幅值，持续设定秒数后撤除")
-        self._btn_pulse_add.clicked.connect(lambda: self._on_pulse(+1))
-        self._btn_pulse_shed = QPushButton("突卸负载")
-        self._btn_pulse_shed.setToolTip("瞬间叠加 −幅值（减载/助力），持续设定秒数后恢复")
-        self._btn_pulse_shed.clicked.connect(lambda: self._on_pulse(-1))
-        db.addWidget(self._btn_pulse_add)
-        db.addWidget(self._btn_pulse_shed)
-        db.addWidget(QLabel("持续(s)"))
-        db.addWidget(self._disturb_dur)
-        f.addRow("一次性扰动", db)
-
-        pb = QHBoxLayout()
-        self._btn_disturb = QPushButton("开启周期扰动")
-        self._btn_disturb.setCheckable(True)
-        self._btn_disturb.setToolTip("周期方波负载：在 ±幅值间来回突变，持续激励，曲线一直起伏")
-        self._btn_disturb.toggled.connect(self._on_toggle_disturb)
-        pb.addWidget(self._btn_disturb)
-        pb.addWidget(QLabel("周期(s)"))
-        pb.addWidget(self._disturb_period)
-        f.addRow("周期扰动", pb)
-
-        self._mech_status = QLabel("提示：仿真运行时生效；真机需外接测功机加载")
-        self._mech_status.setWordWrap(True)
-        self._mech_status.setStyleSheet("color: #8fa3b8;")
-        f.addRow(self._mech_status)
-        return box
-
-    @staticmethod
-    def _mech_spin(val: float, decimals: int, step: float) -> QDoubleSpinBox:
-        sp = QDoubleSpinBox()
-        sp.setRange(0.0, 1e4)
-        sp.setDecimals(decimals)
-        sp.setSingleStep(step)
-        sp.setValue(val)
-        return sp
-
-    def _on_load_type_changed(self, idx: int) -> None:
-        self._load_value.setEnabled(idx != 0)   # 空载禁用数值
-        if self.is_sim_running():
-            self._apply_load_to_sim()
+    def _on_apply_speed_fifo(self) -> None:
+        if not self._comm.is_connected():
+            QMessageBox.warning(self, "无法下发", "请先连接真实F407控制器。")
+            return
+        if int(getattr(self._comm.latest_frame(), "mc_state", 0)) == 6:
+            QMessageBox.warning(
+                self, "运行中禁止修改",
+                "请先停机再修改编码器速度FIFO，避免速度反馈瞬间跳变。")
+            return
+        values = self._speed_fifo_runtime_values()
+        pending_before = self._comm.protocol_status().get("pending_ack", 0)
+        sent = self._comm.send_frame(encode_frame(
+            CMD_SET_PARAMS, firmware_runtime_payload(values)))
+        pending_after = self._comm.protocol_status().get("pending_ack", 0)
+        submitted = sent or pending_after > pending_before
+        self._speed_fifo_status.setText(
+            "设置已提交，等待固件遥测回读"
+            if submitted else "未发送：请检查v2连接与固件能力")
+        logger.log("下发编码器速度FIFO",
+                   f"depth={values['speed_fifo_depth']}")
 
     def is_sim_running(self) -> bool:
         return self._comm.is_sim_running()
-
-    @staticmethod
-    def _compute_load(load_type_idx: int, value: float, rpm: float) -> float:
-        """按负载类型与当前转速算外部负载转矩 N·m。"""
-        if load_type_idx == 0:        # 空载
-            return 0.0
-        if load_type_idx == 2:        # 风机/泵：∝ω²，value=1000rpm 处负载
-            return value * (rpm / 1000.0) ** 2
-        return value                  # 恒转矩 / 对拖（常量，对拖可负）
-
-    def _apply_load_to_sim(self) -> None:
-        if not self.is_sim_running():
-            return
-        load = self._compute_load(self._load_type.currentIndex(),
-                                  self._load_value.value(),
-                                  abs(self._latest_speed()))
-        self._comm.set_sim_load(load)
-
-    def _latest_speed(self) -> float:
-        return getattr(self, "_last_speed_rpm", 0.0)
-
-    def _on_apply_mechanical(self) -> None:
-        sp = self._comm.motor_sim_params()
-        sp.B = self._visc_b.value()
-        sp.T_coulomb = self._coulomb.value()
-        sp.J = self._inertia.value()
-        self._apply_load_to_sim()
-        where = "已写入数字孪生（仿真生效）" if self.is_sim_running() else \
-            "已保存（仿真启动后生效；真机需外接测功机）"
-        self._mech_status.setText(
-            f"{self._load_type.currentText()}：负载 "
-            f"{self._compute_load(self._load_type.currentIndex(), self._load_value.value(), 1000):.3f} N·m"
-            f"@1000rpm，B={sp.B:.4g} Tc={sp.T_coulomb:.4g} J={sp.J:.4g}——{where}")
-        logger.log("应用负载与机械",
-                   f"类型={self._load_type.currentText()} 值={self._load_value.value()} "
-                   f"B={sp.B} Tc={sp.T_coulomb} J={sp.J}")
-
-    def _on_pulse(self, sign: int) -> None:
-        """突加(+1)/突卸(-1)负载：一次性阶跃扰动。"""
-        if not self.is_sim_running():
-            self._mech_status.setText("负载扰动仅在仿真运行时有效，请先启动仿真")
-            return
-        amp = sign * self._disturb_amp.value()
-        dur = self._disturb_dur.value()
-        self._comm.pulse_sim_load(amp, dur)
-        kind = "突加" if sign > 0 else "突卸"
-        self._mech_status.setText(
-            f"{kind}负载 {abs(amp):.3f} N·m，持续 {dur:.1f}s——观察转速跌落与恢复")
-        logger.log("负载扰动", f"{kind} {amp:+.3f}N·m {dur:.1f}s")
-
-    def _on_toggle_disturb(self, on: bool) -> None:
-        """开/关周期方波负载扰动。"""
-        if on and not self.is_sim_running():
-            self._btn_disturb.setChecked(False)
-            self._mech_status.setText("负载扰动仅在仿真运行时有效，请先启动仿真")
-            return
-        if on:
-            amp = self._disturb_amp.value()
-            period = self._disturb_period.value()
-            self._comm.set_sim_load_disturbance(amp, period)
-            self._btn_disturb.setText("停止周期扰动")
-            self._mech_status.setText(
-                f"周期扰动开启：±{amp:.3f} N·m 方波，周期 {period:.1f}s")
-            logger.log("负载扰动", f"周期方波 ±{amp:.3f}N·m 周期{period:.1f}s")
-        else:
-            self._comm.set_sim_load_disturbance(0.0, 0.0)
-            self._btn_disturb.setText("开启周期扰动")
-            self._mech_status.setText("周期扰动已停止")
-            logger.log("负载扰动", "周期方波停止")
 
     def _build_param_box(self) -> QGroupBox:
         box = QGroupBox("控制参数调整")
@@ -600,6 +574,9 @@ class ControlPage(QWidget):
             "kp_cur": 2323.0, "ki_cur": 2077.0,
             "iq_max": 1.887, "max_current_a": 1.887,
             "max_rpm": 4000,
+            "current_filter_enabled": 0,
+            "current_filter_cutoff_hz": 2500,
+            "speed_fifo_depth": 16,
             "description": "当前实验平台稳定基线",
         }
 
@@ -649,6 +626,9 @@ class ControlPage(QWidget):
         values = dict(panel.values())
         profiles[name] = {
             **values,
+            **self._current_filter_runtime_values(),
+            **self._speed_fifo_runtime_values(),
+            "current_filter_cutoff_hz": self._current_filter_cutoff.value(),
             "profile_version": 2,
             "control_mode": mode,
             "target_speed_rpm": self._target_speed.value(),
@@ -714,6 +694,19 @@ class ControlPage(QWidget):
             self._target_speed.setValue(int(values["target_speed_rpm"]))
         if "target_position_deg" in values:
             self._target_position.setValue(float(values["target_position_deg"]))
+        if "current_filter_enabled" in values:
+            index = self._current_filter_mode.findData(
+                bool(int(values["current_filter_enabled"])))
+            if index >= 0:
+                self._current_filter_mode.setCurrentIndex(index)
+        if "current_filter_cutoff_hz" in values:
+            self._current_filter_cutoff.setValue(
+                int(values["current_filter_cutoff_hz"]))
+        if "speed_fifo_depth" in values:
+            index = self._speed_fifo_depth.findData(
+                int(values["speed_fifo_depth"]))
+            if index >= 0:
+                self._speed_fifo_depth.setCurrentIndex(index)
         logger.log(
             "加载控制参数方案",
             f"方案={self._pi_profile_combo.currentText()} 模式={mode} "
@@ -863,6 +856,38 @@ class ControlPage(QWidget):
     def _current_mode(self) -> str:
         return self._mode_text_to_mode(self._mode_combo.currentText())
 
+    def set_simulation_snapshot_provider(self, provider) -> None:
+        """注入独立数字孪生页的只读归档接口，避免控制页持有仿真控件。"""
+        self._simulation_snapshot_provider = provider
+
+    def current_loop_analysis_snapshot(self) -> dict:
+        """供波特图页读取当前UI增益和固件滤波回读，不改变控制状态。"""
+        mode = self._current_mode()
+        mode_params = (
+            dict(self._panels[mode].values()) if mode in self._panels else {})
+        frame = self._comm.latest_frame()
+        real_feedback = getattr(frame, "data_source", "") == "real"
+        filter_enabled = (
+            bool(getattr(frame, "current_filter_enabled", False))
+            if real_feedback else
+            bool(self._current_filter_mode.currentData()))
+        filter_alpha_q15 = (
+            int(getattr(frame, "current_filter_alpha_q15", 0) or 0)
+            if real_feedback else
+            current_filter_alpha_q15(self._current_filter_cutoff.value()))
+        if filter_alpha_q15 <= 0:
+            filter_alpha_q15 = current_filter_alpha_q15(
+                self._current_filter_cutoff.value())
+        return {
+            "kp_cur_digit": int(round(float(mode_params.get("kp_cur", 2323)))),
+            "ki_cur_digit": int(round(float(mode_params.get("ki_cur", 2077)))),
+            "sample_rate_hz": int(_CURRENT_LOOP_SAMPLE_RATE_HZ),
+            "vbus_v": float(getattr(frame, "vdc", 0.0) or 24.0),
+            "filter_enabled": filter_enabled,
+            "filter_alpha_q15": filter_alpha_q15,
+            "source": "固件遥测+当前控制页" if real_feedback else "当前控制页默认值",
+        }
+
     def experiment_snapshot(self) -> dict:
         """导出当前控制配置的只读实验快照，不下发参数也不改变 UI 状态。"""
         motor_info = load_motor_info()
@@ -875,17 +900,9 @@ class ControlPage(QWidget):
             name: dict(self._sensor_panels[name].values())
             for name in sensors if name in self._sensor_panels
         }
-        mechanical = {
-            "load_type": self._load_type.currentText(),
-            "load_value": self._load_value.value(),
-            "viscous_friction_B": self._visc_b.value(),
-            "coulomb_friction_Tc": self._coulomb.value(),
-            "inertia_J": self._inertia.value(),
-            "disturbance_amplitude_Nm": self._disturb_amp.value(),
-            "disturbance_duration_s": self._disturb_dur.value(),
-            "disturbance_period_s": self._disturb_period.value(),
-            "periodic_disturbance_enabled": self._btn_disturb.isChecked(),
-        }
+        mechanical = (
+            dict(self._simulation_snapshot_provider())
+            if callable(self._simulation_snapshot_provider) else {})
         protection_keys = {
             "iq_max", "current_upper", "current_limit", "voltage_limit",
             "u_min", "u_max", "delta_u_max", "x_min", "x_max",
@@ -918,6 +935,18 @@ class ControlPage(QWidget):
                 "target_speed_rpm": self._target_speed.value(),
                 "target_position_deg": self._target_position.value(),
                 "mode_params": mode_params,
+                "current_feedback_filter": {
+                    **self._current_filter_runtime_values(),
+                    "cutoff_hz": self._current_filter_cutoff.value(),
+                    "sample_rate_hz": int(_CURRENT_LOOP_SAMPLE_RATE_HZ),
+                },
+                "speed_feedback_fifo": {
+                    **self._speed_fifo_runtime_values(),
+                    "sample_rate_hz": 500,
+                    "group_delay_ms": (
+                        (self._speed_fifo_runtime_values()["speed_fifo_depth"] - 1)
+                        / 2.0 / 500.0 * 1000.0),
+                },
                 "sensor_params": sensor_params,
                 "mechanical_load": mechanical,
             },
@@ -957,6 +986,12 @@ class ControlPage(QWidget):
             self._syncing_iq_limit = False
 
     def _on_apply(self) -> None:
+        if self._comm.is_sim_running() and not self._comm.is_connected():
+            QMessageBox.information(
+                self, "固件参数与仿真已分离",
+                "当前页面只发送 F407 固件参数。数字孪生采用独立的控制结构和参数单位，"
+                "请在“数字孪生”页面设置仿真目标、机械参数和负载。")
+            return
         mode = self._current_mode()
         if not mode:
             return
@@ -1000,8 +1035,16 @@ class ControlPage(QWidget):
                     "speed_closed"),
                 "target": self._target_speed.value(),
                 "position_target_deg": self._target_position.value()}
+        filter_values = (
+            {} if int(getattr(self._comm.latest_frame(), "mc_state", 0)) == 6
+            else self._current_filter_runtime_values())
+        fifo_values = (
+            {} if int(getattr(self._comm.latest_frame(), "mc_state", 0)) == 6
+            else self._speed_fifo_runtime_values())
         payload = firmware_runtime_payload({
             **params,
+            **filter_values,
+            **fifo_values,
             "control_mode": meta["control_mode"],
             "target": meta["target"],
             "position_target_deg": meta["position_target_deg"],
@@ -1018,8 +1061,8 @@ class ControlPage(QWidget):
                    f"传感器={meta['sensors'] or '无'} 电流限幅={current_limit:.2f}A")
         downstream_note = (
             "真机已应用：位置/速度/电流PI、速度前馈、位置速度限幅、最高转速与Iq限流。"
-            if self._comm.is_connected() and not self._comm.is_sim_running()
-            else "数字孪生已应用全部界面参数。")
+            if self._comm.is_connected() else
+            "未连接真机，参数没有发送；数字孪生参数请在独立页面设置。")
         QMessageBox.information(
             self, "已应用",
             f"电机：{meta['motor']}\n"
@@ -1042,6 +1085,11 @@ class ControlPage(QWidget):
         self._comm.send_frame_with_id(frame, can_id=can_id)
 
     def _on_start(self) -> None:
+        if self._comm.is_sim_running() and not self._comm.is_connected():
+            QMessageBox.information(
+                self, "请使用数字孪生工作台",
+                "固件控制与数字孪生已经分离。请到“数字孪生”页面运行仿真模型。")
+            return
         now = time.monotonic()
         if self._start_command_pending:
             logger.log("忽略重复启动", "上一条START仍在等待设备ACK")
@@ -1223,7 +1271,28 @@ class ControlPage(QWidget):
             self._device_limits.setText(
                 f"最高 {frame.max_rpm:.0f} rpm｜Iq限流 {frame.current_limit_a:.3f} A｜"
                 f"跑飞阈值 {frame.runaway_limit_rpm:.0f} rpm")
-        # 风机/泵类负载随转速平方实时变化，需逐帧刷新
-        if (self.is_sim_running() and hasattr(self, "_load_type")
-                and self._load_type.currentIndex() == 2):
-            self._apply_load_to_sim()
+            alpha = int(getattr(frame, "current_filter_alpha_q15", 0) or 0)
+            enabled = bool(getattr(frame, "current_filter_enabled", False))
+            if alpha > 0:
+                cutoff = current_filter_cutoff_hz(alpha)
+                self._current_filter_status.setText(
+                    (f"已启用 · Id/Iq参与PI · fc≈{cutoff:.0f} Hz · α={alpha} · "
+                     "16 kHz F1 Iq显示PI实际反馈"
+                     if enabled else
+                     f"已旁路 · α预置={alpha}（fc≈{cutoff:.0f} Hz）"))
+                self._current_filter_status.setStyleSheet(
+                    "color:#69f0ae;" if enabled else "color:#90a4ae;")
+            else:
+                self._current_filter_status.setText(
+                    "固件未回报滤波状态（可能是旧版本）")
+                self._current_filter_status.setStyleSheet("color:#ffb74d;")
+            fifo_depth = int(getattr(frame, "speed_fifo_depth", 0) or 0)
+            if 1 <= fifo_depth <= 16:
+                delay_ms = (fifo_depth - 1) / 2.0 / 500.0 * 1000.0
+                self._speed_fifo_status.setText(
+                    f"已应用 · {fifo_depth}点平均 · 约{delay_ms:g} ms群延迟")
+                self._speed_fifo_status.setStyleSheet("color:#69f0ae;")
+            else:
+                self._speed_fifo_status.setText(
+                    "固件未回报FIFO深度（可能是旧版本）")
+                self._speed_fifo_status.setStyleSheet("color:#ffb74d;")

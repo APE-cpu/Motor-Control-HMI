@@ -302,7 +302,9 @@ class _TcpPanel(QWidget):
         f = QFormLayout(self)
         self.host = QLineEdit("192.168.1.50")
         self.port = QSpinBox(); self.port.setRange(1, 65535); self.port.setValue(5000)
-        self.timeout = QDoubleSpinBox(); self.timeout.setRange(1.0, 60.0); self.timeout.setValue(10.0)
+        # 这是板卡直连局域网，正常建连应在几十毫秒内完成。较长超时会在
+        # 网线/固件异常时先等原生接收器、再等 Python 回退，阻塞界面数十秒。
+        self.timeout = QDoubleSpinBox(); self.timeout.setRange(0.2, 60.0); self.timeout.setValue(1.0)
         # 空 = 自动选择与板卡同网段的有线网卡，避免 WLAN/Clash TUN 抢走路由。
         self.local_host = QLineEdit("192.168.1.15")
         self.local_host.setPlaceholderText("空=自动同网段网卡")
@@ -525,11 +527,11 @@ class CommunicationPage(QWidget):
         row = QHBoxLayout()
         self._tele_level = QComboBox()
         self._tele_level.addItem("省流·安全（最稳，只留相电流）", "eco")
-        self._tele_level.addItem("标准（默认：相电流 + 采样诊断）", "std")
-        self._tele_level.addItem("示波器·16kHz（TCP连续原始点）", "scope16k")
+        self._tele_level.addItem("标准·16kHz（以太网连续原始点）", "std")
+        self._tele_level.addItem("兼容模式（固件16点平均；TCP 1k/UART 200Hz）", "compat")
         self._tele_level.addItem("辨识（开在线RLS，相电流保持链路全速）", "id")
         self._tele_level.addItem("自定义", "custom")
-        self._tele_level.setCurrentIndex(1)   # 标准 = 固件默认
+        self._tele_level.setCurrentIndex(1)   # 标准 = 16 kHz 原始流
         self._tele_level.currentIndexChanged.connect(self._on_tele_changed)
         row.addWidget(QLabel("档位："))
         row.addWidget(self._tele_level, 1)
@@ -585,11 +587,10 @@ class CommunicationPage(QWidget):
             return 0x00, 5, 20, 100
         if key == "std":
             return 0x01, 0, 20, 100
-        if key == "scope16k":
+        if key == "compat":
             return 0x01, 0, 20, 100
         if key == "id":
-            # 辨识不能牺牲电流波形采样率：0 表示使用当前传输链路默认值，
-            # TCP 为 1 kHz，串口为 200 Hz；F3 仍以 10 Hz 独立发送。
+            # F3 以 10 Hz 独立发送；有以太网时F1仍保持16 kHz。
             return 0x03, 0, 20, 100
         flags = ((0x01 if self._tele_f2_on.isChecked() else 0) |
                  (0x02 if self._tele_f3_on.isChecked() else 0))
@@ -599,8 +600,11 @@ class CommunicationPage(QWidget):
 
     def _resolve_f1_stream_rate_hz(self) -> int:
         """返回FOC中断连续流速率；0表示沿用旧毫秒周期采样器。"""
-        if self._tele_level.currentData() == "scope16k":
-            return 16000
+        key = self._tele_level.currentData()
+        ethernet = self._kind.currentText() in ("以太网TCP", "RS-485+以太网")
+        if key in ("std", "id"):
+            # 串口/CAN无法承载16 kHz，只能回退到兼容采样器。
+            return 16000 if ethernet else 0
         if self._tele_level.currentData() == "custom":
             value = int(self._tele_f1.currentData())
             return -value if value < 0 else 0
@@ -612,13 +616,18 @@ class CommunicationPage(QWidget):
         if stream_rate:
             f1txt = f"{stream_rate // 1000}kHz"
         elif f1 == 0:
-            f1txt = "自动"
+            ethernet = self._kind.currentText() in (
+                "以太网TCP", "RS-485+以太网")
+            f1txt = "1kHz" if ethernet else "200Hz"
         else:
             hz = round(1000 / f1)
             f1txt = "1kHz" if hz >= 1000 else f"{hz}Hz"
         self._tele_hint.setText(
             f"相电流{f1txt} · 诊断{'开' if flags & 1 else '关'} · "
-            f"辨识{'开' if flags & 2 else '关'}")
+            f"辨识{'开' if flags & 2 else '关'}"
+            + (" · 串口/CAN已回退兼容模式"
+               if self._tele_level.currentData() in ("std", "id")
+               and not stream_rate else ""))
 
     def _build_telemetry_detail(self) -> QWidget:
         """遥测档位详情面板：各通道频率、字节数、内容分解。"""
@@ -642,10 +651,11 @@ class CommunicationPage(QWidget):
 
         # F1: 高速遥测 (200Hz~16kHz, 电流/电压)
         f1 = QLabel(
-            "🔹 <b>F1 高速遥测</b> | 200 Hz (串口) / 1~16 kHz (TCP, 16点批量) | 22字节/点\n"
+            "🔹 <b>F1 高速遥测</b> | 标准16 kHz原始流 / 兼容200 Hz~1 kHz | 22字节/点\n"
             "   电角度 (u16) · Iq (s16码值, ×0.000629→A) · 相电流 Ia/Ib (s16码值, ×0.000629→A)\n"
             "   施加电压 Vd/Vq (s16码值, ×0.000324→V) · 母线电压 Vbus (u16, 0.1V分辨率)\n"
-            "   <i>16kHz档由FOC中断逐周期写入环形缓冲；TCP批量发送，网络仍约1000帧/秒</i>")
+            "   <i>标准模式由FOC中断逐周期写入环形缓冲、不做数字平均；"
+            "兼容模式保留固件16点箱式平均</i>")
         f1.setWordWrap(True)
         v.addWidget(f1)
 
@@ -709,6 +719,8 @@ class CommunicationPage(QWidget):
     def _on_kind_changed(self, idx: int) -> None:
         # idx: 0=RS-232, 1=RS-485, 2=CAN, 3=TCP, 4=RS-485+以太网
         self._stack.setCurrentIndex(idx)
+        if hasattr(self, "_tele_level"):
+            self._update_tele_hint()
 
     def _on_protocol_mode_changed(self, _idx: int) -> None:
         mode = self._protocol_mode.currentData()
@@ -816,8 +828,10 @@ class CommunicationPage(QWidget):
                 self._tele_f2_on.setChecked(bool(custom["f2_enabled"]))
             if "f3_enabled" in custom:
                 self._tele_f3_on.setChecked(bool(custom["f3_enabled"]))
-            tele_idx = self._tele_level.findData(
-                cfg.get("telemetry_level", "std"))
+            saved_level = cfg.get("telemetry_level", "std")
+            if saved_level == "scope16k":  # 旧版名称迁移到新标准模式
+                saved_level = "std"
+            tele_idx = self._tele_level.findData(saved_level)
             if tele_idx >= 0:
                 self._tele_level.setCurrentIndex(tele_idx)
             self._update_tele_hint()

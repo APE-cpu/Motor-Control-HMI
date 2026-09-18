@@ -22,14 +22,11 @@ def _drain_qt_events_after_test():
 
 
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
-    """在Python扩展模块卸载前显式销毁遗留窗口，避免Windows原生退出崩溃。"""
+    """关闭遗留窗口，但不在会话钩子里强制派送 DeferredDelete。
+
+    PySide6/QtCharts 控件的父子对象会在窗口关闭时自行回收。在 pytest
+    sessionfinish 中再次批量 deleteLater 并强制派送删除事件，会让某些已经由
+    父对象释放的图表包装器被重复访问，Windows 下会直接触发原生 abort。
+    """
     _QT_APPLICATION.closeAllWindows()
-    for widget in list(_QT_APPLICATION.topLevelWidgets()):
-        try:
-            widget.close()
-            widget.deleteLater()
-        except RuntimeError:
-            pass
-    _QT_APPLICATION.processEvents()
-    QCoreApplication.sendPostedEvents(None, QEvent.DeferredDelete)
     _QT_APPLICATION.processEvents()

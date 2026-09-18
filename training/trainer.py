@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import json
+import os
 import threading
 from typing import Optional
 
@@ -32,6 +34,22 @@ except ImportError:
 
 
 IN_DIM = 8   # 默认全特征维度；实际训练维度由数据列数决定
+
+
+class _PreprocessedModel(nn.Module):
+    """把训练集拟合的Z-score固化进ONNX，使模型继续接收原始特征。"""
+
+    def __init__(self, model: nn.Module, mean: np.ndarray,
+                 std: np.ndarray) -> None:
+        super().__init__()
+        self.model = model
+        self.register_buffer("input_mean", torch.as_tensor(
+            mean, dtype=torch.float32).reshape(1, -1))
+        self.register_buffer("input_std", torch.as_tensor(
+            std, dtype=torch.float32).reshape(1, -1))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        return self.model((x - self.input_mean) / self.input_std)
 
 
 # ──────────────────────────────────────────────────────────────
@@ -173,6 +191,54 @@ def _build_scheduler(name: str, opt, epochs: int):
     return None
 
 
+def _classifier_module(model: nn.Module) -> nn.Module:
+    """Return the task head while keeping model-specific backbones reusable."""
+    if isinstance(model, _MLP):
+        for module in reversed(list(model.net.children())):
+            if isinstance(module, nn.Linear):
+                return module
+    if isinstance(model, (_CNN1D, _LSTM, _Transformer)):
+        return model.fc
+    raise TypeError(f"模型 {type(model).__name__} 未声明可迁移的分类头")
+
+
+def _set_transfer_trainability(model: nn.Module, backbone_trainable: bool) -> tuple[int, int]:
+    """Freeze/unfreeze the backbone and always leave the task head trainable."""
+    for parameter in model.parameters():
+        parameter.requires_grad = bool(backbone_trainable)
+    head = _classifier_module(model)
+    for parameter in head.parameters():
+        parameter.requires_grad = True
+    trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total = sum(p.numel() for p in model.parameters())
+    return trainable, total
+
+
+def _set_training_mode(model: nn.Module, backbone_trainable: bool) -> None:
+    """Frozen backbones stay deterministic while the task head trains."""
+    if backbone_trainable:
+        model.train()
+        return
+    model.eval()
+    _classifier_module(model).train()
+
+
+def _safe_torch_load(path: str) -> dict:
+    """Load state-only checkpoints without allowing pickled code execution."""
+    try:
+        value = torch.load(path, map_location="cpu", weights_only=True)
+    except TypeError:  # torch versions before weights_only
+        value = torch.load(path, map_location="cpu")
+    if not isinstance(value, dict):
+        raise ValueError("训练检查点格式无效：根对象不是字典")
+    return value
+
+
+def _json_safe(value):
+    """Keep checkpoint metadata portable and compatible with weights_only."""
+    return json.loads(json.dumps(value, ensure_ascii=False, allow_nan=False))
+
+
 # ──────────────────────────────────────────────────────────────
 # Trainer
 # ──────────────────────────────────────────────────────────────
@@ -181,6 +247,7 @@ class Trainer(QObject):
     epochDone = Signal(int, float, float)   # epoch, train_loss, val_loss
     finished = Signal(str)
     error = Signal(str)
+    transferStatus = Signal(str)
 
     def __init__(self) -> None:
         super().__init__()
@@ -188,6 +255,12 @@ class Trainer(QObject):
         self._sk_model = None
         self._model_name: str = "MLP (多层感知机)"
         self._in_dim: int = IN_DIM
+        self._input_mean = np.zeros(IN_DIM, dtype=np.float32)
+        self._input_std = np.ones(IN_DIM, dtype=np.float32)
+        self._feature_names: list[str] = []
+        self._feature_metadata: dict = {}
+        self._hyper: dict = {}
+        self._transfer_metadata: dict = {}
         self._stop = threading.Event()
 
     # ─── 公共接口 ─────────────────────────────────────────────
@@ -197,14 +270,23 @@ class Trainer(QObject):
               batch_size: int = 32, val_split: float = 0.2,
               optimizer: str = "Adam", loss_name: str = "MSELoss",
               scheduler: str = "None", weight_decay: float = 0.0,
-              hyper: Optional[dict] = None) -> None:
+              hyper: Optional[dict] = None, normalize: bool = True,
+              split_index: Optional[int] = None,
+              feature_names: Optional[list[str]] = None,
+              feature_metadata: Optional[dict] = None,
+              transfer: Optional[dict] = None) -> None:
         self._stop.clear()
         self._model_name = model_name
+        self._feature_names = list(feature_names or [])
+        self._feature_metadata = dict(feature_metadata or {})
         hyper = hyper or {}
+        self._hyper = dict(hyper)
+        self._transfer_metadata = {}
         t = threading.Thread(
             target=self._dispatch,
             args=(X, y, epochs, lr, batch_size, val_split,
-                  optimizer, loss_name, scheduler, weight_decay, hyper),
+                  optimizer, loss_name, scheduler, weight_decay, hyper,
+                  normalize, split_index, dict(transfer or {})),
             daemon=True,
         )
         t.start()
@@ -216,6 +298,9 @@ class Trainer(QObject):
         if self._torch_model is None:
             raise RuntimeError("当前模型不可导出 ONNX（仅 PyTorch 模型支持）")
         self._torch_model.eval()
+        export_model = _PreprocessedModel(
+            self._torch_model, self._input_mean, self._input_std)
+        export_model.eval()
         dummy = torch.zeros(1, self._in_dim)
         kwargs = dict(
             input_names=["features"], output_names=["score"],
@@ -225,32 +310,110 @@ class Trainer(QObject):
         try:
             # torch≥2.9 默认走 dynamo 导出器（需额外的 onnxscript）；
             # 显式 dynamo=False 使用稳定的 TorchScript 导出器，仅依赖 onnx
-            torch.onnx.export(self._torch_model, dummy, path,
+            torch.onnx.export(export_model, dummy, path,
                               dynamo=False, **kwargs)
         except TypeError:
             # 旧版 torch 无 dynamo 参数
-            torch.onnx.export(self._torch_model, dummy, path, **kwargs)
+            torch.onnx.export(export_model, dummy, path, **kwargs)
+        metadata = {
+            "model": self._model_name,
+            "input_dimension": self._in_dim,
+            "feature_names": self._feature_names,
+            "normalization_embedded_in_onnx": True,
+            "normalization_mean": self._input_mean.tolist(),
+            "normalization_std": self._input_std.tolist(),
+            "feature_pipeline": self._feature_metadata,
+            "transfer_learning": self._transfer_metadata,
+        }
+        with open(path + ".features.json", "w", encoding="utf-8") as stream:
+            json.dump(metadata, stream, ensure_ascii=False, indent=2,
+                      allow_nan=False)
+
+    def save_checkpoint(self, path: str) -> None:
+        """Save a state-only checkpoint that can be used for fine-tuning."""
+        if self._torch_model is None:
+            raise RuntimeError("当前没有可保存的 PyTorch 模型")
+        payload = {
+            "format": "motor-host-transfer-checkpoint",
+            "format_version": 1,
+            "model_name": self._model_name,
+            "hyperparameters": _json_safe(self._hyper),
+            "input_dimension": int(self._in_dim),
+            "feature_names": list(self._feature_names),
+            "feature_pipeline": _json_safe(self._feature_metadata),
+            "normalization_mean": self._input_mean.tolist(),
+            "normalization_std": self._input_std.tolist(),
+            "transfer_learning": _json_safe(self._transfer_metadata),
+            "state_dict": {
+                name: tensor.detach().cpu()
+                for name, tensor in self._torch_model.state_dict().items()
+            },
+        }
+        torch.save(payload, path)
+
+    @staticmethod
+    def inspect_checkpoint(path: str) -> dict:
+        checkpoint = _safe_torch_load(path)
+        if checkpoint.get("format") != "motor-host-transfer-checkpoint":
+            raise ValueError("不是本上位机导出的迁移学习检查点")
+        if int(checkpoint.get("format_version", 0)) != 1:
+            raise ValueError("不支持的迁移学习检查点版本")
+        if not isinstance(checkpoint.get("state_dict"), dict):
+            raise ValueError("训练检查点缺少 state_dict")
+        return {
+            key: checkpoint.get(key)
+            for key in (
+                "format_version", "model_name", "hyperparameters",
+                "input_dimension", "feature_names", "feature_pipeline",
+                "normalization_mean", "normalization_std",
+                "transfer_learning",
+            )
+        }
 
     # ─── 调度 ────────────────────────────────────────────────
     def _dispatch(self, X, y, epochs, lr, batch_size, val_split,
-                  optimizer, loss_name, scheduler, weight_decay, hyper):
+                  optimizer, loss_name, scheduler, weight_decay, hyper,
+                  normalize, split_index, transfer):
         try:
             if self._model_name.startswith(("随机森林", "支持向量机")):
-                self._train_sklearn(X, y, val_split, hyper)
+                self._train_sklearn(
+                    X, y, val_split, hyper, normalize, split_index)
             else:
                 self._train_torch(X, y, epochs, lr, batch_size, val_split,
-                                  optimizer, loss_name, scheduler, weight_decay, hyper)
+                                  optimizer, loss_name, scheduler, weight_decay,
+                                  hyper, normalize, split_index, transfer)
         except Exception as exc:
             self.error.emit(str(exc))
 
+    def _split_and_scale(self, X, y, val_split, normalize, split_index):
+        X = np.asarray(X, dtype=np.float32)
+        y = np.asarray(y, dtype=np.float32)
+        n = len(X)
+        split = (int(split_index) if split_index is not None
+                 else int(n * (1.0 - val_split)))
+        if not 1 <= split < n:
+            raise ValueError("训练/验证切分后任一集合为空")
+        # 时序数据保持先后顺序；滑窗特征传入的split_index已经保证窗口不跨界。
+        X_tr, y_tr = X[:split].copy(), y[:split].copy()
+        X_val, y_val = X[split:].copy(), y[split:].copy()
+        if normalize:
+            mean = X_tr.mean(axis=0, dtype=np.float64).astype(np.float32)
+            std = X_tr.std(axis=0, dtype=np.float64).astype(np.float32)
+            std[std < 1e-8] = 1.0
+        else:
+            mean = np.zeros(X.shape[1], dtype=np.float32)
+            std = np.ones(X.shape[1], dtype=np.float32)
+        self._input_mean = mean
+        self._input_std = std
+        return ((X_tr - mean) / std, y_tr,
+                (X_val - mean) / std, y_val)
+
     # ─── PyTorch 训练 ────────────────────────────────────────
     def _train_torch(self, X, y, epochs, lr, batch_size, val_split,
-                     optimizer, loss_name, scheduler, weight_decay, hyper):
-        n = len(X)
-        split = int(n * (1 - val_split))
-        idx = np.random.permutation(n)
-        X_tr, y_tr = X[idx[:split]], y[idx[:split]]
-        X_val, y_val = X[idx[split:]], y[idx[split:]]
+                     optimizer, loss_name, scheduler, weight_decay, hyper,
+                     normalize, split_index, transfer=None):
+        X_tr, y_tr, X_val, y_val = self._split_and_scale(
+            X, y, val_split, normalize, split_index)
 
         X_tr_t = torch.tensor(X_tr, dtype=torch.float32)
         y_tr_t = torch.tensor(y_tr, dtype=torch.float32).unsqueeze(1)
@@ -264,7 +427,46 @@ class Trainer(QObject):
         self._in_dim = int(X.shape[1])   # 输入维度跟随所选特征数
         self._torch_model = _build_torch_model(self._model_name, hyper,
                                                in_dim=self._in_dim)
-        opt = _build_optimizer(optimizer, self._torch_model.parameters(), lr, weight_decay)
+        self._hyper = dict(hyper)
+        transfer = dict(transfer or {})
+        transfer_mode = str(transfer.get("mode", "none"))
+        frozen_epochs = max(0, int(transfer.get("freeze_epochs", 0)))
+        backbone_trainable = True
+        if transfer.get("checkpoint_path"):
+            checkpoint_path = os.path.abspath(
+                os.fspath(transfer["checkpoint_path"]))
+            checkpoint = _safe_torch_load(checkpoint_path)
+            self._validate_and_load_transfer_checkpoint(
+                checkpoint, checkpoint_path)
+            if transfer_mode not in {"head_only", "staged", "full"}:
+                raise ValueError(f"未知迁移学习模式：{transfer_mode}")
+            backbone_trainable = transfer_mode == "full"
+            trainable, total = _set_transfer_trainability(
+                self._torch_model, backbone_trainable)
+            self._transfer_metadata = {
+                "enabled": True,
+                "source_checkpoint": checkpoint_path,
+                "source_model": checkpoint.get("model_name", ""),
+                "mode": transfer_mode,
+                "freeze_epochs": frozen_epochs if transfer_mode == "staged" else 0,
+                "target_normalization_refit": True,
+            }
+            mode_text = {
+                "head_only": "冻结特征提取层，仅训练分类头",
+                "staged": f"先冻结 {frozen_epochs} 轮，再解冻全网微调",
+                "full": "加载权重后全网络微调",
+            }[transfer_mode]
+            self.transferStatus.emit(
+                f"迁移权重已加载：{mode_text}；可训练参数 "
+                f"{trainable}/{total}；归一化按目标训练集重新拟合")
+        else:
+            _set_transfer_trainability(self._torch_model, True)
+            self._transfer_metadata = {"enabled": False}
+
+        trainable_params = [
+            parameter for parameter in self._torch_model.parameters()
+            if parameter.requires_grad]
+        opt = _build_optimizer(optimizer, trainable_params, lr, weight_decay)
         loss_fn = _build_loss(loss_name)
         sch = _build_scheduler(scheduler, opt, epochs)
 
@@ -272,7 +474,21 @@ class Trainer(QObject):
             if self._stop.is_set():
                 self.finished.emit("训练已中止")
                 return
-            self._torch_model.train()
+            if (transfer_mode == "staged" and not backbone_trainable and
+                    ep > frozen_epochs):
+                backbone_trainable = True
+                trainable, total = _set_transfer_trainability(
+                    self._torch_model, True)
+                fine_tune_lr = max(float(lr) * 0.1, 1e-8)
+                opt = _build_optimizer(
+                    optimizer, self._torch_model.parameters(), fine_tune_lr,
+                    weight_decay)
+                sch = _build_scheduler(
+                    scheduler, opt, max(1, epochs - frozen_epochs))
+                self.transferStatus.emit(
+                    f"第 {ep} 轮解冻特征提取层：全网 {trainable}/{total} "
+                    f"参数参与微调，学习率降为 {fine_tune_lr:g}")
+            _set_training_mode(self._torch_model, backbone_trainable)
             for xb, yb in loader:
                 opt.zero_grad()
                 loss_fn(self._torch_model(xb), yb).backward()
@@ -291,15 +507,43 @@ class Trainer(QObject):
 
         self.finished.emit(f"训练完成（{self._model_name}），共 {epochs} 轮")
 
+    def _validate_and_load_transfer_checkpoint(
+            self, checkpoint: dict, path: str) -> None:
+        if checkpoint.get("format") != "motor-host-transfer-checkpoint":
+            raise ValueError("迁移源不是本上位机导出的 .pt 训练检查点")
+        if int(checkpoint.get("format_version", 0)) != 1:
+            raise ValueError("迁移源检查点版本不受支持")
+        source_model = str(checkpoint.get("model_name", ""))
+        if source_model != self._model_name:
+            raise ValueError(
+                f"模型结构不匹配：检查点为 {source_model}，当前为 "
+                f"{self._model_name}")
+        source_dim = int(checkpoint.get("input_dimension", -1))
+        if source_dim != self._in_dim:
+            raise ValueError(
+                f"输入维度不匹配：检查点为 {source_dim}，当前为 "
+                f"{self._in_dim}")
+        source_features = list(checkpoint.get("feature_names") or [])
+        if source_features and self._feature_names:
+            if source_features != self._feature_names:
+                raise ValueError(
+                    "特征名称或顺序与迁移源不一致；为防止物理量错位，"
+                    "已拒绝加载")
+        state_dict = checkpoint.get("state_dict")
+        if not isinstance(state_dict, dict):
+            raise ValueError("迁移源检查点缺少 state_dict")
+        try:
+            self._torch_model.load_state_dict(state_dict, strict=True)
+        except RuntimeError as exc:
+            raise ValueError(
+                f"网络超参数与迁移源不一致，无法加载 {path}：{exc}") from exc
+
     # ─── scikit-learn 训练 ───────────────────────────────────
-    def _train_sklearn(self, X, y, val_split, hyper):
+    def _train_sklearn(self, X, y, val_split, hyper, normalize, split_index):
         if not _SK_OK:
             raise RuntimeError("scikit-learn 未安装，无法训练随机森林/SVM")
-        n = len(X)
-        split = int(n * (1 - val_split))
-        idx = np.random.permutation(n)
-        X_tr, y_tr = X[idx[:split]], y[idx[:split]]
-        X_val, y_val = X[idx[split:]], y[idx[split:]]
+        X_tr, y_tr, X_val, y_val = self._split_and_scale(
+            X, y, val_split, normalize, split_index)
 
         if self._model_name.startswith("随机森林"):
             model = RandomForestRegressor(

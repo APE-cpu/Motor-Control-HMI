@@ -7,10 +7,10 @@
 电机参数取自数字孪生配置（参数辨识页可更新）。
 
 几何解读：正圆=正常；圆度变差/偏心=不平衡、偏心、退磁等异常。
-注意：10 Hz 遥测在时间上欠采样，轨迹靠余辉点云累积成圆；
-真机高保真矢量图需协议增加突发快照通道。
+真机优先使用 F1 1~16 kHz 电角度/Iq；没有 F1 时才回退到低速遥测。
 """
 import math
+import time
 from collections import deque
 
 from PySide6.QtCore import Qt, QTimer
@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
 from communications.comm_manager import CommManager, TelemetryFrame
 
 try:
+    import numpy as np
     import pyqtgraph as pg
     _PG_OK = True
 except ImportError:  # pragma: no cover
@@ -61,6 +62,10 @@ class _CirclePlot(QWidget):
     def append(self, x: float, y: float) -> None:
         self._xs.append(x)
         self._ys.append(y)
+
+    def extend(self, xs, ys) -> None:
+        self._xs.extend(float(value) for value in xs)
+        self._ys.extend(float(value) for value in ys)
 
     def clear(self) -> None:
         self._xs.clear()
@@ -105,7 +110,9 @@ class VectorPage(QWidget):
     def __init__(self, comm: CommManager) -> None:
         super().__init__()
         self._comm = comm
+        self._analysis_enabled = False
         self._latest = TelemetryFrame()   # 极限圆需要转速与母线电压
+        self._last_high_rate_at = 0.0
 
         root = QVBoxLayout(self)
         title_row = QHBoxLayout()
@@ -113,8 +120,13 @@ class VectorPage(QWidget):
         title.setObjectName("TitleLabel")
         title_row.addWidget(title)
         title_row.addStretch(1)
+        self._chk_enabled = QCheckBox("启用矢量可视化")
+        self._chk_enabled.setChecked(False)
+        self._chk_enabled.setToolTip(
+            "默认关闭以避免在后台持续处理16 kHz点云；启用时从空余辉开始。")
+        title_row.addWidget(self._chk_enabled)
         self._chk_persist = QCheckBox("无限余辉")
-        self._chk_persist.setChecked(True)
+        self._chk_persist.setChecked(False)
         title_row.addWidget(self._chk_persist)
         btn_clear = QPushButton("清空余辉")
         title_row.addWidget(btn_clear)
@@ -122,7 +134,8 @@ class VectorPage(QWidget):
 
         hint = QLabel(
             "仿真模式：直接取虚拟电机 1 kHz 高速轨迹（真实 dq 变换，无频闪）；"
-            "真机模式：由 10 Hz 遥测按 id≈0 重构（欠采样，需协议突发快照通道）。"
+            "真机模式：优先使用F1 1~16 kHz轨迹，为控制绘图负载最多保留4 kHz点云；"
+            "无F1时才回退到F0低速遥测。"
             "正圆 = 正常，圆度/圆心异常 = 不平衡、偏心、退磁等征兆。"
             "红色虚线为极限圆：电流圆=电流限幅；磁链圆=电压极限（半径 Vdc/√3/ωe，"
             "随母线电压和转速实时缩放，轨迹逼近它 = 电压余量耗尽/弱磁边界）。")
@@ -144,10 +157,27 @@ class VectorPage(QWidget):
 
         btn_clear.clicked.connect(self._on_clear)
         comm.telemetryReceived.connect(self._on_telemetry)
+        comm.highRateTelemetryReceived.connect(self._on_high_rate)
+        comm.highRateTelemetryBatchReceived.connect(self._on_high_rate_batch)
+        comm.highRateTelemetryColumnsReceived.connect(self._on_high_rate_columns)
 
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
-        self._timer.start(100)
+        self._timer.setInterval(50)  # 20 Hz重绘；点云采集频率与绘图频率解耦
+        self._chk_enabled.toggled.connect(self._set_analysis_enabled)
+
+    def _set_analysis_enabled(self, enabled: bool) -> None:
+        """按需启用高频点云处理；关闭时立即释放余辉和绘图定时器。"""
+        self._analysis_enabled = bool(enabled)
+        self._on_clear()
+        self._last_high_rate_at = 0.0
+        if self._analysis_enabled:
+            self._timer.start()
+        else:
+            self._timer.stop()
+            self._latest = TelemetryFrame()
+            self._i_plot.refresh(False, None)
+            self._psi_plot.refresh(False, None)
 
     def _on_clear(self) -> None:
         self._i_plot.clear()
@@ -161,15 +191,63 @@ class VectorPage(QWidget):
         self._psi_plot.append(psi_d * c - psi_q * s, psi_d * s + psi_q * c)
 
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
+        if not self._analysis_enabled:
+            return
         self._latest = frame
         # 仿真模式走 1 kHz 高速轨迹（_refresh 里取），10 Hz 遥测只在真机时用
         if self._comm.is_sim_running():
             return
-        p = self._comm.motor_sim_params()
-        theta_e = math.radians(frame.angle_actual) * p.pole_pairs
+        if time.monotonic() - self._last_high_rate_at < 0.5:
+            return
+        # 固件F0的angle_actual已经是电角度，不能再次乘极对数。
+        theta_e = math.radians(frame.angle_actual)
         self._append_point(theta_e, 0.0, frame.current_actual)   # id ≈ 0
 
+    def _append_high_rate_arrays(self, angle_deg, iq_a,
+                                 rate_hz: int) -> None:
+        if not self._analysis_enabled:
+            return
+        if self._comm.is_sim_running():
+            return
+        count = min(len(angle_deg), len(iq_a))
+        if count <= 0:
+            return
+        # 输入可达16 kHz，而屏幕只以20 Hz刷新。保留最多4 kHz
+        # 几何点云已足以呈现圆度，避免将Python/UI拖入逐点热路径。
+        stride = max(1, int(rate_hz) // 4000)
+        angles = np.deg2rad(np.asarray(angle_deg[:count:stride], dtype=float))
+        iq = np.asarray(iq_a[:count:stride], dtype=float)
+        iq = iq[:angles.size]
+        s, c = np.sin(angles), np.cos(angles)
+        self._i_plot.extend(-iq * s, iq * c)  # id≈0
+        p = self._comm.motor_sim_params()
+        psi_d = float(p.psi_f)
+        psi_q = float(p.Lq) * iq
+        self._psi_plot.extend(psi_d * c - psi_q * s,
+                              psi_d * s + psi_q * c)
+        self._last_high_rate_at = time.monotonic()
+
+    def _on_high_rate(self, sample: dict) -> None:
+        self._append_high_rate_arrays(
+            [sample.get("angle_deg", 0.0)], [sample.get("iq_a", 0.0)],
+            int(sample.get("rate_hz", 200)))
+
+    def _on_high_rate_batch(self, samples: list[dict]) -> None:
+        if not samples:
+            return
+        self._append_high_rate_arrays(
+            [sample.get("angle_deg", 0.0) for sample in samples],
+            [sample.get("iq_a", 0.0) for sample in samples],
+            int(samples[-1].get("rate_hz", 200)))
+
+    def _on_high_rate_columns(self, columns: dict) -> None:
+        self._append_high_rate_arrays(
+            columns.get("angle_deg", ()), columns.get("iq_a", ()),
+            int(columns.get("rate_hz", 200)))
+
     def _refresh(self) -> None:
+        if not self._analysis_enabled:
+            return
         active = self._comm.is_sim_running() or self._comm.is_connected()
         if not active:
             self._latest = TelemetryFrame()

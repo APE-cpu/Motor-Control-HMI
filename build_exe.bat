@@ -72,6 +72,11 @@ set ZLG_ZCAN=
 if exist "zlgcan_x64\zlgcan.dll" set ZLG_ZCAN=--add-data "zlgcan_x64;zlgcan_x64"
 if defined ZLG_ZCAN (echo   [+] Found zlgcan_x64, bundling into exe.) else (echo   [!] zlgcan_x64 not found, ZLGCAN-ZCAN backend will be unavailable in the exe.)
 
+rem Simulink Coder 生成模型的 C++ 运行库（数字孪生页面直接调用）
+set SIMULINK_HOST_DLL=
+if exist "simulink_host\bin\pmsm_simulink_host.dll" set SIMULINK_HOST_DLL=--add-binary "simulink_host\bin\pmsm_simulink_host.dll;."
+if defined SIMULINK_HOST_DLL (echo   [+] Found Simulink C++ host DLL, bundling into exe.) else (echo   [!] Simulink host DLL not found, digital-twin simulation will be unavailable in the exe.)
+
 if "%MODE%"=="lite" (
     pyinstaller --noconfirm --clean --onefile --windowed ^
       --name "%BUILD_NAME%" ^
@@ -83,6 +88,7 @@ if "%MODE%"=="lite" (
       --add-data "motor_anomaly.onnx;." ^
       %ZLG_DLL% ^
       %ZLG_ZCAN% ^
+      %SIMULINK_HOST_DLL% ^
       %NATIVE_CORE% ^
       --exclude-module torch ^
       --exclude-module torchvision ^
@@ -107,6 +113,7 @@ if "%MODE%"=="lite" (
       --collect-data rapidocr_onnxruntime ^
       %ZLG_DLL% ^
       %ZLG_ZCAN% ^
+      %SIMULINK_HOST_DLL% ^
       %NATIVE_CORE% ^
       %ENTRY%
 )

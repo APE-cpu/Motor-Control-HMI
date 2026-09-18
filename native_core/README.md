@@ -6,6 +6,12 @@ sample conversion, and F4 burst reassembly. The TCP socket, stream decoder, tele
 parsing, and bounded buffers run in C++; the existing Python session state
 machine and Qt signals consume converted data in batches.
 
+Online ARX/RLS identification also runs here. It consumes the 22-byte F1
+samples (`Ia/Ib`, electrical angle, `Vd/Vq`, and DC bus voltage), reconstructs
+the MCSDK d/q currents with the firmware's exact Clarke/Park convention, and
+publishes a 10 Hz result to the existing RLS monitor. The STM32 firmware does
+not execute estimator matrix operations in the 16 kHz current-loop ISR.
+
 The hot F1 UI path uses a columnar batch (`drain_f1_columns`) so one Python
 object carries whole arrays of angle, speed, current, and voltage values. The
 legacy list-of-dictionaries API remains available for compatibility and tests.

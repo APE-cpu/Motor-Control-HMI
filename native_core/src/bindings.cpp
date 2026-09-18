@@ -208,6 +208,7 @@ py::list f3_samples_to_python(
         item["updates"] = sample.updates;
         item["innov_rms_a"] = sample.innov_rms_a;
         item["innov_rms_digit"] = sample.innov_rms_digit;
+        item["p_trace"] = sample.p_trace;
         item["theta_d"] = std::move(theta_d);
         item["theta_q"] = std::move(theta_q);
         item["a1_d"] = sample.a1_d;
@@ -302,6 +303,11 @@ PYBIND11_MODULE(motor_core_cpp, module) {
              &motor_core::TelemetryProcessor::set_f1_rate_hz)
         .def("set_rls_coefficients_si",
              &motor_core::TelemetryProcessor::set_rls_coefficients_si)
+        .def("set_host_rls_enabled",
+             &motor_core::TelemetryProcessor::set_host_rls_enabled,
+             py::arg("enabled"), py::arg("reset") = true)
+        .def_property_readonly("host_rls_enabled",
+             &motor_core::TelemetryProcessor::host_rls_enabled)
         .def(
             "drain_f1",
             [](motor_core::TelemetryProcessor& processor,
@@ -462,6 +468,11 @@ PYBIND11_MODULE(motor_core_cpp, module) {
         .def("set_f1_rate_hz", &motor_core::TcpV2Receiver::set_f1_rate_hz)
         .def("set_rls_coefficients_si",
              &motor_core::TcpV2Receiver::set_rls_coefficients_si)
+        .def("set_host_rls_enabled",
+             &motor_core::TcpV2Receiver::set_host_rls_enabled,
+             py::arg("enabled"), py::arg("reset") = true)
+        .def_property_readonly("host_rls_enabled",
+             &motor_core::TcpV2Receiver::host_rls_enabled)
         .def("set_telemetry_processing_enabled",
              &motor_core::TcpV2Receiver::set_telemetry_processing_enabled)
         .def("reset_burst", &motor_core::TcpV2Receiver::reset_burst)

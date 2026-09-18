@@ -21,6 +21,10 @@ from PySide6.QtWidgets import (
 )
 
 from ai.ai_client import AIClient
+from ai.diagnostic_tools import create_read_only_registry
+from ai.harness import (
+    AgentRuntime, AuditLog, DiagnosticTelemetryStore, ToolContext, ToolExecutor,
+)
 from ai.rag import RAGIndex, format_context
 from communications.comm_manager import CommManager, TelemetryFrame
 from config.config import AI_DEFAULT_BASE_URL, AI_DEFAULT_MODEL, AI_REQUEST_TIMEOUT
@@ -30,6 +34,7 @@ from runtime_paths import resource_path, writable_path
 _CONFIG_FILE = writable_path("config", "ai_config.json")
 _KNOWLEDGE_DIR = writable_path("knowledge", ".keep").parent
 _REPORT_DIR = writable_path("reports", ".keep").parent
+_TOOL_AUDIT_FILE = writable_path("logs", "ai_tool_audit.jsonl")
 
 _AI_PRESETS = {
     "DeepSeek": {
@@ -65,6 +70,16 @@ _SYS_PROMPT_RAG = """你是一名电机控制专家。当前电机遥测数据�
 
 请根据以上信息回答用户的问题，重点关注异常状态和故障诊断。回答简洁专业。"""
 
+_TOOL_RULES = """
+
+你可以调用上位机提供的只读诊断工具。必须遵守：
+1. 当前状态、固件参数和波形数值优先通过工具取得，不得编造。
+2. 分析波形前先调用capture_signal_window，再把snapshot_id交给分析工具。
+3. 必须区分测量证据、理论模型结果和推测；FFT尖峰不能单独证明闭环不稳定。
+4. 工具失败或数据不足时明确说明，不要用臆测补全。
+5. 当前Harness没有任何写参数、启停电机或烧录工具，不要声称已经执行这些动作。
+回答中简要列出关键证据、结论置信度和下一步验证建议。"""
+
 
 def _normalize_url(url: str) -> str:
     """补全只有主机名的地址，同时保留服务商明确给出的版本路径。"""
@@ -99,6 +114,25 @@ class _Worker(QObject):
                 self.error.emit(str(exc))
 
 
+class _ToolWorker(QObject):
+    event = Signal(str)
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, runtime: AgentRuntime, messages: list) -> None:
+        super().__init__()
+        self._runtime = runtime
+        self._messages = messages
+
+    def run(self) -> None:
+        try:
+            reply = self._runtime.run(
+                self._messages, on_event=self.event.emit)
+            self.finished.emit(reply)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
 _IMAGE_MIME = {".png": "image/png", ".jpg": "image/jpeg", ".jpeg": "image/jpeg",
                ".bmp": "image/bmp", ".webp": "image/webp"}
 
@@ -121,7 +155,8 @@ class _IndexBuilder(QObject):
 
 
 class AIPage(QWidget):
-    def __init__(self, comm: CommManager, monitor_page=None) -> None:
+    def __init__(self, comm: CommManager, monitor_page=None,
+                 firmware_config_provider=None) -> None:
         super().__init__()
         self._comm = comm
         self._monitor = monitor_page
@@ -136,10 +171,25 @@ class AIPage(QWidget):
         self._rag_index: RAGIndex | None = None
         self._rag_builder = None      # 后台索引构建 worker（防 GC）
         self._rag_building = False
+        self._firmware_config_provider_ui = firmware_config_provider
+        self._firmware_config_cache = (
+            dict(firmware_config_provider())
+            if callable(firmware_config_provider) else {})
+        self._diagnostic_store = DiagnosticTelemetryStore(max_samples=5000)
+        self._tool_registry = create_read_only_registry()
+        self._tool_context = ToolContext(
+            comm=comm,
+            telemetry_store=self._diagnostic_store,
+            firmware_config_provider=lambda: dict(self._firmware_config_cache),
+        )
+        self._tool_executor = ToolExecutor(
+            self._tool_registry, self._tool_context,
+            audit_log=AuditLog(_TOOL_AUDIT_FILE))
+        self._agent_runtime = None
 
         root = QVBoxLayout(self)
 
-        title = QLabel("AI 电机分析")
+        title = QLabel("AI 诊断助手")
         title.setObjectName("TitleLabel")
         root.addWidget(title)
 
@@ -190,8 +240,17 @@ class AIPage(QWidget):
         return box
 
     def _build_chat_box(self) -> QGroupBox:
-        box = QGroupBox("对话")
+        box = QGroupBox("诊断对话 · AI可自主调用只读工具")
         v = QVBoxLayout(box)
+        tool_status = QLabel(
+            "只读Harness已启用：运行状态｜固件参数｜同步波形快照｜时域分析｜"
+            "FFT｜电流环模型。不会改参数、启停电机或烧录固件。")
+        tool_status.setWordWrap(True)
+        tool_status.setStyleSheet(
+            "color:#80cbc4; background:rgba(24,93,96,70);"
+            "border:1px solid #285b63; border-radius:6px; padding:6px;")
+        tool_status.setToolTip(f"工具调用审计日志：\n{_TOOL_AUDIT_FILE}")
+        v.addWidget(tool_status)
         self._chat_display = QPlainTextEdit()
         self._chat_display.setReadOnly(True)
         v.addWidget(self._chat_display, 1)
@@ -219,6 +278,11 @@ class AIPage(QWidget):
         self._btn_pi = QPushButton("PI调参建议")
         self._btn_pi.setToolTip("分析最近运行窗口的转速误差、超调和Iq振荡，并生成可执行调参建议")
         self._btn_pi.clicked.connect(self._on_pi_tuning)
+        self._chk_tools = QCheckBox("🔧 允许只读诊断工具")
+        self._chk_tools.setChecked(True)
+        self._chk_tools.setToolTip(
+            "允许AI读取运行状态、固件参数和高速遥测快照，并调用时域、FFT、"
+            "电流环模型。当前不提供改参数、启停或烧录工具。")
         self._attach_label = QLabel("")
         self._attach_label.setStyleSheet("color: #90a4ae;")
         btn_attach_clear = QPushButton("移除图片")
@@ -226,6 +290,7 @@ class AIPage(QWidget):
         h2.addWidget(btn_img)
         h2.addWidget(self._btn_wave)
         h2.addWidget(self._btn_pi)
+        h2.addWidget(self._chk_tools)
         h2.addWidget(btn_attach_clear)
         h2.addWidget(self._attach_label, 1)
         v.addLayout(h2)
@@ -361,6 +426,9 @@ class AIPage(QWidget):
         key = self._api_key.text().strip()
         model = self._model.text().strip()
         self._client = AIClient(url, key, model)
+        self._agent_runtime = AgentRuntime(
+            self._client, self._tool_registry, self._tool_executor,
+            max_rounds=8)
 
     # -------- slots --------
     def _on_save_config(self) -> None:
@@ -396,6 +464,9 @@ class AIPage(QWidget):
         self._snapshot_label.setPlainText(snap)
 
     def _on_high_rate(self, sample: dict) -> None:
+        store = getattr(self, "_diagnostic_store", None)
+        if store is not None:
+            store.feed_sample(sample)
         target = float(self._latest.speed_target)
         # 把采样时的目标冻结进样本；停机后分析不能使用已归零的最新目标。
         if abs(target) > 1.0:
@@ -411,6 +482,9 @@ class AIPage(QWidget):
             self._on_high_rate(sample)
 
     def _on_high_rate_columns(self, columns: dict) -> None:
+        store = getattr(self, "_diagnostic_store", None)
+        if store is not None:
+            store.feed_columns(columns)
         target = float(self._latest.speed_target)
         count = int(columns.get("count", 0))
         if abs(target) <= 1.0 or count <= 0:
@@ -570,6 +644,13 @@ class AIPage(QWidget):
         if not hasattr(self, "_client"):
             self._append_chat("系统", "请先填写 API 配置并点击「保存配置」。")
             return
+        # Qt控件只在UI线程读取；后台工具仅访问这份不可变参数副本。
+        if callable(self._firmware_config_provider_ui):
+            try:
+                self._firmware_config_cache = dict(
+                    self._firmware_config_provider_ui())
+            except Exception as exc:
+                self._append_chat("系统", f"读取当前控制参数失败：{exc}")
 
         attachments = self._attachments
         self._attachments = []
@@ -613,13 +694,21 @@ class AIPage(QWidget):
                 srcs = "、".join(src for _s, src, _t in hits)
                 self._append_chat("系统", f"📚 检索到 {len(hits)} 条参考：{srcs}")
         messages = [
-            {"role": "system", "content": sys_prompt},
+            {"role": "system", "content": (
+                sys_prompt + (_TOOL_RULES if self._chk_tools.isChecked()
+                              and not attachments else ""))},
             {"role": "user", "content": user_content},
         ]
 
         self._stream_started = False
-        self._worker = _Worker(self._client, messages)
-        self._worker.chunk.connect(self._on_chunk)
+        use_tools = (self._chk_tools.isChecked() and not attachments and
+                     self._agent_runtime is not None)
+        if use_tools:
+            self._worker = _ToolWorker(self._agent_runtime, messages)
+            self._worker.event.connect(self._on_tool_event)
+        else:
+            self._worker = _Worker(self._client, messages)
+            self._worker.chunk.connect(self._on_chunk)
         self._worker.finished.connect(self._on_stream_done)
         self._worker.error.connect(self._on_stream_error)
         threading.Thread(target=self._worker.run, daemon=True).start()
@@ -638,6 +727,10 @@ class AIPage(QWidget):
             self._btn_send.setText("生成中…")
             self._insert_at_end("【AI】")
         self._insert_at_end(delta)
+
+    def _on_tool_event(self, event: str) -> None:
+        self._btn_send.setText("工具分析中…")
+        self._append_chat("工具", event)
 
     def _on_stream_done(self, full: str) -> None:
         if not self._stream_started:

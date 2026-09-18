@@ -74,6 +74,57 @@ def test_F1列式导出不创建逐样本字典():
     assert columns["vbus_v"] == [48.0] * 4
 
 
+def test_上位机Cpp_RLS从F1辨识且不依赖固件F3():
+    processor = NativeTelemetryProcessor(max_f1_samples=20000)
+    processor.set_f1_rate_hz(16000)
+    processor.set_host_rls_enabled(True)
+    fs = 16000.0
+    resistance = 0.59
+    inductance = 0.00066
+    a = math.exp(-resistance / inductance / fs)
+    b = (1.0 - a) / resistance
+    current_lsb = 0.000629
+    voltage_lsb = 48.0 / (math.sqrt(3.0) * 32768.0)
+    id_a = iq_a = previous_vd = previous_vq = 0.0
+
+    for base in range(0, 16000, 16):
+        frame = []
+        for index in range(base, base + 16):
+            time_s = index / fs
+            vd_v = (2.0 * math.sin(2.0 * math.pi * 173.0 * time_s) +
+                    1.2 * math.sin(2.0 * math.pi * 431.0 * time_s))
+            vq_v = (3.0 +
+                    2.0 * math.sin(2.0 * math.pi * 137.0 * time_s) +
+                    math.sin(2.0 * math.pi * 619.0 * time_s))
+            id_a = a * id_a + b * previous_vd
+            iq_a = a * iq_a + b * previous_vq
+            previous_vd, previous_vq = vd_v, vq_v
+            angle = 2.0 * math.pi * 50.0 * time_s
+            alpha = iq_a * math.cos(angle) + id_a * math.sin(angle)
+            beta = -iq_a * math.sin(angle) + id_a * math.cos(angle)
+            ia_a = alpha
+            ib_a = (-math.sqrt(3.0) * beta - ia_a) / 2.0
+            angle_u16 = int((angle % (2.0 * math.pi)) *
+                            65536.0 / (2.0 * math.pi)) & 0xFFFF
+            frame.append(struct.pack(
+                "<IHhhhhhhhH", index // 16, angle_u16, 0,
+                round(iq_a / current_lsb), 0,
+                round(ia_a / current_lsb), round(ib_a / current_lsb),
+                round(vd_v / voltage_lsb), round(vq_v / voltage_lsb), 48))
+        assert processor.ingest(0xF1, b"".join(frame))
+
+    results = processor.drain_f3(20)
+    assert processor.host_rls_enabled
+    assert 8 <= len(results) <= 10
+    latest = results[-1]
+    assert latest["updates"] > 14000
+    assert latest["innov_rms_a"] < 0.02
+    assert latest["ld_mh"] == pytest.approx(0.66, abs=0.08)
+    assert latest["lq_mh"] == pytest.approx(0.66, abs=0.08)
+    assert latest["rd_ohm"] == pytest.approx(0.59, abs=0.08)
+    assert latest["rq_ohm"] == pytest.approx(0.59, abs=0.08)
+
+
 def test_F1非法长度计入解析错误且不产生样本():
     processor = NativeTelemetryProcessor()
     assert processor.ingest(0xF1, b"bad")
@@ -118,6 +169,23 @@ def test_F3原生解析SI系数并反解电机参数():
     assert sample["b_qq0_si"] == pytest.approx(0.04)
     assert sample["ld_mh"] == pytest.approx(1.25)
     assert sample["lq_mh"] == pytest.approx(1.5625)
+
+
+def test_F3原生解析使用完整ARX系数换算等效参数():
+    processor = NativeTelemetryProcessor()
+    processor.set_rls_coefficients_si(True)
+    theta_d = [1.3, -0.36, 0.0, 0.05, -0.02, 0.0, 0.0]
+    theta_q = [1.3, -0.36, 0.0, 0.0, 0.0, 0.05, -0.02]
+    payload = struct.pack(
+        "<IIff14f", 123, 456, 0.125, 99.0, *(theta_d + theta_q))
+
+    assert processor.ingest(0xF3, payload)
+    sample = processor.drain_f3()[0]
+
+    assert sample["rd_ohm"] == pytest.approx(2.0, rel=1e-5)
+    assert sample["rq_ohm"] == pytest.approx(2.0, rel=1e-5)
+    assert sample["ld_mh"] == pytest.approx(1.25, rel=1e-5)
+    assert sample["lq_mh"] == pytest.approx(1.25, rel=1e-5)
 
 
 def test_F2_F3非法长度均计入解析错误():

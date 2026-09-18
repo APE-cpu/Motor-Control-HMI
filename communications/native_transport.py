@@ -104,6 +104,13 @@ class NativeTcpV2Receiver:
     def set_rls_coefficients_si(self, enabled: bool) -> None:
         self._receiver.set_rls_coefficients_si(bool(enabled))
 
+    def set_host_rls_enabled(self, enabled: bool, *, reset: bool = True) -> None:
+        self._receiver.set_host_rls_enabled(bool(enabled), bool(reset))
+
+    @property
+    def host_rls_enabled(self) -> bool:
+        return bool(self._receiver.host_rls_enabled)
+
     def set_telemetry_processing_enabled(self, enabled: bool) -> None:
         self._receiver.set_telemetry_processing_enabled(bool(enabled))
 

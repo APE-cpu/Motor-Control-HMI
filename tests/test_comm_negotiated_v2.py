@@ -151,6 +151,30 @@ def test_真实v2任意分包握手命令ACK与遥测():
     comm.disconnect()
 
 
+def test_真实v2遥测配置入队即保留供F2开关复用():
+    driver = LoopbackV2Driver(split_size=3)
+    comm = CommManager()
+    changed = []
+    comm.telemetryConfigChanged.connect(changed.append)
+    assert comm.connect_negotiated_v2(
+        "RS-485", driver=driver, handshake_timeout_s=0.5)
+
+    # negotiated-v2 的底层发送会异步等待 ACK，但配置入口应报告已提交，
+    # 并立即保存请求值，避免随后只切 F2 时覆盖 F1/F3。
+    assert not comm.send_telemetry_config(0x03, 0, 50, 250)
+    assert comm.telemetry_config()["flags"] == 0x03
+    assert comm.telemetry_config()["f2_ms"] == 50
+    assert comm.telemetry_config()["f3_ms"] == 250
+    assert changed[-1]["f2_ms"] == 50
+    assert _wait_until(lambda: comm.protocol_status()["pending_ack"] == 0)
+    assert comm.set_f2_diagnostics(False, 100)
+    assert comm.telemetry_config()["flags"] == 0x02
+    assert comm.telemetry_config()["f2_ms"] == 100
+    assert comm.telemetry_config()["f3_ms"] == 250
+    assert _wait_until(lambda: comm.protocol_status()["pending_ack"] == 0)
+    comm.disconnect()
+
+
 def test_真实v2握手无响应失败且绝不降级v1():
     device = V2VirtualDevice()
     device.drop_next_response()
@@ -478,27 +502,59 @@ def test_辨识档开启F3且相电流保持链路默认全速(tmp_path, monkeyp
     page._tele_level.setCurrentIndex(page._tele_level.findData("id"))
 
     assert page._resolve_telemetry() == (0x03, 0, 20, 100)
-    assert "相电流自动" in page._tele_hint.text()
+    assert "相电流200Hz" in page._tele_hint.text()
     assert "辨识开" in page._tele_hint.text()
     page.close()
     page.deleteLater()
     app.processEvents()
 
 
-def test_示波档请求16kHz连续采样并显示实际速率(tmp_path, monkeypatch):
+def test_标准档请求16kHz连续采样并显示实际速率(tmp_path, monkeypatch):
     app = _app()
     monkeypatch.setattr(
         "pages.communication_page._COMM_CFG_FILE", tmp_path / "comm.json")
     comm = CommManager()
     page = CommunicationPage(comm)
 
-    index = page._tele_level.findData("scope16k")
+    page._kind.setCurrentIndex(page._kind.findText("以太网TCP"))
+    index = page._tele_level.findData("std")
     assert index >= 0
     page._tele_level.setCurrentIndex(index)
 
     assert page._resolve_telemetry() == (0x01, 0, 20, 100)
     assert page._resolve_f1_stream_rate_hz() == 16000
     assert "16kHz" in page._tele_hint.text()
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
+def test_兼容档保留旧固件平均路径(tmp_path, monkeypatch):
+    app = _app()
+    monkeypatch.setattr(
+        "pages.communication_page._COMM_CFG_FILE", tmp_path / "comm.json")
+    page = CommunicationPage(CommManager())
+    page._kind.setCurrentIndex(page._kind.findText("以太网TCP"))
+    page._tele_level.setCurrentIndex(page._tele_level.findData("compat"))
+
+    assert page._resolve_telemetry() == (0x01, 0, 20, 100)
+    assert page._resolve_f1_stream_rate_hz() == 0
+    assert "1kHz" in page._tele_hint.text()
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
+def test_标准档在串口链路自动回退兼容采样(tmp_path, monkeypatch):
+    app = _app()
+    monkeypatch.setattr(
+        "pages.communication_page._COMM_CFG_FILE", tmp_path / "comm.json")
+    page = CommunicationPage(CommManager())
+    page._kind.setCurrentIndex(page._kind.findText("RS-485"))
+    page._tele_level.setCurrentIndex(page._tele_level.findData("std"))
+
+    assert page._resolve_f1_stream_rate_hz() == 0
+    assert "回退兼容模式" in page._tele_hint.text()
     page.close()
     page.deleteLater()
     app.processEvents()

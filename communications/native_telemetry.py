@@ -52,6 +52,13 @@ class NativeTelemetryProcessor:
     def set_rls_coefficients_si(self, enabled: bool) -> None:
         self._processor.set_rls_coefficients_si(bool(enabled))
 
+    def set_host_rls_enabled(self, enabled: bool, *, reset: bool = True) -> None:
+        self._processor.set_host_rls_enabled(bool(enabled), bool(reset))
+
+    @property
+    def host_rls_enabled(self) -> bool:
+        return bool(self._processor.host_rls_enabled)
+
     def drain_f1(self, max_samples: int = 8192) -> list[dict]:
         return list(self._processor.drain_f1(max(1, int(max_samples))))
 

@@ -7,10 +7,10 @@ from collections import deque
 from datetime import datetime
 
 import numpy as np
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QThread, QTimer, Qt, Signal
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QFormLayout,
-    QGroupBox, QHBoxLayout, QLabel, QMessageBox, QPlainTextEdit,
+    QGroupBox, QHBoxLayout, QLabel, QLineEdit, QMessageBox, QPlainTextEdit,
     QProgressBar, QPushButton, QSpinBox, QStackedWidget, QTabWidget,
     QTableWidget, QTableWidgetItem, QVBoxLayout, QWidget,
 )
@@ -24,8 +24,10 @@ from config.config import (
 from logs.operation_logger import logger
 from training.trainer import Trainer
 from training.drl_trainer import DRLTrainer
+from training.feature_engineering import analyze_features, engineer_features
 from widgets.fault_sweep_dialogs import FaultCriteriaDialog, SweepConfigDialog
 
+from .feature_analysis import FeatureAnalysisPanel
 from .model_panels import DRLPanel, MODEL_PANELS, ModelPanel
 from .model_struct import describe_model
 
@@ -112,6 +114,28 @@ _TASK_DESCS = {
 }
 
 
+class _FeatureEngineeringWorker(QThread):
+    resultReady = Signal(object, object)
+    failed = Signal(str)
+
+    def __init__(self, X: np.ndarray, y: np.ndarray,
+                 feature_names: list[str], config, parent=None) -> None:
+        super().__init__(parent)
+        self._X = np.asarray(X, dtype=np.float64).copy()
+        self._y = np.asarray(y, dtype=np.float64).copy()
+        self._feature_names = list(feature_names)
+        self._config = config
+
+    def run(self) -> None:
+        try:
+            result = engineer_features(
+                self._X, self._y, self._feature_names, self._config)
+            analysis = analyze_features(result)
+            self.resultReady.emit(result, analysis)
+        except Exception as exc:
+            self.failed.emit(str(exc))
+
+
 class TrainingPage(QWidget):
     def __init__(self, comm: CommManager, control_page=None) -> None:
         super().__init__()
@@ -126,6 +150,12 @@ class TrainingPage(QWidget):
         self._drl_trainer = DRLTrainer()
         self._tr_losses: deque = deque(maxlen=500)
         self._val_losses: deque = deque(maxlen=500)
+        self._feature_result = None
+        self._feature_analysis = None
+        self._train_split_index: int | None = None
+        self._training_feature_names: list[str] = []
+        self._feature_metadata: dict = {}
+        self._transfer_checkpoint_path = ""
 
         os.makedirs(_DATA_DIR, exist_ok=True)
 
@@ -134,21 +164,24 @@ class TrainingPage(QWidget):
         title.setObjectName("TitleLabel")
         root.addWidget(title)
 
-        top = QHBoxLayout()
-        top.addWidget(self._build_collect_box(), 1)
-        top.addWidget(self._build_clean_box(), 1)
-        root.addLayout(top)
-
         self._tab = QTabWidget()
-        self._tab.addTab(self._build_fault_tab(), "电机故障分类")
-        self._tab.addTab(self._build_drl_tab(), "深度强化学习(DRL) - 学习MPC")
+        data_tab = self._build_data_tab()
+        fault_tab = self._build_fault_tab()  # 先创建val_split等共享训练参数
+        feature_tab = self._build_feature_tab()
+        drl_tab = self._build_drl_tab()
+        self._tab.addTab(data_tab, "① 数据集与预处理")
+        self._tab.addTab(feature_tab, "② 特征工程与分析")
+        self._tab.addTab(fault_tab, "③ 故障模型训练")
+        self._tab.addTab(drl_tab, "④ 深度强化学习(DRL)")
         root.addWidget(self._tab, 1)
         self._update_model_desc()
 
         comm.telemetryReceived.connect(self._on_telemetry)
         self._trainer.epochDone.connect(self._on_epoch)
         self._trainer.finished.connect(self._on_train_done)
-        self._trainer.error.connect(lambda e: self._log(f"[错误] {e}"))
+        self._trainer.error.connect(self._on_train_error)
+        self._trainer.transferStatus.connect(
+            lambda message: self._log(f"[迁移学习] {message}"))
         self._drl_trainer.epochDone.connect(self._on_epoch)
         self._drl_trainer.finished.connect(self._on_train_done)
         self._drl_trainer.error.connect(lambda e: self._log(f"[DRL错误] {e}"))
@@ -157,6 +190,13 @@ class TrainingPage(QWidget):
             lambda n: self._mpc_dataset_label.setText(f"回放缓冲区：{n} 条"))
 
     # ─── 数据采集 ───────────────────────────────────────────
+    def _build_data_tab(self) -> QWidget:
+        tab = QWidget()
+        layout = QHBoxLayout(tab)
+        layout.addWidget(self._build_collect_box(), 3)
+        layout.addWidget(self._build_clean_box(), 2)
+        return tab
+
     def _build_collect_box(self) -> QGroupBox:
         box = QGroupBox("数据采集")
         v = QVBoxLayout(box)
@@ -180,7 +220,7 @@ class TrainingPage(QWidget):
         f = QFormLayout()
         self._label_combo = QComboBox()
         self._label_combo.addItems(["正常 (0.0)", "警告 (0.5)", "异常 (1.0)"])
-        self._collect_dur = QSpinBox(); self._collect_dur.setRange(1, 3600); self._collect_dur.setValue(10)
+        self._collect_dur = QSpinBox(); self._collect_dur.setRange(1, 3600); self._collect_dur.setValue(60)
         f.addRow("数据标签", self._label_combo)
         f.addRow("采集时长 (s)", self._collect_dur)
         v.addLayout(f)
@@ -263,6 +303,7 @@ class TrainingPage(QWidget):
                 sender.blockSignals(False)
                 return
             self._raw.clear()
+            self._invalidate_processed()
             self._collect_status.setText("已采集：0 条")
         self._refresh_preview()
 
@@ -287,12 +328,30 @@ class TrainingPage(QWidget):
             self._preview_info.setText(
                 f"数据格式：{len(sel)} 特征 + 1 标签；暂无数据")
 
+    def _invalidate_processed(self) -> None:
+        """原始数据或列定义变化后，禁止继续使用旧的清洗/特征矩阵。"""
+        if self._X_clean is None and self._feature_result is None:
+            return
+        self._X_clean = None
+        self._y_clean = None
+        self._feature_result = None
+        self._feature_analysis = None
+        self._train_split_index = None
+        self._training_feature_names = []
+        self._feature_metadata = {}
+        if hasattr(self, "_feature_panel"):
+            self._feature_panel.clear_result()
+        if hasattr(self, "_clean_status"):
+            self._clean_status.setText("清洗状态：原始数据已变化，请重新处理")
+
     # ─── 数据清洗 ───────────────────────────────────────────
     def _build_clean_box(self) -> QGroupBox:
         box = QGroupBox("数据清洗")
         f = QFormLayout(box)
         self._chk_dedup = QCheckBox("去重（相邻完全相同行）"); self._chk_dedup.setChecked(True)
-        self._chk_norm = QCheckBox("归一化（Z-score）"); self._chk_norm.setChecked(True)
+        self._chk_norm = QCheckBox("训练集拟合 Z-score（验证集只复用）"); self._chk_norm.setChecked(True)
+        self._chk_norm.setToolTip(
+            "缩放参数只从训练集计算，避免验证集信息泄漏；导出ONNX时会固化缩放层")
         self._chk_drop_nan = QCheckBox("删除含 NaN/Inf 行"); self._chk_drop_nan.setChecked(True)
         self._speed_min = QDoubleSpinBox(); self._speed_min.setRange(-1e5, 1e5); self._speed_min.setValue(-5000)
         self._speed_max = QDoubleSpinBox(); self._speed_max.setRange(-1e5, 1e5); self._speed_max.setValue(5000)
@@ -310,6 +369,13 @@ class TrainingPage(QWidget):
         self._y_clean: np.ndarray | None = None
         return box
 
+    # ─── 特征工程与分析 Tab ─────────────────────────────────
+    def _build_feature_tab(self) -> QWidget:
+        self._feature_panel = FeatureAnalysisPanel()
+        self._feature_panel.buildRequested.connect(self._on_build_features)
+        self._feature_panel.exportRequested.connect(self._on_export_features)
+        return self._feature_panel
+
     # ─── 故障分类 Tab ────────────────────────────────────────
     def _build_fault_tab(self) -> QWidget:
         w = QWidget()
@@ -318,6 +384,7 @@ class TrainingPage(QWidget):
         btn_struct = QPushButton("查看模型结构")
         btn_struct.clicked.connect(self._show_model_structure)
         v.addWidget(btn_struct)
+        v.addWidget(self._build_transfer_box())
         v.addWidget(self._build_train_box())
         return w
 
@@ -409,6 +476,57 @@ class TrainingPage(QWidget):
         h.addWidget(self._model_stack, 1)
         return box
 
+    def _build_transfer_box(self) -> QGroupBox:
+        box = QGroupBox("迁移学习（PyTorch 检查点）")
+        form = QFormLayout(box)
+
+        self._transfer_enable = QCheckBox("加载预训练权重")
+        self._transfer_enable.setToolTip(
+            "仅支持本上位机保存的 .pt 状态检查点；ONNX 是部署格式，不能继续训练")
+        self._transfer_enable.toggled.connect(self._sync_transfer_controls)
+        form.addRow(self._transfer_enable)
+
+        source_row = QHBoxLayout()
+        self._transfer_path = QLineEdit()
+        self._transfer_path.setReadOnly(True)
+        self._transfer_path.setPlaceholderText("尚未选择 .pt 训练检查点")
+        btn_select = QPushButton("选择…")
+        btn_select.clicked.connect(self._select_transfer_checkpoint)
+        btn_clear = QPushButton("清除")
+        btn_clear.clicked.connect(self._clear_transfer_checkpoint)
+        source_row.addWidget(self._transfer_path, 1)
+        source_row.addWidget(btn_select)
+        source_row.addWidget(btn_clear)
+        self._transfer_select_button = btn_select
+        self._transfer_clear_button = btn_clear
+        form.addRow("迁移源", source_row)
+
+        self._transfer_mode = QComboBox()
+        self._transfer_mode.addItem(
+            "仅训练分类头（小样本推荐）", "head_only")
+        self._transfer_mode.addItem(
+            "先冻结，再解冻全网微调", "staged")
+        self._transfer_mode.addItem(
+            "加载后立即全网微调", "full")
+        self._transfer_mode.currentIndexChanged.connect(
+            self._sync_transfer_controls)
+        form.addRow("迁移方式", self._transfer_mode)
+
+        self._transfer_freeze_epochs = QSpinBox()
+        self._transfer_freeze_epochs.setRange(0, 2000)
+        self._transfer_freeze_epochs.setValue(10)
+        self._transfer_freeze_epochs.setToolTip(
+            "分阶段模式中，先只训练分类头的轮数；随后以 0.1× 学习率解冻全网")
+        form.addRow("冻结轮数", self._transfer_freeze_epochs)
+
+        self._transfer_status = QLabel(
+            "目标数据会重新拟合 Z-score；特征名称和顺序必须与迁移源一致。")
+        self._transfer_status.setWordWrap(True)
+        self._transfer_status.setStyleSheet("color: #8fa3b8;")
+        form.addRow(self._transfer_status)
+        self._sync_transfer_controls()
+        return box
+
     # ─── 训练参数 ───────────────────────────────────────────
     def _build_train_box(self) -> QGroupBox:
         box = QGroupBox("训练参数")
@@ -465,13 +583,19 @@ class TrainingPage(QWidget):
         self._btn_export = QPushButton("导出 ONNX")
         self._btn_export.clicked.connect(self._on_export)
         self._btn_export.setEnabled(False)
+        self._btn_checkpoint = QPushButton("保存训练检查点")
+        self._btn_checkpoint.setToolTip(
+            "保存可继续训练的 .pt 权重与特征元数据，用作后续迁移学习源")
+        self._btn_checkpoint.clicked.connect(self._on_save_checkpoint)
+        self._btn_checkpoint.setEnabled(False)
         btn_curve = QPushButton("查看曲线")
         btn_curve.clicked.connect(self._show_curve_window)
         self._progress = QProgressBar(); self._progress.setRange(0, 100); self._progress.setValue(0)
         self._train_log = QPlainTextEdit(); self._train_log.setReadOnly(True); self._train_log.setMaximumHeight(80)
         self._train_log.setPlaceholderText(
             "训练日志：开始训练后逐轮显示 train/val 损失、进度与完成/错误信息")
-        for b in (self._btn_train, self._btn_stop_train, self._btn_export, btn_curve):
+        for b in (self._btn_train, self._btn_stop_train, self._btn_export,
+                  self._btn_checkpoint, btn_curve):
             v2.addWidget(b)
         v2.addWidget(self._progress)
         v2.addWidget(self._train_log)
@@ -522,7 +646,84 @@ class TrainingPage(QWidget):
         for w in (self._epochs, self._lr, self._batch, self._weight_decay,
                   self._optimizer, self._loss_fn, self._scheduler, self._val_split):
             w.setEnabled(not is_sk)
+        self._sync_transfer_controls()
         self._update_model_desc()
+
+    def _sync_transfer_controls(self, *_args) -> None:
+        if not hasattr(self, "_transfer_enable"):
+            return
+        model_name = (self._model_combo.currentText()
+                      if hasattr(self, "_model_combo") else "")
+        is_torch = not model_name.startswith(("随机森林", "支持向量机"))
+        self._transfer_enable.setEnabled(is_torch)
+        active = is_torch and self._transfer_enable.isChecked()
+        for widget in (
+                self._transfer_path, self._transfer_select_button,
+                self._transfer_clear_button, self._transfer_mode):
+            widget.setEnabled(active)
+        staged = (active and
+                  self._transfer_mode.currentData() == "staged")
+        self._transfer_freeze_epochs.setEnabled(staged)
+        if not is_torch:
+            self._transfer_status.setText(
+                "随机森林和 SVM 不支持神经网络权重迁移。")
+        elif self._transfer_checkpoint_path:
+            # Keep the checkpoint summary written by the file picker.
+            pass
+        else:
+            self._transfer_status.setText(
+                "目标数据会重新拟合 Z-score；特征名称和顺序必须与迁移源一致。")
+
+    def _select_transfer_checkpoint(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "选择迁移学习检查点", "",
+            "PyTorch 检查点 (*.pt *.pth)")
+        if not path:
+            return
+        try:
+            info = self._trainer.inspect_checkpoint(path)
+            model_name = str(info.get("model_name") or "")
+            index = self._model_combo.findText(model_name)
+            if index < 0:
+                raise ValueError(f"当前版本不支持检查点模型：{model_name}")
+            self._model_combo.setCurrentIndex(index)
+            self._apply_checkpoint_hyperparameters(
+                model_name, dict(info.get("hyperparameters") or {}))
+            self._transfer_checkpoint_path = path
+            self._transfer_path.setText(path)
+            self._transfer_enable.setChecked(True)
+            names = list(info.get("feature_names") or [])
+            self._transfer_status.setText(
+                f"迁移源：{model_name}；输入 {info.get('input_dimension')} 维；"
+                f"记录了 {len(names)} 个特征名。模型结构参数已同步到当前页面。")
+            self._sync_transfer_controls()
+        except Exception as exc:
+            QMessageBox.warning(self, "检查点不可用", str(exc))
+
+    def _clear_transfer_checkpoint(self) -> None:
+        self._transfer_checkpoint_path = ""
+        self._transfer_path.clear()
+        self._transfer_enable.setChecked(False)
+        self._sync_transfer_controls()
+
+    def _apply_checkpoint_hyperparameters(
+            self, model_name: str, values: dict) -> None:
+        panel = self._model_panels[model_name]
+        mapping = {
+            "hidden_size": ("hidden", "channels", "d_model"),
+            "num_layers": ("layers",),
+            "dropout": ("dropout",),
+            "kernel_size": ("kernel",),
+            "nhead": ("nhead",),
+        }
+        for key, attributes in mapping.items():
+            if key not in values:
+                continue
+            for attribute in attributes:
+                widget = getattr(panel, attribute, None)
+                if widget is not None:
+                    widget.setValue(values[key])
+                    break
 
     def _update_model_desc(self) -> None:
         if not hasattr(self, "_model_desc"):
@@ -534,6 +735,7 @@ class TrainingPage(QWidget):
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._latest = frame
         if self._collecting:
+            self._invalidate_processed()
             if self._chk_auto_label.isChecked():
                 label = _auto_label(frame, self._fault_cfg)
             else:
@@ -670,6 +872,7 @@ class TrainingPage(QWidget):
                     "请调整上方「输入特征」勾选以匹配文件，再重新导入。")
                 return
             self._raw.extend(rows)
+            self._invalidate_processed()
             self._collect_status.setText(f"已采集：{len(self._raw)} 条")
             self._refresh_preview()
             logger.log("导入 CSV", f"{os.path.basename(path)}  {len(rows)} 行")
@@ -701,32 +904,121 @@ class TrainingPage(QWidget):
         if self._chk_drop_nan.isChecked():
             data = data[np.isfinite(data).all(axis=1)]
 
-        # 转速过滤只在选了 speed_actual 时按其所在列执行
-        if "speed_actual" in sel and len(sel) == n_feat:
-            col = sel.index("speed_actual")
+        # 转速过滤只在选了“实际转速”时按其所在列执行。
+        if "实际转速" in sel and len(sel) == n_feat:
+            col = sel.index("实际转速")
             mn, mx = self._speed_min.value(), self._speed_max.value()
             data = data[(data[:, col] >= mn) & (data[:, col] <= mx)]
 
-        if self._chk_dedup.isChecked():
-            _, idx = np.unique(data, axis=0, return_index=True)
-            data = data[np.sort(idx)]
+        if self._chk_dedup.isChecked() and len(data) > 1:
+            # 只删除通信重发造成的相邻重复点，不能全局unique打乱时序分布。
+            keep = np.ones(len(data), dtype=bool)
+            keep[1:] = np.any(data[1:] != data[:-1], axis=1)
+            data = data[keep]
 
         X, y = data[:, :n_feat], data[:, n_feat]
 
-        if self._chk_norm.isChecked() and len(X) > 1:
-            self._mean = X.mean(axis=0)
-            self._std = X.std(axis=0) + 1e-8
-            X = (X - self._mean) / self._std
-        else:
-            self._mean = np.zeros(n_feat)
-            self._std = np.ones(n_feat)
-
         self._X_clean = X.astype(np.float32)
         self._y_clean = y.astype(np.float32)
-        msg = f"清洗完成：{n0} → {len(X)} 条"
+        self._feature_result = None
+        self._feature_analysis = None
+        self._train_split_index = None
+        self._training_feature_names = list(sel)
+        self._feature_metadata = {
+            "kind": "instantaneous",
+            "base_feature_names": list(sel),
+        }
+        if hasattr(self, "_feature_panel"):
+            self._feature_panel.clear_result()
+        scale_note = "；Z-score将在训练集划分后拟合" if self._chk_norm.isChecked() else ""
+        msg = f"点样本清洗完成：{n0} → {len(X)} 条{scale_note}"
         self._clean_status.setText(msg)
         self._log(msg)
         logger.log("数据清洗", msg)
+
+    def _on_build_features(self) -> None:
+        if not self._raw:
+            QMessageBox.information(self, "提示", "请先采集或导入数据")
+            return
+        try:
+            data = np.asarray(self._raw, dtype=np.float64)
+            selected = self._selected_features()
+            n_features = len(selected)
+            if data.ndim != 2 or data.shape[1] != n_features + 1:
+                raise ValueError("原始数据列数与当前输入特征选择不一致")
+            X, y = data[:, :n_features], data[:, n_features]
+            if "实际转速" in selected:
+                speed = selected.index("实际转速")
+                keep = ((X[:, speed] >= self._speed_min.value()) &
+                        (X[:, speed] <= self._speed_max.value()))
+                X, y = X[keep], y[keep]
+            config = self._feature_panel.config(
+                train_fraction=1.0 - self._val_split.value())
+        except Exception as exc:
+            QMessageBox.warning(self, "特征工程失败", str(exc))
+            return
+        worker = _FeatureEngineeringWorker(X, y, selected, config, self)
+        worker.resultReady.connect(self._on_features_ready)
+        worker.failed.connect(self._on_features_failed)
+        worker.finished.connect(worker.deleteLater)
+        self._feature_worker = worker
+        self._feature_panel.set_busy(True)
+        worker.start()
+
+    def _on_features_failed(self, message: str) -> None:
+        self._feature_panel.set_busy(False)
+        QMessageBox.warning(self, "特征工程失败", message)
+
+    def _on_features_ready(self, result, analysis) -> None:
+        self._feature_panel.set_busy(False)
+        self._feature_result = result
+        self._feature_analysis = analysis
+        self._X_clean = result.X
+        self._y_clean = result.y
+        self._train_split_index = result.split_index
+        self._training_feature_names = list(result.feature_names)
+        self._feature_metadata = {
+            "kind": "window_features",
+            "sample_rate_hz": result.config.sample_rate_hz,
+            "window_size": result.config.window_size,
+            "hop_size": result.config.hop_size,
+            "include_time": result.config.include_time,
+            "include_frequency": result.config.include_frequency,
+            "label_mode": result.config.label_mode,
+            "base_feature_names": list(
+                result.preprocessing.get("base_feature_names", [])),
+            "preprocessing": result.preprocessing,
+        }
+        self._feature_panel.set_result(result, analysis)
+        msg = (f"特征工程完成：{result.valid_rows}点 → "
+               f"{len(result.X)}窗口 × {len(result.feature_names)}特征；"
+               f"训练/验证={result.train_windows}/{result.validation_windows}")
+        self._clean_status.setText(msg)
+        self._log(msg)
+        logger.log("特征工程", msg)
+
+    def _on_export_features(self) -> None:
+        result = self._feature_result
+        if result is None:
+            QMessageBox.information(self, "提示", "请先生成特征")
+            return
+        ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+        path, _ = QFileDialog.getSaveFileName(
+            self, "导出特征数据集",
+            os.path.join(_DATA_DIR, f"features_{ts}.csv"), "CSV (*.csv)")
+        if not path:
+            return
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.writer(stream)
+                writer.writerow(result.feature_names + ["label", "split"])
+                for index, (features, label) in enumerate(zip(result.X, result.y)):
+                    split = "train" if index < result.split_index else "validation"
+                    writer.writerow([*map(float, features), float(label), split])
+            logger.log("导出特征数据集", os.path.basename(path))
+            QMessageBox.information(self, "导出成功", f"已保存到：\n{path}")
+        except Exception as exc:
+            QMessageBox.warning(self, "导出失败", str(exc))
 
     def _on_start_train(self) -> None:
         if self._X_clean is None or len(self._X_clean) < 10:
@@ -746,15 +1038,30 @@ class TrainingPage(QWidget):
         self._btn_stop_train.setEnabled(True)
         self._show_curve_window()
         self._btn_export.setEnabled(False)
+        self._btn_checkpoint.setEnabled(False)
         self._progress.setValue(0)
         self._total_epochs = self._epochs.value()
 
         model_name = self._model_combo.currentText()
         hyper = self._model_panels[model_name].values()
+        transfer = {}
+        if self._transfer_enable.isChecked():
+            if not self._transfer_checkpoint_path:
+                QMessageBox.warning(
+                    self, "缺少迁移源", "请先选择一个 .pt 训练检查点")
+                self._btn_train.setEnabled(True)
+                self._btn_stop_train.setEnabled(False)
+                return
+            transfer = {
+                "checkpoint_path": self._transfer_checkpoint_path,
+                "mode": self._transfer_mode.currentData(),
+                "freeze_epochs": self._transfer_freeze_epochs.value(),
+            }
         logger.log("开始训练",
                    f"模型={model_name} epochs={self._total_epochs} "
                    f"lr={self._lr.value()} opt={self._optimizer.currentText()} "
-                   f"loss={self._loss_fn.currentText()} hp={hyper}")
+                   f"loss={self._loss_fn.currentText()} hp={hyper} "
+                   f"transfer={transfer or 'disabled'}")
 
         self._trainer.start(
             self._X_clean, self._y_clean,
@@ -768,6 +1075,11 @@ class TrainingPage(QWidget):
             scheduler=self._scheduler.currentText(),
             weight_decay=self._weight_decay.value(),
             hyper=hyper,
+            normalize=self._chk_norm.isChecked(),
+            split_index=self._train_split_index,
+            feature_names=self._training_feature_names,
+            feature_metadata=self._feature_metadata,
+            transfer=transfer,
         )
 
     def _on_stop_train(self) -> None:
@@ -821,9 +1133,18 @@ class TrainingPage(QWidget):
             btn.setEnabled(False)
         is_torch = not self._model_combo.currentText().startswith(("随机森林", "支持向量机"))
         self._btn_export.setEnabled(is_torch)
+        self._btn_checkpoint.setEnabled(is_torch)
         self._progress.setValue(100)
         self._log(msg)
         logger.log("训练完成", msg)
+
+    def _on_train_error(self, message: str) -> None:
+        self._btn_train.setEnabled(True)
+        self._btn_stop_train.setEnabled(False)
+        self._btn_export.setEnabled(False)
+        self._btn_checkpoint.setEnabled(False)
+        self._log(f"[错误] {message}")
+        logger.log("训练失败", message)
 
     def _log(self, msg: str) -> None:
         self._train_log.appendPlainText(msg)
@@ -839,9 +1160,31 @@ class TrainingPage(QWidget):
         try:
             self._trainer.export_onnx(path)
             logger.log("导出 ONNX", os.path.basename(path))
-            QMessageBox.information(self, "导出成功", f"已保存到：\n{path}")
+            note = f"已保存到：\n{path}\n\n特征与预处理说明：\n{path}.features.json"
+            if self._feature_metadata.get("kind") == "window_features":
+                note += ("\n\n该模型输入为滑窗统计特征，部署推理时必须使用相同的"
+                         "采样率、窗口、步长和特征顺序，不能直接传入8个瞬时遥测值。")
+            QMessageBox.information(self, "导出成功", note)
         except Exception as e:
             QMessageBox.warning(self, "导出失败", str(e))
+
+    def _on_save_checkpoint(self) -> None:
+        path, _ = QFileDialog.getSaveFileName(
+            self, "保存训练检查点", "motor_anomaly_checkpoint.pt",
+            "PyTorch 检查点 (*.pt)")
+        if not path:
+            return
+        if not path.lower().endswith(".pt"):
+            path += ".pt"
+        try:
+            self._trainer.save_checkpoint(path)
+            logger.log("保存训练检查点", os.path.basename(path))
+            QMessageBox.information(
+                self, "保存成功",
+                f"已保存可迁移训练检查点：\n{path}\n\n"
+                "检查点包含模型结构、权重、特征顺序、归一化和特征流水线元数据。")
+        except Exception as exc:
+            QMessageBox.warning(self, "保存失败", str(exc))
 
     def _show_model_structure(self) -> None:
         name = self._model_combo.currentText()

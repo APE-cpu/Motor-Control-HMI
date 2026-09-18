@@ -7,7 +7,7 @@ from enum import Enum
 
 from config.config import (
     CMD_EMERGENCY_STOP, CMD_RESET_FAULT, CMD_SET_PARAMS, CMD_SET_SENSOR,
-    CMD_START, CMD_STOP, CMD_TELEMETRY,
+    CMD_SET_TELEMETRY, CMD_START, CMD_STOP, CMD_TELEMETRY,
 )
 
 from .protocol_session import DeviceCapabilities
@@ -55,7 +55,7 @@ class V2VirtualDevice:
             protocol_min=protocol_min,
             protocol_max=protocol_max,
             commands=[CMD_START, CMD_STOP, CMD_EMERGENCY_STOP, CMD_RESET_FAULT,
-                      CMD_SET_PARAMS, CMD_SET_SENSOR],
+                      CMD_SET_PARAMS, CMD_SET_SENSOR, CMD_SET_TELEMETRY],
             telemetry_fields=[
                 "speed_actual", "speed_target", "current_actual", "temperature",
                 "vdc", "bus_state", "fault_code", "fault_history_code",

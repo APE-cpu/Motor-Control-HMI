@@ -2,7 +2,10 @@ import time
 from collections import deque
 from typing import Deque, Dict
 
-from PySide6.QtWidgets import QLabel, QVBoxLayout, QWidget
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
+    QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
+)
 
 from config.config import CURVE_BUFFER_SIZE
 
@@ -75,6 +78,8 @@ class TrendCurve(QWidget):
         self._times: Deque[float] = deque(maxlen=self._buffer_size)
         self._manual_x = False   # 用户手动缩放过时间轴时停止自动跟随
         self._smooth_n = 1       # 显示平滑窗口（1=关）；仅平滑显示，不动缓冲
+        self._sample_rate_hz = 0.0
+        self._source_processing = "按输入原样缓存（来源未声明额外滤波）"
         self._disp: Dict[str, tuple] = {}   # 最近一次显示的 (times, values)，供Y量程
         self._view_window_s = 0.0  # >0 时只显示最近这么多秒（如相电流看几个电周期）
         # 画线跟随 UI 帧率；量程和 FFT/THD 没必要每帧重算。
@@ -83,6 +88,21 @@ class TrendCurve(QWidget):
         self._range_interval_s = 0.10
         self._stats_interval_s = 0.25
         if _PG_OK:
+            # 处理链路说明放在图上方，避免与波形图下方的时间轴混在一起。
+            # 原有“均值/RMS/峰峰值/THD”实时统计行不再加入布局；
+            # 频域分析改到独立的离线傅里叶页，需要时才计算。
+            self._processing_label = QLabel("")
+            self._processing_label.setStyleSheet(
+                "color: #90a4ae; font-size: 11px; padding: 1px 4px;")
+            self._processing_label.setWordWrap(False)
+            self._processing_label.setMinimumWidth(0)
+            self._processing_label.setSizePolicy(
+                QSizePolicy.Ignored, QSizePolicy.Fixed)
+            self._header_layout = QHBoxLayout()
+            self._header_layout.setContentsMargins(0, 0, 0, 0)
+            self._header_layout.setSpacing(6)
+            self._header_layout.addWidget(self._processing_label, 1)
+            layout.addLayout(self._header_layout)
             self._plot = _YZoomPlot(self, title=title)
             self._plot.setBackground("#10131a")
             self._plot.showGrid(x=True, y=True, alpha=0.3)
@@ -97,9 +117,10 @@ class TrendCurve(QWidget):
                 curve.setDownsampling(auto=True, method="peak")
                 self._curves[name] = curve
             layout.addWidget(self._plot)
+            # 保留属性仅为兼容旧扩展，但不再显示、不再做实时 FFT。
             self._stats_label = QLabel("")
-            self._stats_label.setStyleSheet("color: #90a4ae; font-size: 11px;")
-            layout.addWidget(self._stats_label)
+            self._stats_label.hide()
+            self._update_processing_label()
         else:
             layout.addWidget(QLabel(f"[未安装 pyqtgraph]\n{title}"))
 
@@ -122,6 +143,7 @@ class TrendCurve(QWidget):
         """批量加入高速样本，只重绘一次，避免高频刷新阻塞界面。"""
         if not samples:
             return
+        self._set_sample_interval(interval_s)
         if not self._times:
             self._t0 = time.time()
         start = self._times[-1] + interval_s if self._times else 0.0
@@ -147,6 +169,7 @@ class TrendCurve(QWidget):
         count = min(len(values) for _name, values in active)
         if count <= 0:
             return
+        self._set_sample_interval(interval_s)
         if not self._times:
             self._t0 = time.time()
         start = self._times[-1] + interval_s if self._times else 0.0
@@ -211,8 +234,88 @@ class TrendCurve(QWidget):
         if new_n == self._smooth_n:
             return
         self._smooth_n = new_n
+        self._update_processing_label()
         if _PG_OK and self._times:
             self._render(force_range=True)
+
+    def _set_sample_interval(self, interval_s: float) -> None:
+        """记录批量数据的确切采样率，供标注和离线 FFT 使用。"""
+        interval_s = float(interval_s)
+        if interval_s <= 0.0:
+            return
+        rate_hz = 1.0 / interval_s
+        if abs(rate_hz - self._sample_rate_hz) > max(0.5, rate_hz * 0.001):
+            self._sample_rate_hz = rate_hz
+            self._update_processing_label()
+
+    def set_source_processing(self, description: str,
+                              sample_rate_hz: float | None = None) -> None:
+        """标注从 ADC/固件到上位机缓存之间的处理。
+
+        这与 ``set_smoothing`` 分开：前者是数据源已经发生的处理，
+        后者只是上位机显示效果。
+        """
+        new_description = str(description).strip() or "未声明"
+        changed = new_description != self._source_processing
+        self._source_processing = new_description
+        if sample_rate_hz is not None and float(sample_rate_hz) > 0.0:
+            new_rate = float(sample_rate_hz)
+            changed = changed or abs(new_rate - self._sample_rate_hz) > 0.5
+            self._sample_rate_hz = new_rate
+        if changed:
+            self._update_processing_label()
+
+    def _update_processing_label(self) -> None:
+        if not _PG_OK or not hasattr(self, "_processing_label"):
+            return
+        if self._sample_rate_hz >= 1000.0:
+            rate = f"{self._sample_rate_hz / 1000.0:g} kHz"
+        elif self._sample_rate_hz > 0.0:
+            rate = f"{self._sample_rate_hz:g} Hz"
+        else:
+            rate = "随遥测到达"
+        display = ("关闭（原始缓冲点）" if self._smooth_n <= 1 else
+                   f"{self._smooth_n}点居中移动平均（仅显示）")
+        self._processing_label.setText(
+            f"采样率：{rate}  ·  采集处理：{self._source_processing}  ·  "
+            f"显示滤波：{display}")
+        self._processing_label.setToolTip(self._processing_label.text())
+
+    def add_header_widget(self, widget: QWidget) -> None:
+        """在采样/滤波说明同一行的右侧添加操作控件。"""
+        if _PG_OK and hasattr(self, "_header_layout"):
+            widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
+            self._header_layout.addWidget(widget, 0, Qt.AlignRight)
+
+    def processing_details(self) -> str:
+        """返回可随数据导出/离线分析保存的处理说明。"""
+        display = ("无（原始缓冲点）" if self._smooth_n <= 1 else
+                   f"{self._smooth_n}点居中移动平均，仅显示")
+        return f"采集处理：{self._source_processing}；显示滤波：{display}"
+
+    def raw_snapshot(self, series_name: str) -> dict:
+        """复制一份原始缓冲，不套用显示平滑，供离线分析。"""
+        if series_name not in self._buffers:
+            raise KeyError(series_name)
+        values = list(self._buffers[series_name])
+        times = list(self._times)
+        sample_times = times[-len(values):] if values else []
+        rate_hz = float(self._sample_rate_hz)
+        if rate_hz <= 0.0 and len(sample_times) >= 2:
+            deltas = [b - a for a, b in zip(sample_times, sample_times[1:])
+                      if b > a]
+            if deltas:
+                ordered = sorted(deltas)
+                rate_hz = 1.0 / ordered[len(ordered) // 2]
+        return {
+            "times": sample_times,
+            "values": values,
+            "sample_rate_hz": rate_hz,
+            "source_processing": self._source_processing,
+            "display_filter": ("无（FFT使用原始缓冲）" if self._smooth_n <= 1
+                               else f"当前显示为{self._smooth_n}点居中移动平均；"
+                                    "FFT仍使用原始缓冲"),
+        }
 
     def set_view_window(self, seconds: float) -> None:
         """>0 时时间轴只显示最近 seconds 秒（滚动跟随），0=显示全部缓冲。
@@ -272,25 +375,8 @@ class TrendCurve(QWidget):
         self._plot.setYRange(lo, hi, padding=0.08)
 
     def _update_stats(self) -> None:
-        """统计行：均值 / RMS / 峰峰值 / THD（FFT 去直流，谐波能量/最大基波）。"""
-        parts = []
-        for name, buf in self._buffers.items():
-            if len(buf) < 16:
-                continue
-            a = np.asarray(buf, dtype=float)
-            mean, pp = a.mean(), a.max() - a.min()
-            rms = float(np.sqrt((a * a).mean()))
-            spec = np.abs(np.fft.rfft(a - mean))
-            thd_text = "--"
-            if len(spec) > 2:
-                k = int(np.argmax(spec[1:])) + 1
-                fund = spec[k]
-                if fund > 1e-9:
-                    rest = np.sqrt(max(float((spec[1:] ** 2).sum() - fund ** 2), 0.0))
-                    thd_text = f"{rest / fund * 100.0:.1f}%"
-            parts.append(f"{name}: μ={mean:.2f}  RMS={rms:.2f}"
-                         f"  峰峰={pp:.2f}  THD={thd_text}")
-        self._stats_label.setText("    |    ".join(parts))
+        """兼容旧调用点；实时统计/FFT已移至离线分析页。"""
+        return
 
     def resume_follow(self) -> None:
         """恢复时间轴自动跟随。新一次运行开始时由页面调用，避免用户

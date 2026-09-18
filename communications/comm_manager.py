@@ -16,7 +16,7 @@ from typing import Optional, Tuple
 from PySide6.QtCore import QObject, Signal
 
 from config.config import (
-    CMD_EMERGENCY_STOP, CMD_START, CMD_STOP, CMD_TELEMETRY,
+    CMD_EMERGENCY_STOP, CMD_SET_TELEMETRY, CMD_START, CMD_STOP, CMD_TELEMETRY,
     FRAME_HEADER, FRAME_TAIL,
     TELEM_ANGLE_SCALE, TELEM_CURRENT_SCALE, TELEM_FMT, TELEM_FMT_CAN,
     TELEM_LEN, TELEM_LEN_CAN, TELEM_TEMP_OFFSET, TELEM_TORQUE_FROM_CURRENT,
@@ -113,6 +113,9 @@ class TelemetryFrame:
         "phase_current_a", # 相电流幅值，区别于current_actual(q轴电流)
         "speed_kp",        # 下位机速度环实际Kp数字量
         "speed_ki",        # 下位机速度环实际Ki数字量
+        "current_filter_enabled",   # Id/Iq反馈IIR是否参与电流PI
+        "current_filter_alpha_q15", # 一阶IIR系数（Q15）
+        "speed_fifo_depth",         # 编码器速度滑动平均窗口（1..16）
         "position_actual_deg",  # 位置环反馈（机械角，相对启动捕获点）
         "position_target_deg",  # 位置环目标（机械角）
         "position_error_deg",   # 位置环误差
@@ -155,6 +158,9 @@ class TelemetryFrame:
         self.phase_current_a = 0.0
         self.speed_kp = 0
         self.speed_ki = 0
+        self.current_filter_enabled = False
+        self.current_filter_alpha_q15 = 0
+        self.speed_fifo_depth = 16
         self.position_actual_deg = 0.0
         self.position_target_deg = 0.0
         self.position_error_deg = 0.0
@@ -184,13 +190,14 @@ class CommManager(QObject):
     highRateTelemetryBatchReceived = Signal(object) # 以太网批量样本，降低UI事件率
     highRateTelemetryColumnsReceived = Signal(object) # C++列式批量，避免逐样本dict
     currentSamplingDiagReceived = Signal(object) # F2 ADC/PWM采样诊断
-    rlsCoeffReceived = Signal(object)         # F3 在线ARX/RLS辨识系数
+    rlsCoeffReceived = Signal(object)         # 上位机C++或兼容F3的RLS系数
     burstReceived = Signal(object)            # F4 16kHz突发抓取波形(重组完成)
     logMessage = Signal(str)                  # 日志/错误信息
     rawReceived = Signal(int, bytes)          # CAN原始帧 (arbitration_id, data)
     faultDetected = Signal(str)               # 需要进入 FAULT_LOCKED 的故障
     protocolSessionChanged = Signal(object)   # 会话状态快照 dict
     commandResult = Signal(object)            # v2 CommandResult
+    telemetryConfigChanged = Signal(object)   # 最近请求的F1/F2/F3配置
 
     def __init__(self) -> None:
         super().__init__()
@@ -235,6 +242,13 @@ class CommManager(QObject):
         self._native_telem_bursts_dropped_seen = 0
         self._native_telem_diagnostics_dropped_seen = 0
         self._native_telem_high_frames_seen = 0
+        # 最近一次请求的遥测档位；诊断页切换F2时据此保留F1设置。
+        self._telemetry_flags = 0x01
+        self._telemetry_f1_ms = 0
+        self._telemetry_f2_ms = 20
+        self._telemetry_f3_ms = 100
+        self._telemetry_f1_rate_hz = 0
+        self._telemetry_f1_batch_samples = 16
         try:
             self._native_telemetry_processor = (
                 NativeTelemetryProcessor() if native_telemetry_enabled() else None)
@@ -552,6 +566,10 @@ class CommManager(QObject):
         return (not self.is_connected()
                 and self._thread is not None and self._thread.is_alive())
 
+    def motor_sim_enabled(self) -> bool:
+        """数字孪生内部逆变器是否使能；供独立仿真页面显示运行状态。"""
+        return bool(self._motor_sim.enabled)
+
     def protocol_status(self) -> dict:
         session = self._v2_session
         caps = session.capabilities if session else None
@@ -744,7 +762,8 @@ class CommManager(QObject):
                               f1_rate_hz: int = 0,
                               f1_batch_samples: int = 16) -> bool:
         """下发遥测档位到固件（CMD_SET_TELEMETRY=0x22）。
-        flags: bit0=F2诊断开, bit1=F3在线辨识开; f1_ms=0 表示按传输默认。
+        flags: bit0=F2诊断开；bit1为旧固件F3兼容位，新固件忽略。
+        f1_ms=0 表示按传输默认。
         f1_rate_hz>0 时使用兼容扩展载荷，请求由16kHz FOC中断生产连续样本；
         旧固件/旧档位仍使用原来的7字节载荷。"""
         from communications.protocol import encode_frame
@@ -769,7 +788,99 @@ class CommManager(QObject):
         else:
             payload = struct.pack("<BHHH", flags & 0xFF, f1_ms & 0xFFFF,
                                   f2_ms & 0xFFFF, f3_ms & 0xFFFF)
-        return self.send_frame(encode_frame(0x22, payload))
+        status_before = self.protocol_status()
+        pending_before = status_before.get("pending_ack", 0)
+        tx_before = int(status_before.get("statistics", {}).get("tx_frames", 0))
+        sent = self.send_frame(encode_frame(CMD_SET_TELEMETRY, payload))
+        status_after = self.protocol_status()
+        pending_after = status_after.get("pending_ack", 0)
+        tx_after = int(status_after.get("statistics", {}).get("tx_frames", 0))
+        # negotiated-v2 的 send_frame 在命令已经可靠入队、但 ACK 尚未返回时
+        # 按旧接口会返回 False。这里将“成功提交”与“同步收到 ACK”统一视为
+        # 已发送，否则诊断页会误报失败，后续切换 F2 还会覆盖 F1/F3 配置。
+        submitted = (sent or pending_after > pending_before or
+                     tx_after > tx_before)
+        if submitted:
+            self._telemetry_flags = int(flags) & 0xFF
+            self._telemetry_f1_ms = int(f1_ms)
+            self._telemetry_f2_ms = int(f2_ms)
+            self._telemetry_f3_ms = int(f3_ms)
+            self._telemetry_f1_rate_hz = f1_rate_hz
+            self._telemetry_f1_batch_samples = f1_batch_samples
+            self.telemetryConfigChanged.emit(self.telemetry_config())
+        # 保持既有API语义：真实v2在ACK前仍返回False；请求值已经在上面保存。
+        return sent
+
+    def telemetry_config(self) -> dict:
+        """返回最近请求的遥测配置，供独立诊断页安全地只改F2。"""
+        return {
+            "flags": self._telemetry_flags,
+            "f1_ms": self._telemetry_f1_ms,
+            "f2_ms": self._telemetry_f2_ms,
+            "f3_ms": self._telemetry_f3_ms,
+            "f1_rate_hz": self._telemetry_f1_rate_hz,
+            "f1_batch_samples": self._telemetry_f1_batch_samples,
+        }
+
+    def start_host_rls(self) -> bool:
+        """在 C++ 上位机中启动/复位 RLS，并确保固件只发送 F1 原始量。"""
+        if not self.is_connected():
+            self.logMessage.emit("[错误] 通信未连接，无法启动上位机RLS")
+            return False
+        processors = [
+            item for item in (
+                self._native_telemetry_processor,
+                self._native_telem_receiver,
+            ) if item is not None
+        ]
+        if not processors:
+            self.logMessage.emit(
+                "[错误] C++遥测核心不可用，未启动RLS；请重新安装native_core")
+            return False
+        for processor in processors:
+            processor.set_host_rls_enabled(True, reset=True)
+
+        current = self.telemetry_config()
+        # bit1 was the old firmware-side F3/RLS gate. It is now always clear.
+        flags = int(current["flags"]) & ~0x02
+        ethernet = self._kind in ("以太网TCP", "RS-485+以太网")
+        rate_hz = 16000 if ethernet else 1000
+        self.send_telemetry_config(
+            flags, 0, int(current["f2_ms"]), 100,
+            f1_rate_hz=rate_hz,
+            f1_batch_samples=int(current["f1_batch_samples"]))
+        self.logMessage.emit(
+            f"[状态] 上位机C++ RLS已复位并启动；固件RLS关闭，"
+            f"F1={rate_hz}Hz")
+        return True
+
+    def stop_host_rls(self) -> None:
+        """停止本地辨识，不改变当前 F1 波形档位。"""
+        for processor in (
+                self._native_telemetry_processor,
+                self._native_telem_receiver):
+            if processor is not None:
+                processor.set_host_rls_enabled(False, reset=False)
+
+    def set_f2_diagnostics(self, enabled: bool,
+                           period_ms: int = 20) -> bool:
+        """只切换F2诊断，保留当前F1连续流设置。"""
+        current = self.telemetry_config()
+        flags = int(current["flags"])
+        flags = flags | 0x01 if enabled else flags & ~0x01
+        status_before = self.protocol_status()
+        pending_before = int(status_before.get("pending_ack", 0))
+        tx_before = int(status_before.get("statistics", {}).get("tx_frames", 0))
+        sent = self.send_telemetry_config(
+            flags, int(current["f1_ms"]), int(period_ms),
+            int(current["f3_ms"]),
+            f1_rate_hz=int(current["f1_rate_hz"]),
+            f1_batch_samples=int(current["f1_batch_samples"]))
+        status_after = self.protocol_status()
+        return bool(
+            sent or
+            int(status_after.get("pending_ack", 0)) > pending_before or
+            int(status_after.get("statistics", {}).get("tx_frames", 0)) > tx_before)
 
     def _apply_f1_stream_config(self, f1_ms: int,
                                 f1_rate_hz: int = 0) -> None:
@@ -1107,18 +1218,46 @@ class CommManager(QObject):
                     firmware = caps.firmware_version if caps is not None else ""
                     coeffs_are_si = firmware.startswith("0.7.6-rls-si")
                     if coeffs_are_si:
+                        b_scale = 1.0
                         b_dd0 = theta_d[3]         # A/V，d轴电流对d轴电压
                         b_qq0 = theta_q[5]         # A/V，q轴电流对q轴电压
                     else:
                         i_lsb = (3.30 / 2) / (0.01 * 8.0) / 32767.0
                         v_lsb = 24.0 / (3 ** 0.5) / 32767.0
-                        b_dd0 = theta_d[3] * i_lsb / v_lsb
-                        b_qq0 = theta_q[5] * i_lsb / v_lsb
-                    # 反解物理参数：L=Ts/b0，R=(1-a1)/b0_SI（a1受电流噪声影响大）
-                    ld_est = ts / b_dd0 if b_dd0 > 1e-9 else float("nan")
-                    lq_est = ts / b_qq0 if b_qq0 > 1e-9 else float("nan")
-                    rd_est = (1 - a1_d) / b_dd0 if b_dd0 > 1e-9 else float("nan")
-                    rq_est = (1 - a1_q) / b_qq0 if b_qq0 > 1e-9 else float("nan")
+                        b_scale = i_lsb / v_lsb
+                        b_dd0 = theta_d[3] * b_scale
+                        b_qq0 = theta_q[5] * b_scale
+                    def _arx3_first_order_equivalent(
+                            theta, own_b_index, coefficient_scale):
+                        """由完整 ARX(3,1) 的低频增益/斜率求等效 R、L。"""
+                        a1, a2, a3 = map(float, theta[:3])
+                        b0 = float(theta[own_b_index]) * coefficient_scale
+                        b1 = float(theta[own_b_index + 1]) * coefficient_scale
+                        a_dc = 1.0 - a1 - a2 - a3
+                        b_dc = b0 + b1
+                        eps = 1e-12
+                        if (not all(math.isfinite(value) for value in
+                                    (a1, a2, a3, b0, b1, a_dc, b_dc)) or
+                                abs(a_dc) <= eps or abs(b_dc) <= eps):
+                            return float("nan"), float("nan")
+
+                        resistance = a_dc / b_dc
+                        # H(q)=(b0*q+b1*q^2)/
+                        #      (1-a1*q-a2*q^2-a3*q^3), q=z^-1。
+                        # 下式是 q=1 处的归一化一阶矩；对于原一阶模型
+                        # 会严格退化为 L=Ts/b0、R=(1-a1)/b0。
+                        moment = ((b0 + 2.0 * b1) / b_dc +
+                                  (a1 + 2.0 * a2 + 3.0 * a3) / a_dc)
+                        inductance = resistance * ts * moment
+                        if (resistance <= 0.0 or inductance <= 0.0 or
+                                not math.isfinite(inductance)):
+                            return float("nan"), float("nan")
+                        return resistance, inductance
+
+                    rd_est, ld_est = _arx3_first_order_equivalent(
+                        theta_d, 3, b_scale)
+                    rq_est, lq_est = _arx3_first_order_equivalent(
+                        theta_q, 5, b_scale)
                     sample = {
                         "tick_ms": tick_ms, "updates": updates,
                         "innov_rms_a": (innov_rms if coeffs_are_si
@@ -1314,6 +1453,7 @@ class CommManager(QObject):
         }
         integer_fields = {
             "fault_code", "fault_history_code", "mc_state", "speed_kp", "speed_ki",
+            "current_filter_alpha_q15", "speed_fifo_depth",
             "stop_reason", "stop_command", "stop_rx_age_ms", "stop_run_ms",
         }
         # F407 uses signed centidegrees on the wire to avoid float formatting
@@ -1357,7 +1497,8 @@ class CommManager(QObject):
                     value = float(value)
                 elif field in integer_fields:
                     value = int(value)
-                elif field in {"low_speed_warn", "position_saturated"}:
+                elif field in {"low_speed_warn", "position_saturated",
+                               "current_filter_enabled"}:
                     value = _parse_bool(value)
                 elif field in {"sensor_source", "fault_text", "fault_history_text",
                                "bus_state"}:

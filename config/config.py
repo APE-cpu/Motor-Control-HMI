@@ -185,6 +185,7 @@ CMD_EMERGENCY_STOP = 0x12
 CMD_RESET_FAULT = 0x13       # v2：下位机确认保护条件后执行故障复位
 CMD_SET_PARAMS = 0x20
 CMD_SET_SENSOR = 0x21        # 单独下发位置传感器配置
+CMD_SET_TELEMETRY = 0x22     # 设置F1/F2/F3遥测频率与使能位
 
 # 遥测 flags：bit0 仅告警；bit1~3 表示下位机已经锁定的硬故障。
 TELEM_FLAG_LOW_SPEED_WARN = 0x01

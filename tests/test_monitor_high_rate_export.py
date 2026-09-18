@@ -217,3 +217,27 @@ def test_monitor_plot_timer_runs_at_about_30_hz():
     assert page._timer.interval() == MONITOR_PLOT_REFRESH_MS == 33
     page._timer.stop()
     page.close()
+
+
+def test_filter_panel_controls_each_display_curve_without_touching_raw_data():
+    _app()
+    page = MonitorPage(CommManager())
+    page._timer.stop()
+    page._c_phase_current.append_columns({"Ia": [0.0, 1.0, 0.0]}, 0.001)
+    raw_before = page._c_phase_current.raw_snapshot("Ia")["values"]
+
+    page._filter_dialog._current_preset()
+
+    assert page._c_current._smooth_n == 16
+    assert page._c_phase_current._smooth_n == 16
+    assert page._c_voltage._smooth_n == 16
+    assert page._c_speed._smooth_n == 1
+    assert "3路开启" in page._btn_filter_panel.text()
+    assert page._c_phase_current.raw_snapshot("Ia")["values"] == raw_before
+
+    page._filter_dialog._disable_all()
+    assert page._c_current._smooth_n == 1
+    assert page._c_phase_current._smooth_n == 1
+    assert page._c_voltage._smooth_n == 1
+    assert "全关" in page._btn_filter_panel.text()
+    page.close()

@@ -44,3 +44,34 @@ def test_f2_extended_calibration_payload_is_decoded_without_stopping_rx():
     assert received[0]["cal_adc2_pp"] == 40
     assert received[0]["sample_point"] == 5249
     assert abs(received[0]["adc1_v"] - 1.6516) < 0.001
+
+
+def test_f2_switch_preserves_f1_stream_and_f3_configuration(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    comm._telemetry_flags = 0x03
+    comm._telemetry_f1_ms = 0
+    comm._telemetry_f2_ms = 20
+    comm._telemetry_f3_ms = 100
+    comm._telemetry_f1_rate_hz = 16000
+    comm._telemetry_f1_batch_samples = 16
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    submitted = []
+
+    def record(flags, f1_ms, f2_ms, f3_ms, **kwargs):
+        submitted.append((flags, f1_ms, f2_ms, f3_ms, kwargs))
+        return True
+
+    monkeypatch.setattr(comm, "send_telemetry_config", record)
+    page = CurrentSamplingPage(comm)
+    page._f2_period.setCurrentIndex(page._f2_period.findData(50))
+    page._f2_enabled.setChecked(False)
+
+    flags, f1_ms, f2_ms, f3_ms, kwargs = submitted[-1]
+    assert flags == 0x02
+    assert (f1_ms, f2_ms, f3_ms) == (0, 50, 100)
+    assert kwargs == {"f1_rate_hz": 16000, "f1_batch_samples": 16}
+    assert page.findChild(type(page._f2_enabled), "") is not None
+    page.close()
+    page.deleteLater()
+    app.processEvents()

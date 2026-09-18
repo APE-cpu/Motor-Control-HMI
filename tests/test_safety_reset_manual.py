@@ -31,6 +31,43 @@ def _wait_until(predicate, timeout=1.5):
     return bool(predicate())
 
 
+def test_主窗口退出前同步停止数字孪生线程(tmp_path, monkeypatch):
+    _app()
+    monkeypatch.setattr(
+        "pages.experiment_page.writable_path",
+        lambda *parts: tmp_path.joinpath(*parts))
+    window = MainWindow(enable_training=False)
+
+    class FakeRunningEngine:
+        def __init__(self):
+            self.running = True
+            self.stop_calls = 0
+            self.wait_calls = []
+
+        def isRunning(self):  # noqa: N802 - mirrors QThread
+            return self.running
+
+        def stop_model(self):
+            self.stop_calls += 1
+
+        def wait(self, timeout_ms):
+            self.wait_calls.append(timeout_ms)
+            self.running = False
+            return True
+
+    engine = FakeRunningEngine()
+    window.digital_twin_page._engine = engine
+    window.digital_twin_page._engine_state = "running"
+
+    assert window.close() is True
+    assert engine.stop_calls == 1
+    assert engine.wait_calls == [3000]
+    assert engine.running is False
+    assert window.digital_twin_page._engine is None
+    window.deleteLater()
+    _app().processEvents()
+
+
 def test_电流限幅进入数字孪生与实验保护快照():
     _app()
     comm = CommManager()
@@ -76,6 +113,7 @@ def test_矢量页在数据源停止后清空并停止演示旋转():
     _app()
     comm = CommManager()
     page = VectorPage(comm)
+    page._chk_enabled.setChecked(True)
     page._i_plot.append(1.0, 2.0)
     page._psi_plot.append(0.1, 0.2)
     page._spin = 2.0
@@ -92,6 +130,7 @@ def test_矢量页在数据源停止后清空并停止演示旋转():
 def test_功率页显示计算式且系统导航提供说明书(tmp_path, monkeypatch):
     _app()
     power_page = PowerFlowPage(CommManager())
+    power_page._chk_enabled.setChecked(True)
     texts = "\n".join(label.text() for label in power_page.findChildren(QLabel))
     assert "P_inv = 3/2" in texts
     assert "P_brake = V_dc²" in texts
@@ -119,27 +158,36 @@ def test_功率页显示计算式且系统导航提供说明书(tmp_path, monkey
     window.deleteLater()
 
 
-def test_快速仿真一键进入运行且主页面小屏可滚动(tmp_path, monkeypatch):
+def test_数字孪生独立页面进入运行且主页面小屏可滚动(tmp_path, monkeypatch):
     _app()
     monkeypatch.setattr(
         "pages.experiment_page.writable_path",
         lambda *parts: tmp_path.joinpath(*parts))
+    fake_dll = tmp_path / "pmsm_simulink_host.dll"
+    fake_dll.write_bytes(b"test")
+    monkeypatch.setattr(
+        "pages.digital_twin_page.resolve_simulink_dll", lambda: fake_dll)
     window = MainWindow(enable_training=False)
     monitor = window.monitor_page
+    twin = window.digital_twin_page
 
-    monitor._on_quick_sim()
+    twin._start_environment()
+    window.runtime_state.begin_precheck("测试")
+    window.runtime_state.pass_precheck("测试")
+    twin._on_engine_state_changed("running")
     assert window.runtime_state.state.value == "running"
-    assert window.comm_manager.is_sim_running() is True
-    assert window.comm_manager._motor_sim.enabled is True
+    assert twin._environment_ready is True
+    assert window.comm_manager.is_sim_running() is False
 
     wrapper = QStackedWidget.widget(window.stack, 0)
     assert isinstance(wrapper, QScrollArea)
     assert wrapper.widget() is monitor
     assert monitor.minimumWidth() == 980
 
-    monitor._on_stop()
+    window.runtime_state.request_stop("测试")
+    twin._on_engine_state_changed("stopped")
     assert window.runtime_state.state.value == "ready"
-    monitor._on_toggle_sim()
+    twin._stop_environment()
     assert window.runtime_state.state.value == "disconnected"
     window.close()
     window.deleteLater()

@@ -309,6 +309,14 @@ void TcpV2Receiver::set_rls_coefficients_si(bool value) noexcept {
     telemetry_.set_rls_coefficients_si(value);
 }
 
+void TcpV2Receiver::set_host_rls_enabled(bool enabled, bool reset) {
+    telemetry_.set_host_rls_enabled(enabled, reset);
+}
+
+bool TcpV2Receiver::host_rls_enabled() const noexcept {
+    return telemetry_.host_rls_enabled();
+}
+
 void TcpV2Receiver::set_telemetry_processing_enabled(bool enabled) noexcept {
     telemetry_processing_enabled_ = enabled;
 }

@@ -176,3 +176,19 @@ def test_v2通用MCSDK文本会被具体故障码替换():
         MessageType.TELEMETRY, command=0x30, payload=payload))
 
     assert "启动失败" in frame.fault_text
+
+
+def test_v2电流反馈滤波状态可由遥测回读():
+    comm = CommManager()
+    payload = json.dumps({
+        "current_filter_enabled": 1,
+        "current_filter_alpha_q15": 20491,
+        "speed_fifo_depth": 8,
+    }).encode("utf-8")
+
+    frame = comm._parse_v2_telemetry(V2Frame(
+        MessageType.TELEMETRY, command=0x30, payload=payload))
+
+    assert frame.current_filter_enabled is True
+    assert frame.current_filter_alpha_q15 == 20491
+    assert frame.speed_fifo_depth == 8

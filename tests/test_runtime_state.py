@@ -9,9 +9,13 @@ import time
 
 from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import decode_frame
-from config.config import CMD_RESET_FAULT, CMD_START
+from config.config import CMD_RESET_FAULT, CMD_SET_PARAMS, CMD_START
 from core import RuntimeState, RuntimeStateMachine, TransitionError
-from pages.control_page import ControlPage, firmware_runtime_payload
+from pages.control_page import (
+    ControlPage, current_filter_alpha_q15, current_filter_cutoff_hz,
+    firmware_runtime_payload,
+)
+from pages.digital_twin_page import DigitalTwinPage
 from pages.experiment_page import ExperimentPage
 
 
@@ -118,18 +122,17 @@ def test_断线状态下故障复位回到未连接():
     assert machine.state is RuntimeState.DISCONNECTED
 
 
-def test_控制页启动和停机必须经过状态机(tmp_path, monkeypatch):
+def test_数字孪生页启动和停机必须经过状态机(tmp_path, monkeypatch):
     app = _app()
     comm = CommManager()
-    monkeypatch.setattr(comm, "is_sim_running", lambda: True)
-    monkeypatch.setattr(comm, "send_frame", lambda _data: True)
     machine = RuntimeStateMachine()
     _make_ready(machine)
-    page = ControlPage(comm, machine)
+    page = DigitalTwinPage(comm, machine)
 
-    page._on_start()
+    page._on_engine_state_changed("running")
     assert machine.state is RuntimeState.RUNNING
-    page._on_stop()
+    machine.request_stop("测试停止")
+    page._on_engine_state_changed("stopped")
     assert machine.state is RuntimeState.READY
     page.close()
     page.deleteLater()
@@ -237,6 +240,93 @@ def test_位置三环参数帧不超过固件旧拷贝缓冲():
     assert b"ki_pos=" not in payload
     assert "永磁".encode("utf-8") not in payload
     assert b"sample_time=" not in payload
+
+
+def test_电流反馈滤波频率与Q15系数可逆():
+    alpha = current_filter_alpha_q15(2500.0)
+    assert alpha == 20491
+    assert current_filter_cutoff_hz(alpha) == pytest.approx(2500.0, abs=0.1)
+    with pytest.raises(ValueError):
+        current_filter_alpha_q15(500.0)
+
+
+def test_控制页可单独下发旁路或IIR设置(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    sent = []
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(comm, "send_frame", lambda data: sent.append(data) or True)
+    page = ControlPage(comm)
+
+    assert page._current_filter_mode.currentData() is False
+    assert page._current_filter_cutoff.isEnabled() is False
+    page._current_filter_mode.setCurrentIndex(
+        page._current_filter_mode.findData(True))
+    page._current_filter_cutoff.setValue(2500)
+    page._on_apply_current_filter()
+
+    command, payload = decode_frame(sent[-1])
+    assert command == CMD_SET_PARAMS
+    assert b"current_filter_enabled=1" in payload
+    assert b"current_filter_alpha_q15=20491" in payload
+    assert "等待固件遥测回读" in page._current_filter_status.text()
+    feedback = TelemetryFrame()
+    feedback.data_source = "real"
+    feedback.current_filter_enabled = True
+    feedback.current_filter_alpha_q15 = 20491
+    page._on_telemetry(feedback)
+    assert "Id/Iq参与PI" in page._current_filter_status.text()
+    assert "2500 Hz" in page._current_filter_status.text()
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
+def test_控制页运行中拒绝改变电流反馈滤波(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    sent = []
+    frame = TelemetryFrame()
+    frame.mc_state = 6
+    comm._latest_frame = frame
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(comm, "send_frame", lambda data: sent.append(data) or True)
+    monkeypatch.setattr(QMessageBox, "warning", lambda *args, **kwargs: None)
+    page = ControlPage(comm)
+
+    page._on_apply_current_filter()
+
+    assert sent == []
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
+def test_控制页可下发并回读编码器速度FIFO(monkeypatch):
+    app = _app()
+    comm = CommManager()
+    sent = []
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(comm, "send_frame", lambda data: sent.append(data) or True)
+    page = ControlPage(comm)
+    page._speed_fifo_depth.setCurrentIndex(
+        page._speed_fifo_depth.findData(8))
+
+    page._on_apply_speed_fifo()
+
+    command, payload = decode_frame(sent[-1])
+    assert command == CMD_SET_PARAMS
+    assert b"speed_fifo_depth=8" in payload
+    assert "等待固件遥测回读" in page._speed_fifo_status.text()
+    feedback = TelemetryFrame()
+    feedback.data_source = "real"
+    feedback.speed_fifo_depth = 8
+    page._on_telemetry(feedback)
+    assert "8点平均" in page._speed_fifo_status.text()
+    assert "7 ms群延迟" in page._speed_fifo_status.text()
+    page.close()
+    page.deleteLater()
+    app.processEvents()
 
 
 def test_位置三环真实v2启动只发START不夹带遥测配置(monkeypatch):

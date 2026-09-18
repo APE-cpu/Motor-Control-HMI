@@ -19,7 +19,7 @@ class AIClient:
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
                 "Authorization": f"Bearer {self.api_key}",
-                "User-Agent": "MotorControlHMI/1.9.0 (OpenAI-compatible client)",
+                "User-Agent": "MotorControlHMI/1.9.1 (OpenAI-compatible client)",
             },
             method="POST",
         )
@@ -33,14 +33,27 @@ class AIClient:
             msg = body
         return RuntimeError(f"HTTP {e.code}: {msg}")
 
-    def chat(self, messages: List[Dict], timeout: int = 30) -> str:
-        req = self._request({"model": self.model, "messages": messages})
+    def complete(self, messages: List[Dict], tools: list | None = None,
+                 timeout: int = 30) -> dict:
+        """返回完整assistant message，保留兼容接口的tool_calls字段。"""
+        payload = {"model": self.model, "messages": messages}
+        if tools:
+            payload["tools"] = tools
+            payload["tool_choice"] = "auto"
+        req = self._request(payload)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode("utf-8"))
-            return data["choices"][0]["message"]["content"]
+            message = data["choices"][0]["message"]
+            if not isinstance(message, dict):
+                raise RuntimeError("模型响应中的message格式无效")
+            return message
         except urllib.error.HTTPError as e:
             raise self._http_error(e) from None
+
+    def chat(self, messages: List[Dict], timeout: int = 30) -> str:
+        message = self.complete(messages, timeout=timeout)
+        return str(message.get("content") or "")
 
     def chat_stream(self, messages: List[Dict], timeout: int = 30,
                     on_delta=None) -> str:

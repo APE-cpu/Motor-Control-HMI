@@ -1,5 +1,7 @@
 #pragma once
 
+#include "motor_core/online_rls.hpp"
+
 #include <atomic>
 #include <array>
 #include <cstddef>
@@ -63,6 +65,7 @@ struct F3Sample {
     std::uint32_t updates = 0;
     double innov_rms_a = 0.0;
     double innov_rms_digit = 0.0;
+    double p_trace = 0.0;
     std::array<float, 7> theta_d{};
     std::array<float, 7> theta_q{};
     double a1_d = 0.0;
@@ -102,6 +105,8 @@ public:
                 std::size_t size);
     void set_f1_rate_hz(std::uint32_t value) noexcept;
     void set_rls_coefficients_si(bool value) noexcept;
+    void set_host_rls_enabled(bool enabled, bool reset = true);
+    bool host_rls_enabled() const noexcept;
     std::vector<F1Sample> drain_f1(std::size_t max_samples = 8192);
     std::vector<F2Sample> drain_f2(std::size_t max_samples = 512);
     std::vector<F3Sample> drain_f3(std::size_t max_samples = 512);
@@ -122,6 +127,7 @@ private:
     const std::size_t max_diagnostics_;
     std::atomic<std::uint32_t> f1_rate_hz_{1000};
     std::atomic<bool> rls_coefficients_si_{false};
+    OnlineRlsEstimator host_rls_;
     mutable std::mutex mutex_;
     std::deque<F1Sample> f1_queue_;
     std::deque<F2Sample> f2_queue_;

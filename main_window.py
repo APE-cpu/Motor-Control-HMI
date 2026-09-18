@@ -26,6 +26,9 @@ from pages.manual_page import ManualPage
 from pages.operation_log_page import OperationLogPage
 from pages.experiment_page import ExperimentPage
 from pages.current_sampling_page import CurrentSamplingPage
+from pages.digital_twin_page import DigitalTwinPage
+from pages.fourier_page import FourierAnalysisPage
+from pages.frequency_response_page import FrequencyResponsePage
 from widgets.side_nav import SideNav
 from communications.comm_manager import CommManager, decode_motor_fault_code
 from logs.operation_logger import logger
@@ -33,7 +36,7 @@ from core import RuntimeStateMachine
 from core import RuntimeState
 from config.config import CMD_RESET_FAULT, CMD_START, CMD_STOP
 
-APP_VERSION = "1.9.0"
+APP_VERSION = "1.9.1"
 
 _STOP_REASON_TEXT = {
     0: "未记录",
@@ -113,14 +116,20 @@ class MainWindow(QMainWindow):
         experiment_idx = sampling_idx + 1
         log_idx = experiment_idx + 1
         manual_idx = log_idx + 1
-        ai_section = [("🤖 AI 分析", 6), ("🧠 边缘AI", 7)]
+        digital_twin_idx = manual_idx + 1
+        fourier_idx = digital_twin_idx + 1
+        frequency_response_idx = fourier_idx + 1
+        ai_section = [("🛠 诊断助手", 6), ("🧠 边缘AI", 7)]
         if enable_training:
             ai_section.append(("🎓 模型训练", 8))
         nav_sections = [
             ("运行控制", [("📊 监控页面", 0), ("🎮 电机控制", 1),
+                          ("🧬 数字孪生", digital_twin_idx),
                           ("🧪 实验管理", experiment_idx)]),
             ("分析可视化", [("🌀 矢量可视化", 2), ("⚡ 功率流", 3),
-                            ("🔍 参数辨识", 4), ("🔬 电流采样诊断", sampling_idx)]),
+                            ("🔍 参数辨识", 4), ("🌊 离线傅里叶", fourier_idx),
+                            ("📐 波特图与传函", frequency_response_idx),
+                            ("🔬 电流采样诊断", sampling_idx)]),
             ("AI 智能", ai_section),
             ("系统", [("📡 通信设置", 5), ("📋 操作记录", log_idx),
                     ("📖 使用说明书", manual_idx)]),
@@ -130,13 +139,28 @@ class MainWindow(QMainWindow):
         self.stack = ResponsiveStack()
 
         self.control_page = ControlPage(self.comm_manager, self.runtime_state)
+        self.digital_twin_page = DigitalTwinPage(
+            self.comm_manager, self.runtime_state)
+        self.control_page.set_simulation_snapshot_provider(
+            self.digital_twin_page.mechanical_snapshot)
         self.monitor_page = MonitorPage(
             self.comm_manager, self.control_page, self.runtime_state)
+        self.fourier_page = FourierAnalysisPage(
+            self.monitor_page.fourier_snapshot,
+            self.monitor_page.fourier_source_items())
+        self.frequency_response_page = FrequencyResponsePage(
+            self.monitor_page.fourier_snapshot,
+            self.control_page.current_loop_analysis_snapshot)
         self.vector_page = VectorPage(self.comm_manager)
         self.power_flow_page = PowerFlowPage(self.comm_manager)
         self.identify_page = IdentifyPage(self.comm_manager)
         self.communication_page = CommunicationPage(self.comm_manager)
-        self.ai_page = AIPage(self.comm_manager, monitor_page=self.monitor_page)
+        self.ai_page = AIPage(
+            self.comm_manager,
+            monitor_page=self.monitor_page,
+            firmware_config_provider=(
+                self.control_page.current_loop_analysis_snapshot),
+        )
         self.edge_ai_page = EdgeAIPage(self.comm_manager)
         self.operation_log_page = OperationLogPage()
         self.manual_page = ManualPage()
@@ -164,6 +188,11 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.experiment_page)
         self.stack.addWidget(self.operation_log_page)
         self.stack.addWidget(self.manual_page)
+        self.stack.addWidget(self.digital_twin_page)
+        # 放在物理页面序列末尾，不改动已有页面索引；
+        # 导航仍将它归在“分析可视化”分组。
+        self.stack.addWidget(self.fourier_page)
+        self.stack.addWidget(self.frequency_response_page)
 
         layout.addWidget(self.nav)
         layout.addWidget(self.stack, 1)
@@ -291,12 +320,6 @@ class MainWindow(QMainWindow):
 
             fade_in.finished.connect(_finish_fade)
             fade_in.start()
-
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt signature
-        self._clear_page_transition()
-        self.nav.stop_animations()
-        self.monitor_page.stop_visual_animations()
-        super().closeEvent(event)
 
     def _on_runtime_telemetry(self, frame) -> None:
         """同步下位机主动受控停机 / 保护锁存，避免界面残留在 RUNNING。"""
@@ -444,6 +467,17 @@ class MainWindow(QMainWindow):
             logger.log("运行状态应答处理失败", str(exc))
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        # 子页面不会因主窗口关闭而可靠收到 closeEvent。必须先同步停止
+        # Simulink C++ 后台线程，否则 QApplication 退出后仍存活的 QThread
+        # 会导致 Windows AppHang/QThread destroyed while running。
+        if not self.digital_twin_page.shutdown():
+            self.statusBar().showMessage(
+                "C++ 模型线程尚未停止，已取消退出；请稍后重试。", 10000)
+            event.ignore()
+            return
+        self._clear_page_transition()
+        self.nav.stop_animations()
+        self.monitor_page.stop_visual_animations()
         self.experiment_page.shutdown()
         try:
             self.comm_manager.disconnect()

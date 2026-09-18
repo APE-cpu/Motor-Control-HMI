@@ -9,6 +9,7 @@ from experiments import SessionStatus
 from core import RuntimeStateMachine
 from main_window import MainWindow
 from pages.control_page import ControlPage
+from pages.digital_twin_page import DigitalTwinPage
 from pages.experiment_page import ExperimentPage
 
 
@@ -159,11 +160,14 @@ def test_主窗口包含实验管理页面且导航索引正确(tmp_path, monkey
     )
     window = MainWindow(enable_training=False)
 
-    assert window.stack.count() == 12
+    assert window.stack.count() == 15
     assert window.stack.indexOf(window.current_sampling_page) == 8
     assert window.stack.indexOf(window.experiment_page) == 9
     assert window.stack.indexOf(window.operation_log_page) == 10
     assert window.stack.indexOf(window.manual_page) == 11
+    assert window.stack.indexOf(window.digital_twin_page) == 12
+    assert window.stack.indexOf(window.fourier_page) == 13
+    assert window.stack.indexOf(window.frequency_response_page) == 14
     window.nav.select_page(9)
     assert window.stack.currentWidget() is window.experiment_page
     window.close()
@@ -205,12 +209,14 @@ def test_控制页快照自动冻结到实验档案(tmp_path, monkeypatch):
     })
     comm = CommManager()
     control = ControlPage(comm)
+    twin = DigitalTwinPage(comm)
+    control.set_simulation_snapshot_provider(twin.mechanical_snapshot)
     control._motor_model.setText("PMSM-78W-A")
     control._pole_pairs.setValue(5)
     control._max_rpm.setValue(3200)
     control._target_speed.setValue(1800)
-    control._load_type.setCurrentIndex(1)
-    control._load_value.setValue(0.25)
+    twin._load_type.setCurrentIndex(1)
+    twin._load_value.setValue(0.25)
 
     page = ExperimentPage(
         comm,
@@ -237,6 +243,12 @@ def test_控制页快照自动冻结到实验档案(tmp_path, monkeypatch):
     assert loaded.protection_params["max_rpm"] == 3200
     assert "iq_max" in loaded.protection_params
     page.shutdown()
+    page.deleteLater()
+    twin.close()
+    twin.deleteLater()
+    control.close()
+    control.deleteLater()
+    QApplication.processEvents()
 
 
 def test_不同控制方式导出各自参数(tmp_path):

@@ -4,16 +4,18 @@
 箭头反向并变色；各级损耗（电源内阻、制动电阻、铜损、摩擦）以向下
 支路标注。下半部分为功率趋势曲线。
 
-数据来自遥测帧的 powers 快照（仿真由 MotorSim 逐步计算；真机协议
-暂无功率字段，接真机后此页显示等待数据）。
+数据来自遥测帧的 powers 快照（仿真），或根据真机F0/F1的
+Iq、Vq、Vbus、转速和转矩做主机侧估算。
 逆变器开关损耗暂忽略，直流侧输入 ≈ 电机电功率。
 """
 import math
+import time
 
 from PySide6.QtCore import Qt, QTimer, QPointF
 from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
 from PySide6.QtWidgets import (
-    QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel, QVBoxLayout, QWidget,
+    QCheckBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QVBoxLayout, QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
@@ -158,7 +160,13 @@ class _FlowDiagram(QWidget):
         self._t = 0.0
         self._anim = QTimer(self)
         self._anim.timeout.connect(self._tick)
-        self._anim.start(40)
+        self._anim.setInterval(40)
+
+    def set_active(self, active: bool) -> None:
+        if active:
+            self._anim.start()
+        else:
+            self._anim.stop()
 
     def _tick(self) -> None:
         self._t += 0.04
@@ -179,7 +187,7 @@ class _FlowDiagram(QWidget):
         if not self._powers:
             qp.setPen(QPen(QColor("#90a4ae")))
             qp.drawText(self.rect(), Qt.AlignCenter,
-                        "暂无功率数据（启动仿真后显示；真机协议暂不支持）")
+                        "暂无功率数据（等待仿真或真机F0/F1遥测）")
             return
 
         p = self._powers
@@ -302,7 +310,15 @@ class PowerFlowPage(QWidget):
     def __init__(self, comm: CommManager) -> None:
         super().__init__()
         self._comm = comm
+        self._analysis_enabled = False
         self._latest = TelemetryFrame()
+        self._last_telemetry_at = 0.0
+        self._last_f1_at = 0.0
+        self._real_inv_w: float | None = None
+        self._real_iq_rms_a: float | None = None
+        self._previous_omega = 0.0
+        self._previous_speed_at = 0.0
+        self._kinetic_power_w = 0.0
 
         root = QVBoxLayout(self)
         title_row = QHBoxLayout()
@@ -310,9 +326,17 @@ class PowerFlowPage(QWidget):
         title.setObjectName("TitleLabel")
         title_row.addWidget(title)
         title_row.addStretch(1)
+        self._chk_enabled = QCheckBox("启用功率流")
+        self._chk_enabled.setChecked(False)
+        self._chk_enabled.setToolTip(
+            "默认关闭以避免在后台持续计算和绘制功率流。")
+        title_row.addWidget(self._chk_enabled)
         self._eff_label = QLabel("效率 η = --")
         self._eff_label.setStyleSheet("color: #69f0ae; font-weight: bold;")
         title_row.addWidget(self._eff_label)
+        self._source_label = QLabel("数据源：等待")
+        self._source_label.setStyleSheet("color:#90a4ae;")
+        title_row.addWidget(self._source_label)
         root.addLayout(title_row)
 
         hint = QLabel(
@@ -338,20 +362,142 @@ class PowerFlowPage(QWidget):
             {"电源输入": "#ffb74d", "电磁功率": "#4fc3f7",
              "制动泄放": "#ef5350", "总损耗": "#81c784"},
             y_label="W")
+        self._curve.set_source_processing(
+            "仿真功率快照，或真机F0/F1主机侧估算")
         cv.addWidget(self._curve)
         root.addWidget(curve_box, 2)
 
         comm.telemetryReceived.connect(self._on_telemetry)
+        comm.highRateTelemetryReceived.connect(self._on_high_rate)
+        comm.highRateTelemetryBatchReceived.connect(self._on_high_rate_batch)
+        comm.highRateTelemetryColumnsReceived.connect(self._on_high_rate_columns)
         self._timer = QTimer(self)
         self._timer.timeout.connect(self._refresh)
-        self._timer.start(200)
+        self._timer.setInterval(200)
+        self._chk_enabled.toggled.connect(self._set_analysis_enabled)
+
+    def _set_analysis_enabled(self, enabled: bool) -> None:
+        """按需启用功率估算与动画；关闭时不再消费高速F1数据。"""
+        self._analysis_enabled = bool(enabled)
+        self._diagram.set_active(self._analysis_enabled)
+        if self._analysis_enabled:
+            self._timer.start()
+            return
+        self._timer.stop()
+        self._latest = TelemetryFrame()
+        self._last_telemetry_at = 0.0
+        self._last_f1_at = 0.0
+        self._real_inv_w = None
+        self._real_iq_rms_a = None
+        self._kinetic_power_w = 0.0
+        self._diagram.set_data({}, 0.0, "normal")
+        self._calculation.set_data({})
+        self._curve.clear()
+        self._source_label.setText("数据源：已关闭")
+        self._eff_label.setText("效率 η = --")
 
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
+        if not self._analysis_enabled:
+            return
         self._latest = frame
+        now = time.monotonic()
+        omega = float(frame.speed_actual) * math.pi / 30.0
+        if self._previous_speed_at > 0.0:
+            dt = now - self._previous_speed_at
+            if 0.02 <= dt <= 1.0:
+                inertia = float(self._comm.motor_sim_params().J)
+                raw = inertia * omega * (omega - self._previous_omega) / dt
+                self._kinetic_power_w = 0.75 * self._kinetic_power_w + 0.25 * raw
+        self._previous_omega = omega
+        self._previous_speed_at = now
+        self._last_telemetry_at = now
+
+    def _consume_f1(self, iq_values, vq_values, vbus_values) -> None:
+        if not self._analysis_enabled:
+            return
+        count = min(len(iq_values), len(vq_values), len(vbus_values))
+        if count <= 0:
+            return
+        # 功率页只需要每批的短时平均，取最新256点避免隐藏页
+        # 也在Python中扫描整个16 kHz队列。
+        start = max(0, count - 256)
+        pairs = []
+        iq_sq = 0.0
+        for iq, vq_raw, vbus in zip(
+                iq_values[start:count], vq_values[start:count],
+                vbus_values[start:count]):
+            iq = float(iq)
+            vq_v = float(vq_raw) / 32767.0 * float(vbus) / math.sqrt(3.0)
+            pairs.append(1.5 * vq_v * iq)  # id未上报，按id≈0估算
+            iq_sq += iq * iq
+        if not pairs:
+            return
+        self._real_inv_w = sum(pairs) / len(pairs)
+        self._real_iq_rms_a = math.sqrt(iq_sq / len(pairs))
+        self._last_f1_at = time.monotonic()
+
+    def _on_high_rate(self, sample: dict) -> None:
+        self._consume_f1(
+            [sample.get("iq_a", 0.0)], [sample.get("vq_raw", 0.0)],
+            [sample.get("vbus_v", self._latest.vdc)])
+
+    def _on_high_rate_batch(self, samples: list[dict]) -> None:
+        if not samples:
+            return
+        self._consume_f1(
+            [sample.get("iq_a", 0.0) for sample in samples],
+            [sample.get("vq_raw", 0.0) for sample in samples],
+            [sample.get("vbus_v", self._latest.vdc) for sample in samples])
+
+    def _on_high_rate_columns(self, columns: dict) -> None:
+        self._consume_f1(
+            columns.get("iq_a", ()), columns.get("vq_raw", ()),
+            columns.get("vbus_v", ()))
+
+    def _estimate_real_powers(self) -> tuple[dict, str]:
+        f = self._latest
+        params = self._comm.motor_sim_params()
+        iq_rms = (self._real_iq_rms_a
+                  if self._real_iq_rms_a is not None
+                  else abs(float(f.current_actual)))
+        cu = 1.5 * float(params.Rs) * iq_rms * iq_rms
+        omega = float(f.speed_actual) * math.pi / 30.0
+        em = float(f.torque_actual) * omega
+        fresh_f1 = (self._real_inv_w is not None and
+                    time.monotonic() - self._last_f1_at < 1.0)
+        inv = float(self._real_inv_w) if fresh_f1 else em + cu
+        brake = max(-inv, 0.0) if f.bus_state == "brake" else 0.0
+        supply = inv + brake
+        kinetic = self._kinetic_power_w
+        load_and_friction = em - kinetic
+        powers = {
+            "supply": supply,
+            "loss_src": 0.0,       # 协议暂无母线输入电流
+            "inv": inv,
+            "brake": brake,
+            "cu": cu,
+            "em": em,
+            "fric": load_and_friction,
+            "kinetic": kinetic,
+        }
+        source = ("真机估算：F1 Vq·Iq + F0转速/转矩"
+                  if fresh_f1 else
+                  "真机降级估算：F0电磁功率+铜损（等待F1电压）")
+        return powers, source
 
     def _refresh(self) -> None:
+        if not self._analysis_enabled:
+            return
         f = self._latest
         p = f.powers or {}
+        source = "仿真模型功率"
+        if (not p and self._comm.is_connected() and
+                not self._comm.is_sim_running() and
+                time.monotonic() - self._last_telemetry_at < 1.0):
+            p, source = self._estimate_real_powers()
+        elif not p:
+            source = "等待数据"
+        self._source_label.setText("数据源：" + source)
         self._diagram.set_data(p, f.vdc, f.bus_state)
         self._calculation.set_data(p)
         if not p:

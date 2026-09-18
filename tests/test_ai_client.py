@@ -75,3 +75,32 @@ def test_非流式接口不受影响(monkeypatch):
     monkeypatch.setattr(mod.urllib.request, "urlopen",
                         lambda req, timeout: _R([]))
     assert AIClient("http://x/v1", "k", "m").chat([]) == "答"
+
+
+def test_完整响应保留工具调用并发送工具定义(monkeypatch):
+    captured = {}
+
+    class _R(_FakeResp):
+        def read(self):
+            return json.dumps({"choices": [{"message": {
+                "role": "assistant",
+                "content": None,
+                "tool_calls": [{
+                    "id": "c1", "type": "function",
+                    "function": {"name": "get_state", "arguments": "{}"},
+                }],
+            }}]}).encode("utf-8")
+
+    def fake_urlopen(req, timeout):
+        captured["payload"] = json.loads(req.data.decode("utf-8"))
+        return _R([])
+
+    monkeypatch.setattr(mod.urllib.request, "urlopen", fake_urlopen)
+    tools = [{"type": "function", "function": {
+        "name": "get_state", "description": "状态",
+        "parameters": {"type": "object"},
+    }}]
+    message = AIClient("http://x/v1", "k", "m").complete([], tools=tools)
+    assert message["tool_calls"][0]["function"]["name"] == "get_state"
+    assert captured["payload"]["tools"] == tools
+    assert captured["payload"]["tool_choice"] == "auto"
