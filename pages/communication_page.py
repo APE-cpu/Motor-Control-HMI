@@ -75,9 +75,11 @@ def _protocol_doc() -> str:
 
   上行（下位机 → 上位机）：
     0x{CMD_TELEMETRY:02X}  v1 遥测帧（payload 格式见第三节）
-    0xF0   v2 常规遥测帧（10 Hz，慢变量，载荷同 v1 串口格式）
-    0xF1   v2 高速遥测帧（200 Hz UART / 1 kHz TCP 批量，电角度/Iq/相电流/Vd/Vq/Vbus）
+    F0     v2 常规 JSON 遥测（通道号 0，10 Hz，状态/故障/慢变量）
+    0xF1   v2 连续高速遥测（兼容200 Hz~1 kHz / TCP标准1~16 kHz）
     0xF2   v2 电流采样诊断帧（50 Hz，ADC 原始值/PWM duty/扇区/标定窗口/VDDA）
+    0xF3   旧固件在线RLS系数（兼容保留；当前固件不上报）
+    0xF4   一次性16 kHz突发抓取（2048点Ia/Ib/电角度）
 
   下行（上位机 → 下位机）：
     0x{CMD_START:02X}  启动电机
@@ -148,22 +150,35 @@ def _protocol_doc() -> str:
         持续到达，则遥测作为会话存活证据，单独丢失心跳 ACK 不触发停机。
   经典 CAN 不支持 v2（v2 最小帧超过 8 字节，需先定义分片协议）。
 
-【八、v2 三通道遥测载荷】
+【八、v2 五类遥测载荷】
 
-  v2 把遥测拆成三个独立通道，各有独立频率与字段（完整字段语义与
+  v2 把遥测拆成独立逻辑通道，各有独立频率与字段（完整字段语义与
   PWM 比较值/采样点/扇区/VDDA 说明见《通信规约与数据字典.md》）：
 
-  0xF0 常规遥测：载荷 15 B（串口/TCP）或 8 B（CAN 兼容），10 Hz，
-                 字段与第三节 v1 串口/CAN 遥测一致。
-  0xF1 高速遥测：载荷 12/16/22 B 三档，200 Hz（UART）或 1 kHz（TCP 批量），
-                 含 tick_ms + angle_raw + speed_rpm + Iq + Iqref（+ Ia/Ib
-                 + Vd/Vq/Vbus）。
+  F0 常规遥测：v2通道号为0（界面简称F0），JSON变长载荷，固定10 Hz；
+                 含转速/给定、温度、母线、状态、故障、滤波和控制参数。
+                 实时数值卡、转矩曲线和实验 telemetry.csv 使用此数据；
+                 转速曲线仅在没有F1时降级使用F0。
+  0xF1 高速遥测：新格式 40 B/点（兼容旧 12/16/22/30/32 B），
+                  200 Hz（UART）或 1~16 kHz（TCP 批量），
+                 含连续序号 + Park/执行角 + Id/Iq + 实际Id/IqRef + Ia/Ib
+                 + Vd/Vq + PWM比较值 + 母线ADC均值 + VDDA。
+                 电流/电压/角度可随16 kHz电流环产生新样本；speed_rpm字段
+                 来源于500 Hz测速器，16 kHz传输时约连续32点保持相同值。
+                 上位机转速趋势和FFT按500 Hz更新节拍抽取该speed_rpm字段。
   0xF2 电流采样诊断：载荷 21/29/31 B 三档，50 Hz，
                  含 tick_ms + ADC1/ADC2 原始码 + A/B 相零点 + SVPWM 扇区
                  + 三相 PWM 比较值 + 采样点（+ 校准窗口 + VDDA）。
+  0xF3 旧RLS结果：旧固件上报两轴ARX系数；当前固件端RLS已经移除，
+                 上位机C++直接消费F1运行ESO/RLS，结果不再经过F3传输。
+  0xF4 突发抓取：手动触发后以16 kHz记录2048点Ia/Ib/电角度，随后分块
+                 回传；适合电流采样诊断，不是持续绘图通道。
 
-  Iq/相电流标度：A = raw × 0.000629（MCSDK 默认 s16→A，对应 ADC 满量程
-                 与运放增益组合，硬件变更须同步修改 comm_manager.py）。
+  注意：通道发送率不等于其中每个字段的物理更新率。尤其F1以16 kHz
+        发送时，电流是逐FOC周期的新样本，而速度只有500 Hz的信息带宽。
+
+  Iq/相电流标度：A = raw × 0.000629425（3.30/(65536×0.01Ω×8)）；
+                 硬件变更须同步修改 config/config.py 与原生解析器。
   PWM 比较值：duty_a/b/c 是 STM32 TIM1 CCR 寄存器原始码（0..ARR），
                  不是占空比百分比；ARR 典型 5249。
   采样点：sample_point 是 ADC 注入触发计数值，对应 PWM 周期内的时刻，
@@ -529,7 +544,7 @@ class CommunicationPage(QWidget):
         self._tele_level.addItem("省流·安全（最稳，只留相电流）", "eco")
         self._tele_level.addItem("标准·16kHz（以太网连续原始点）", "std")
         self._tele_level.addItem("兼容模式（固件16点平均；TCP 1k/UART 200Hz）", "compat")
-        self._tele_level.addItem("辨识（开在线RLS，相电流保持链路全速）", "id")
+        self._tele_level.addItem("辨识（自动启动上位机RLS，相电流保持全速）", "id")
         self._tele_level.addItem("自定义", "custom")
         self._tele_level.setCurrentIndex(1)   # 标准 = 16 kHz 原始流
         self._tele_level.currentIndexChanged.connect(self._on_tele_changed)
@@ -590,7 +605,8 @@ class CommunicationPage(QWidget):
         if key == "compat":
             return 0x01, 0, 20, 100
         if key == "id":
-            # F3 以 10 Hz 独立发送；有以太网时F1仍保持16 kHz。
+            # bit1 是 UI 的“辨识会话”请求；发往新固件前会清除，
+            # 并自动联动上位机 C++ RLS。
             return 0x03, 0, 20, 100
         flags = ((0x01 if self._tele_f2_on.isChecked() else 0) |
                  (0x02 if self._tele_f3_on.isChecked() else 0))
@@ -643,19 +659,20 @@ class CommunicationPage(QWidget):
 
         # F0: 常规遥测 (10Hz, 慢变量)
         f0 = QLabel(
-            "🔹 <b>F0 常规遥测</b> | 10 Hz | 14字节\n"
-            "   转速实际值/目标值 (rpm) · Iq实际值 (mA) · 电角度 (0.01°)\n"
-            "   传感器原始计数 · 温度 (°C) · 传感器质量/收敛度 · 故障标志位")
+            "🔹 <b>F0 常规遥测（v2通道号0）</b> | 固定10 Hz | JSON慢变量\n"
+            "   转速实际/目标 · Iq/转矩 · 温度/母线 · 运行状态/故障 · 控制与滤波状态\n"
+            "   <i>实时数值卡、转矩趋势和实验telemetry.csv使用F0；"
+            "转速趋势仅在F1不可用时按F0单帧降级记录</i>")
         f0.setWordWrap(True)
         v.addWidget(f0)
 
         # F1: 高速遥测 (200Hz~16kHz, 电流/电压)
         f1 = QLabel(
-            "🔹 <b>F1 高速遥测</b> | 标准16 kHz原始流 / 兼容200 Hz~1 kHz | 22字节/点\n"
-            "   电角度 (u16) · Iq (s16码值, ×0.000629→A) · 相电流 Ia/Ib (s16码值, ×0.000629→A)\n"
-            "   施加电压 Vd/Vq (s16码值, ×0.000324→V) · 母线电压 Vbus (u16, 0.1V分辨率)\n"
-            "   <i>标准模式由FOC中断逐周期写入环形缓冲、不做数字平均；"
-            "兼容模式保留固件16点箱式平均</i>")
+            "🔹 <b>F1 连续高速遥测</b> | 标准16 kHz原始流 / 兼容200 Hz~1 kHz | 新格式40字节/点\n"
+            "   Id/Iq/Idref/Iqref · Ia/Ib · Park角/执行角 · Vd/Vq · PWM比较值 · Vbus/VDDA · 连续序号\n"
+            "   <i>电流/电压/角度可逐16 kHz FOC周期更新；speed_rpm虽随每点携带，"
+            "但测速器只在500 Hz更新，16 kHz流中约每32点才出现一个新速度值。"
+            "转速趋势/FFT按500 Hz节拍抽取；原始数据.csv中的转速、高速电流、电压和角度来自F1</i>")
         f1.setWordWrap(True)
         v.addWidget(f1)
 
@@ -669,11 +686,11 @@ class CommunicationPage(QWidget):
         f2.setWordWrap(True)
         v.addWidget(f2)
 
-        # F3: RLS在线辨识 (2~10Hz, 阻抗)
+        # F3: 仅兼容旧固件；当前RLS在上位机消费F1计算。
         f3 = QLabel(
-            "🔹 <b>F3 RLS辨识</b> | 2~10 Hz | 72字节载荷 (档位可关)\n"
-            "   dq轴 ARX 系数、创新量、协方差、更新计数及反解的 Ld/Lq/Rd/Rq\n"
-            "   <i>固件16kHz RLS递推实时估计；用于参数自适应与热态监测</i>")
+            "🔹 <b>F3 旧固件RLS结果通道</b> | 当前固件不再上报，仅保留解析兼容\n"
+            "   旧格式传递dq轴ARX系数；现在由上位机C++逐点读取F1，运行ESO→三阶RLS\n"
+            "   <i>当前辨识结果是主机内部结果，不经过F3，也不会把RLS矩阵运算放回电流环</i>")
         f3.setWordWrap(True)
         v.addWidget(f3)
 
@@ -681,15 +698,16 @@ class CommunicationPage(QWidget):
         f4 = QLabel(
             "🔹 <b>F4 突发抓取</b> | 非周期 (手动触发) | 2048点×6字节 分18块\n"
             "   真实16kHz原始 Ia/Ib/电角度 录128ms再慢速回传 (~0.3s)\n"
-            "   <i>抓取期间暂停F1/F2/F3，每15ms发一个726字节大帧，不占心跳队列</i>")
+            "   <i>适合电流采样诊断，不是持续绘图通道；抓取期间分块发送，避免挤占心跳队列</i>")
         f4.setWordWrap(True)
         v.addWidget(f4)
 
         # 心跳与瓶颈说明
         note = QLabel(
-            "⚠️ <b>通信瓶颈</b>：制约的是 lwIP <b>队列条目数×帧率</b>，不是带宽。\n"
-            "   TCP_SND_QUEUELEN=32 + pbuf内存池 + 心跳抢占 → 高帧率小包仍易爆。\n"
-            "   策略：F1批量(减少帧数) + F2/F3低频 + 突发慢速非实时 = 队列压力最小。")
+            "⚠️ <b>更新率≠传输率</b>：F1可以16 kHz传输，但速度源只在500 Hz更新；"
+            "不应把重复速度点当作16 kHz测速。\n"
+            "   通信瓶颈主要是lwIP队列条目数×帧率。策略：F1批量减少帧数，"
+            "F0保持慢状态通道，F2按需开启，F4突发后慢速回传。")
         note.setWordWrap(True)
         note.setStyleSheet("color:#ffab91; font-size:11px; font-style:italic;")
         v.addWidget(note)
@@ -701,6 +719,11 @@ class CommunicationPage(QWidget):
         if not self._comm.is_connected():
             return
         flags, f1, f2, f3 = self._resolve_telemetry()
+        identify = bool(flags & 0x02)
+        # bit1 在 UI 中代表辨识意图；新路径的 RLS 运行在上位机，
+        # 因此不再让旧固件 F3 开关落到电流环 ISR。
+        flags &= ~0x02
+        self._comm.set_host_rls_enabled(identify, reset=False)
         self._comm.send_telemetry_config(
             flags, f1, f2, f3,
             f1_rate_hz=self._resolve_f1_stream_rate_hz(),

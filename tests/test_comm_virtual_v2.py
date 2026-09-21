@@ -18,7 +18,9 @@ from communications.v2_virtual_device import V2VirtualDevice
 from communications.protocol_v2 import (
     MessageType, V2Frame, decode_v2_frame, encode_v2_frame, make_ack, make_nack,
 )
-from config.config import CMD_SET_SENSOR, CMD_START, CMD_STOP
+from config.config import (
+    CMD_SET_SENSOR, CMD_START, CMD_STOP, F1_CURRENT_A_PER_DIGIT,
+)
 from pages.communication_page import CommunicationPage
 from main_window import MainWindow
 from core import RuntimeState
@@ -178,10 +180,31 @@ def test_200Hz高速通道解码Iq和两相电流():
     samples = comm._process_v2_responses([raw])
 
     assert len(samples) == 1
-    assert samples[0]["iq_a"] == 200 * 0.000629
-    assert samples[0]["iqref_a"] == 80 * 0.000629
-    assert samples[0]["ia_a"] == 300 * 0.000629
-    assert samples[0]["ib_a"] == -150 * 0.000629
+    assert samples[0]["iq_a"] == 200 * F1_CURRENT_A_PER_DIGIT
+    assert samples[0]["iqref_a"] == 80 * F1_CURRENT_A_PER_DIGIT
+    assert samples[0]["ia_a"] == 300 * F1_CURRENT_A_PER_DIGIT
+    assert samples[0]["ib_a"] == -150 * F1_CURRENT_A_PER_DIGIT
+
+
+def test_Python后备解析F1_32使用VDDA标度():
+    comm = CommManager()
+    comm._native_telemetry_processor = None
+    vdda_mv = 3150
+    bus_adc = round(24.0 * 0.0270 / 3.15 * 65536.0)
+    payload = struct.pack(
+        "<IHHhhhhhhhhhHHH", 43, 74, 32768, 500, 2000, -321, 1990, 25,
+        1200, -600, -1000, 6000, bus_adc, vdda_mv, 0xF132)
+    raw = encode_v2_frame(V2Frame(
+        MessageType.TELEMETRY, command=0xF1, payload=payload))
+
+    samples = comm._process_v2_responses([raw])
+
+    expected_scale = 3.15 / (65536.0 * 0.01000 * 8.00)
+    assert len(samples) == 1
+    assert samples[0]["vdda_source_direct"] is True
+    assert samples[0]["vdda_v"] == pytest.approx(3.15)
+    assert samples[0]["iq_a"] == pytest.approx(2000 * expected_scale)
+    assert samples[0]["vbus_v"] == pytest.approx(24.0, abs=0.003)
 
 
 def test_1kHz以太网批量高速通道逐样本解码():
@@ -198,7 +221,7 @@ def test_1kHz以太网批量高速通道逐样本解码():
     samples = batches[0]
     assert [sample["tick_ms"] for sample in samples] == [100, 101]
     assert all(sample["rate_hz"] == 1000 for sample in samples)
-    assert samples[1]["ib_a"] == -151 * 0.000629
+    assert samples[1]["ib_a"] == -151 * F1_CURRENT_A_PER_DIGIT
 
 
 def test_F4乱序分片由通讯管理器重组并发出完整抓取():

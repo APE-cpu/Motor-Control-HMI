@@ -1,11 +1,62 @@
 import math
+import csv
+from pathlib import Path
 import struct
 
 import pytest
 
+from config.config import F1_CURRENT_A_PER_DIGIT
 from communications.native_telemetry import (
     NativeTelemetryProcessor, native_telemetry_available,
 )
+
+
+def test_CppESO_RLS逐样本复现R2024b_ESOrls黄金轨迹():
+    import motor_core_cpp
+
+    assert motor_core_cpp.telemetry_schema_version >= 3
+
+    fixture = Path(__file__).with_name("simulink_rls_golden.csv")
+    with fixture.open("r", encoding="utf-8", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+
+    results = list(motor_core_cpp.run_simulink_rls(
+        [float(row["id_a"]) for row in rows],
+        [float(row["iq_a"]) for row in rows],
+        [float(row["ud_v"]) for row in rows],
+        [float(row["uq_v"]) for row in rows],
+        100000,
+        1,
+    ))
+
+    assert len(results) == len(rows)
+    # Simulink RLS uses a square-root numerical realization while the native
+    # implementation keeps the equivalent covariance recursion.  The ESO
+    # samples are expected to match at floating-point roundoff; the ARX
+    # coefficients are equivalent within the measured realization delta.
+    absolute_tolerance = [2e-6, 2e-6, 2e-6, 3e-5, 3e-5, 1e-10, 1e-10]
+    for row, result in zip(rows, results):
+        assert result["id_hat_a"] == pytest.approx(
+            float(row["id_hat_a"]), abs=2e-12)
+        assert result["iq_hat_a"] == pytest.approx(
+            float(row["iq_hat_a"]), abs=2e-12)
+        expected_d = [float(row[f"theta_d_{index}"]) for index in range(1, 8)]
+        expected_q = [float(row[f"theta_q_{index}"]) for index in range(1, 8)]
+        for actual, expected, tolerance in zip(
+                result["theta_d"], expected_d, absolute_tolerance):
+            assert actual == pytest.approx(expected, abs=tolerance)
+        for actual, expected, tolerance in zip(
+                result["theta_q"], expected_q, absolute_tolerance):
+            assert actual == pytest.approx(expected, abs=tolerance)
+
+    # The tiny transient difference comes from the proprietary block's matrix
+    # multiplication order.  Once the covariance settles, the full vectors
+    # coincide to normal double-precision engineering tolerance.
+    for axis in ("d", "q"):
+        expected = [float(rows[-1][f"theta_{axis}_{index}"])
+                    for index in range(1, 8)]
+        assert results[-1][f"theta_{axis}"] == pytest.approx(
+            expected, rel=6e-8, abs=3e-8)
 
 
 pytestmark = pytest.mark.skipif(
@@ -30,11 +81,84 @@ def test_F1原生解析兼容12_16_22字节格式():
     assert all(sample["rate_hz"] == 16000 for sample in samples)
     assert samples[0]["angle_deg"] == pytest.approx(180.0)
     assert "ia_a" not in samples[0]
-    assert samples[1]["ia_a"] == pytest.approx(-300 * 0.000629)
+    assert samples[1]["ia_a"] == pytest.approx(
+        -300 * F1_CURRENT_A_PER_DIGIT)
     assert "vd_raw" not in samples[1]
     assert samples[2]["vd_raw"] == -1200
     assert samples[2]["vq_raw"] == 1300
     assert samples[2]["vbus_v"] == 48.0
+
+
+def test_F1_30字节标记格式直接携带Park_Id和连续序号且不会误拆():
+    processor = NativeTelemetryProcessor()
+    processor.set_f1_rate_hz(16000)
+    sample = struct.pack(
+        "<IHHhhhhhhhhhHH", 42, 73, 32768, 500, 2000, -321, 1990, 25,
+        1200, -600, -1000, 6000,
+        round(24.0 * 0.0270 / 3.30 * 65536.0), 0xF130)
+    payload = sample * 11  # Tagged format is explicit for every sample.
+
+    assert processor.ingest(0xF1, payload)
+    columns = processor.drain_f1_columns()
+
+    assert columns["count"] == 11
+    assert columns["id_source_direct"] is True
+    assert columns["sequence_source_direct"] is True
+    assert columns["sample_seq"] == [73] * 11
+    assert columns["id_a"] == pytest.approx(
+        [-321 * F1_CURRENT_A_PER_DIGIT] * 11)
+    assert columns["iq_a"] == pytest.approx(
+        [2000 * F1_CURRENT_A_PER_DIGIT] * 11)
+    assert columns["iqref_a"] == pytest.approx(
+        [1990 * F1_CURRENT_A_PER_DIGIT] * 11)
+    assert columns["idref_a"] == pytest.approx(
+        [25 * F1_CURRENT_A_PER_DIGIT] * 11)
+    assert columns["vd_raw"] == [-1000.0] * 11
+    assert columns["vq_raw"] == [6000.0] * 11
+    assert columns["vbus_v"] == pytest.approx([24.0] * 11, abs=0.003)
+
+
+def test_F1_32字节格式用实测VDDA换算电流与母线电压():
+    processor = NativeTelemetryProcessor()
+    processor.set_f1_rate_hz(16000)
+    vdda_mv = 3150
+    bus_adc = round(24.0 * 0.0270 / 3.15 * 65536.0)
+    sample = struct.pack(
+        "<IHHhhhhhhhhhHHH", 43, 74, 32768, 500, 2000, -321, 1990, 25,
+        1200, -600, -1000, 6000, bus_adc, vdda_mv, 0xF132)
+
+    assert processor.ingest(0xF1, sample * 16)
+    columns = processor.drain_f1_columns()
+
+    expected_scale = 3.15 / (65536.0 * 0.01000 * 8.00)
+    assert columns["count"] == 16
+    assert columns["vdda_source_direct"] is True
+    assert columns["vdda_v"] == pytest.approx([3.15] * 16)
+    assert columns["iq_a"] == pytest.approx([2000 * expected_scale] * 16)
+    assert columns["vbus_v"] == pytest.approx([24.0] * 16, abs=0.003)
+
+
+def test_F1_40字节格式从最终PWM比较值重构施加dq电压():
+    processor = NativeTelemetryProcessor()
+    processor.set_f1_rate_hz(16000)
+    vdda_mv = 3150
+    bus_adc = round(24.0 * 0.0270 / 3.15 * 65536.0)
+    sample = struct.pack(
+        "<IHHHhhhhhhhhhHHHHHH",
+        44, 75, 0, 0, 500, 2000, -321, 1990, 25,
+        1200, -600, -1000, 6000,
+        3150, 2363, 2363, bus_adc, vdda_mv, 0xF140)
+
+    assert len(sample) == 40
+    assert processor.ingest(0xF1, sample * 16)
+    columns = processor.drain_f1_columns()
+
+    assert columns["count"] == 16
+    assert columns["applied_voltage_source_direct"] is True
+    assert columns["actuation_angle_deg"] == pytest.approx([0.0] * 16)
+    assert columns["duty_a"] == [3150] * 16
+    assert columns["vd_applied_v"] == pytest.approx([0.0] * 16, abs=0.005)
+    assert columns["vq_applied_v"] == pytest.approx([2.398] * 16, abs=0.01)
 
 
 def test_F1批量解析与环形队列丢旧留新():
@@ -69,8 +193,10 @@ def test_F1列式导出不创建逐样本字典():
     assert columns["count"] == 4
     assert columns["rate_hz"] == 1000
     assert columns["tick_ms"] == [0, 1, 2, 3]
-    assert columns["iq_a"][3] == pytest.approx(3 * 0.000629)
-    assert columns["ib_a"][3] == pytest.approx(-3 * 0.000629)
+    assert columns["iq_a"][3] == pytest.approx(
+        3 * F1_CURRENT_A_PER_DIGIT)
+    assert columns["ib_a"][3] == pytest.approx(
+        -3 * F1_CURRENT_A_PER_DIGIT)
     assert columns["vbus_v"] == [48.0] * 4
 
 
@@ -83,7 +209,7 @@ def test_上位机Cpp_RLS从F1辨识且不依赖固件F3():
     inductance = 0.00066
     a = math.exp(-resistance / inductance / fs)
     b = (1.0 - a) / resistance
-    current_lsb = 0.000629
+    current_lsb = F1_CURRENT_A_PER_DIGIT
     voltage_lsb = 48.0 / (math.sqrt(3.0) * 32768.0)
     id_a = iq_a = previous_vd = previous_vq = 0.0
 
@@ -123,6 +249,56 @@ def test_上位机Cpp_RLS从F1辨识且不依赖固件F3():
     assert latest["lq_mh"] == pytest.approx(0.66, abs=0.08)
     assert latest["rd_ohm"] == pytest.approx(0.59, abs=0.08)
     assert latest["rq_ohm"] == pytest.approx(0.59, abs=0.08)
+    assert latest["rl_equivalent_method"] == "arx3_low_frequency_moment"
+    assert latest["rl_physical_validated"] is False
+
+
+def test_RLS_q轴使用PI实际反馈而非原始相电流重算():
+    """Firmware filtering makes F1 Iq differ from raw Ia/Ib by design."""
+    processor = NativeTelemetryProcessor(max_f1_samples=32)
+    processor.set_f1_rate_hz(16000)
+    processor.set_host_rls_enabled(True)
+    fs = 16000.0
+    resistance = 0.59
+    inductance = 0.00066
+    a = math.exp(-resistance / inductance / fs)
+    b = (1.0 - a) / resistance
+    current_lsb = F1_CURRENT_A_PER_DIGIT
+    voltage_lsb = 24.0 / (math.sqrt(3.0) * 32768.0)
+    iq_a = previous_vq = 0.0
+
+    # Deliberately keep raw Ia/Ib at zero: this represents the strongest
+    # possible mismatch between raw phase-current telemetry and the filtered
+    # Iq feedback actually consumed by the PI.  The identifier must follow the
+    # explicit F1 Iq field, otherwise b0+b1 collapses and Lq/Rq become NaN.
+    for base in range(0, 16000, 16):
+        frame = []
+        for index in range(base, base + 16):
+            time_s = index / fs
+            vq_v = (2.0 +
+                    1.5 * math.sin(2.0 * math.pi * 137.0 * time_s) +
+                    0.7 * math.sin(2.0 * math.pi * 619.0 * time_s))
+            iq_a = a * iq_a + b * previous_vq
+            previous_vq = vq_v
+            angle = 2.0 * math.pi * 33.0 * time_s
+            angle_u16 = int((angle % (2.0 * math.pi)) *
+                            65536.0 / (2.0 * math.pi)) & 0xFFFF
+            frame.append(struct.pack(
+                "<IHhhhhhhhH", index // 16, angle_u16, 500,
+                round(iq_a / current_lsb), round(iq_a / current_lsb),
+                0, 0, 0, round(vq_v / voltage_lsb), 24))
+        assert processor.ingest(0xF1, b"".join(frame))
+
+    latest = processor.drain_f3(20)[-1]
+    assert math.isfinite(latest["lq_mh"])
+    assert math.isfinite(latest["rq_ohm"])
+    assert latest["lq_mh"] == pytest.approx(0.66, abs=0.08)
+    assert latest["rq_ohm"] == pytest.approx(0.59, abs=0.08)
+    # Faithful Simulink reproduction does not inject a nominal motor model or
+    # project an unexcited axis onto physical bounds.  Its equivalent R/L is
+    # therefore explicitly unavailable instead of being a plausible fake.
+    assert math.isnan(latest["ld_mh"])
+    assert math.isnan(latest["rd_ohm"])
 
 
 def test_F1非法长度计入解析错误且不产生样本():

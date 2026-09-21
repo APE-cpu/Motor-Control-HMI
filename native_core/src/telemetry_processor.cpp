@@ -50,7 +50,8 @@ constexpr std::uint8_t kF1Command = 0xF1;
 constexpr std::uint8_t kF2Command = 0xF2;
 constexpr std::uint8_t kF3Command = 0xF3;
 constexpr std::uint8_t kF4Command = 0xF4;
-constexpr double kCurrentScale = 0.000629;
+constexpr double kNominalCurrentScale =
+    3.30 / (65536.0 * 0.01000 * 8.00);
 constexpr double kAngleScale = 360.0 / 65536.0;
 
 std::uint16_t read_u16_le(const std::uint8_t* data) noexcept {
@@ -122,7 +123,54 @@ bool TelemetryProcessor::host_rls_enabled() const noexcept {
 bool TelemetryProcessor::ingest_f1(const std::uint8_t* payload,
                                    std::size_t size) {
     std::size_t sample_size = 0;
-    if (size == 12U) {
+    constexpr std::uint16_t kF1Format30Tag = 0xF130U;
+    constexpr std::uint16_t kF1Format32Tag = 0xF132U;
+    constexpr std::uint16_t kF1Format40Tag = 0xF140U;
+    constexpr double kBusAdcReferenceV = 3.30;
+    // Generated F407 power-stage configuration:
+    // VBUS_PARTITIONING_FACTOR = Vadc/Vbus = 0.0270 (no midpoint bias).
+    constexpr double kBusPartitioningFactor = 0.0270;
+    // TIM1 runs at 168 MHz and center-aligned PWM is 16 kHz.  MCSDK stores
+    // compare values against Half_PWMPeriod = PWMperiod/2 = 5250 counts.
+    constexpr double kPwmHalfPeriodCounts = 5250.0;
+    bool tagged_40 = size >= 40U && size % 40U == 0U;
+    if (tagged_40) {
+        for (std::size_t offset = 0; offset < size; offset += 40U) {
+            if (read_u16_le(payload + offset + 38U) != kF1Format40Tag) {
+                tagged_40 = false;
+                break;
+            }
+        }
+    }
+    bool tagged_32 = size >= 32U && size % 32U == 0U;
+    if (tagged_40) {
+        sample_size = 40U;
+        tagged_32 = false;
+    } else if (tagged_32) {
+        for (std::size_t offset = 0; offset < size; offset += 32U) {
+            if (read_u16_le(payload + offset + 30U) != kF1Format32Tag) {
+                tagged_32 = false;
+                break;
+            }
+        }
+    }
+    bool tagged_30 = size >= 30U && size % 30U == 0U;
+    if (tagged_30) {
+        for (std::size_t offset = 0; offset < size; offset += 30U) {
+            if (read_u16_le(payload + offset + 28U) != kF1Format30Tag) {
+                tagged_30 = false;
+                break;
+            }
+        }
+    }
+    if (tagged_40) {
+        // The F1/40 payload may also be divisible by 32 or 30 (for example,
+        // 16 samples are 640 bytes).  Keep the already verified format.
+    } else if (tagged_32) {
+        sample_size = 32U;
+    } else if (tagged_30) {
+        sample_size = 30U;
+    } else if (size == 12U) {
         sample_size = 12U;
     } else if (size >= 22U && size % 22U == 0U) {
         sample_size = 22U;
@@ -143,27 +191,95 @@ bool TelemetryProcessor::ingest_f1(const std::uint8_t* payload,
         F1Sample result;
         result.tick_ms = read_u32_le(sample);
         result.rate_hz = rate_hz;
-        result.angle_deg = read_u16_le(sample + 4U) * kAngleScale;
-        result.speed_rpm = static_cast<double>(read_i16_le(sample + 6U));
-        result.iq_a = read_i16_le(sample + 8U) * kCurrentScale;
-        result.iqref_a = read_i16_le(sample + 10U) * kCurrentScale;
-        if (sample_size >= 16U) {
+        if (sample_size == 40U || sample_size == 32U || sample_size == 30U) {
+            double current_scale = kNominalCurrentScale;
+            double bus_reference_v = kBusAdcReferenceV;
+            if (sample_size == 40U || sample_size == 32U) {
+                const auto vdda_offset = sample_size == 40U ? 36U : 28U;
+                const auto vdda_mv = read_u16_le(sample + vdda_offset);
+                if (vdda_mv >= 2800U && vdda_mv <= 3600U) {
+                    result.has_vdda = true;
+                    result.vdda_v = static_cast<double>(vdda_mv) / 1000.0;
+                    bus_reference_v = result.vdda_v;
+                    current_scale = bus_reference_v /
+                        (65536.0 * 0.01000 * 8.00);
+                }
+            }
+            result.has_sample_sequence = true;
+            result.sample_sequence = read_u16_le(sample + 4U);
+            result.angle_deg = read_u16_le(sample + 6U) * kAngleScale;
+            const auto base_offset = sample_size == 40U ? 2U : 0U;
+            if (sample_size == 40U) {
+                result.actuation_angle_deg =
+                    read_u16_le(sample + 8U) * kAngleScale;
+            } else {
+                result.actuation_angle_deg = result.angle_deg;
+            }
+            result.speed_rpm = static_cast<double>(
+                read_i16_le(sample + 8U + base_offset));
+            result.iq_a = read_i16_le(sample + 10U + base_offset) * current_scale;
+            result.has_direct_dq_current = true;
+            result.id_a = read_i16_le(sample + 12U + base_offset) * current_scale;
+            result.iqref_a = read_i16_le(sample + 14U + base_offset) * current_scale;
+            result.idref_a = read_i16_le(sample + 16U + base_offset) * current_scale;
             result.has_phase_current = true;
-            result.ia_a = read_i16_le(sample + 12U) * kCurrentScale;
-            result.ib_a = read_i16_le(sample + 14U) * kCurrentScale;
-        }
-        if (sample_size >= 22U) {
+            result.ia_a = read_i16_le(sample + 18U + base_offset) * current_scale;
+            result.ib_a = read_i16_le(sample + 20U + base_offset) * current_scale;
             result.has_voltage = true;
-            result.vd_raw = static_cast<double>(read_i16_le(sample + 16U));
-            result.vq_raw = static_cast<double>(read_i16_le(sample + 18U));
-            result.vbus_v = static_cast<double>(read_u16_le(sample + 20U));
+            result.vd_raw = static_cast<double>(
+                read_i16_le(sample + 22U + base_offset));
+            result.vq_raw = static_cast<double>(
+                read_i16_le(sample + 24U + base_offset));
+            const auto bus_offset = sample_size == 40U ? 34U : 26U;
+            const double bus_adc = static_cast<double>(
+                read_u16_le(sample + bus_offset));
+            result.vbus_v = bus_adc / 65536.0 * bus_reference_v /
+                            kBusPartitioningFactor;
+            if (sample_size == 40U) {
+                result.duty_a = read_u16_le(sample + 28U);
+                result.duty_b = read_u16_le(sample + 30U);
+                result.duty_c = read_u16_le(sample + 32U);
+                const double da = result.duty_a / kPwmHalfPeriodCounts;
+                const double db = result.duty_b / kPwmHalfPeriodCounts;
+                const double dc = result.duty_c / kPwmHalfPeriodCounts;
+                const double alpha = result.vbus_v *
+                    (2.0 * da - db - dc) / 3.0;
+                const double beta = result.vbus_v * (dc - db) /
+                    std::sqrt(3.0);
+                const double angle = result.actuation_angle_deg *
+                    3.14159265358979323846 / 180.0;
+                result.vq_applied_v = alpha * std::cos(angle) -
+                    beta * std::sin(angle);
+                result.vd_applied_v = alpha * std::sin(angle) +
+                    beta * std::cos(angle);
+                result.has_applied_voltage = true;
+            }
+        } else {
+            result.angle_deg = read_u16_le(sample + 4U) * kAngleScale;
+            result.speed_rpm = static_cast<double>(read_i16_le(sample + 6U));
+            result.iq_a = read_i16_le(sample + 8U) * kNominalCurrentScale;
+            result.iqref_a = read_i16_le(sample + 10U) * kNominalCurrentScale;
+            if (sample_size >= 16U) {
+                result.has_phase_current = true;
+                result.ia_a = read_i16_le(sample + 12U) * kNominalCurrentScale;
+                result.ib_a = read_i16_le(sample + 14U) * kNominalCurrentScale;
+            }
+            if (sample_size >= 22U) {
+                result.has_voltage = true;
+                result.vd_raw = static_cast<double>(read_i16_le(sample + 16U));
+                result.vq_raw = static_cast<double>(read_i16_le(sample + 18U));
+                result.vbus_v = static_cast<double>(read_u16_le(sample + 20U));
+            }
         }
         if (result.has_phase_current && result.has_voltage) {
             RlsResult estimate;
             const RlsInput input{
                 result.tick_ms, result.rate_hz, result.angle_deg,
-                result.iq_a, result.ia_a, result.ib_a,
-                result.vd_raw, result.vq_raw, result.vbus_v};
+                result.iq_a, result.id_a, result.has_direct_dq_current,
+                result.ia_a, result.ib_a,
+                result.vd_raw, result.vq_raw, result.vbus_v,
+                result.vd_applied_v, result.vq_applied_v,
+                result.has_applied_voltage};
             if (host_rls_.ingest(input, estimate)) {
                 F3Sample local;
                 local.tick_ms = estimate.tick_ms;
@@ -174,6 +290,8 @@ bool TelemetryProcessor::ingest_f1(const std::uint8_t* payload,
                 local.innov_rms_digit =
                     std::numeric_limits<double>::quiet_NaN();
                 local.p_trace = estimate.p_trace;
+                local.id_hat_a = estimate.id_hat_a;
+                local.iq_hat_a = estimate.iq_hat_a;
                 for (std::size_t i = 0; i < local.theta_d.size(); ++i) {
                     local.theta_d[i] = static_cast<float>(estimate.theta_d[i]);
                     local.theta_q[i] = static_cast<float>(estimate.theta_q[i]);

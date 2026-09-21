@@ -265,6 +265,12 @@ class TrendCurve(QWidget):
         if changed:
             self._update_processing_label()
 
+    def reset_sample_rate(self) -> None:
+        """清除固定采样率，让下一次快照按真实时间戳重新估算。"""
+        if self._sample_rate_hz != 0.0:
+            self._sample_rate_hz = 0.0
+            self._update_processing_label()
+
     def _update_processing_label(self) -> None:
         if not _PG_OK or not hasattr(self, "_processing_label"):
             return

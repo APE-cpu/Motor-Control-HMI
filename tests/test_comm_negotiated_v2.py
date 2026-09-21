@@ -509,6 +509,40 @@ def test_辨识档开启F3且相电流保持链路默认全速(tmp_path, monkeyp
     app.processEvents()
 
 
+def test_辨识档自动联动上位机RLS且不再开固件F3(tmp_path, monkeypatch):
+    app = _app()
+    monkeypatch.setattr(
+        "pages.communication_page._COMM_CFG_FILE", tmp_path / "comm.json")
+    comm = CommManager()
+    rls_calls = []
+    telemetry_calls = []
+    monkeypatch.setattr(comm, "is_connected", lambda: True)
+    monkeypatch.setattr(
+        comm, "set_host_rls_enabled",
+        lambda enabled, reset=False:
+            rls_calls.append((bool(enabled), bool(reset))) or True)
+    monkeypatch.setattr(
+        comm, "send_telemetry_config",
+        lambda flags, f1, f2, f3, **kwargs:
+            telemetry_calls.append((flags, f1, f2, f3, kwargs)) or True)
+    page = CommunicationPage(comm)
+    page._kind.setCurrentIndex(page._kind.findText("以太网TCP"))
+    rls_calls.clear()
+    telemetry_calls.clear()
+
+    page._tele_level.setCurrentIndex(page._tele_level.findData("id"))
+
+    assert rls_calls[-1] == (True, False)
+    assert telemetry_calls[-1][0] & 0x02 == 0
+    assert telemetry_calls[-1][4]["f1_rate_hz"] == 16000
+
+    page._tele_level.setCurrentIndex(page._tele_level.findData("std"))
+    assert rls_calls[-1] == (False, False)
+    page.close()
+    page.deleteLater()
+    app.processEvents()
+
+
 def test_标准档请求16kHz连续采样并显示实际速率(tmp_path, monkeypatch):
     app = _app()
     monkeypatch.setattr(

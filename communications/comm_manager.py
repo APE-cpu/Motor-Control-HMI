@@ -17,6 +17,7 @@ from PySide6.QtCore import QObject, Signal
 
 from config.config import (
     CMD_EMERGENCY_STOP, CMD_SET_TELEMETRY, CMD_START, CMD_STOP, CMD_TELEMETRY,
+    F1_CURRENT_A_PER_DIGIT, F1_VBUS_PARTITION_FACTOR,
     FRAME_HEADER, FRAME_TAIL,
     TELEM_ANGLE_SCALE, TELEM_CURRENT_SCALE, TELEM_FMT, TELEM_FMT_CAN,
     TELEM_LEN, TELEM_LEN_CAN, TELEM_TEMP_OFFSET, TELEM_TORQUE_FROM_CURRENT,
@@ -116,6 +117,9 @@ class TelemetryFrame:
         "current_filter_enabled",   # Id/Iq反馈IIR是否参与电流PI
         "current_filter_alpha_q15", # 一阶IIR系数（Q15）
         "speed_fifo_depth",         # 编码器速度滑动平均窗口（1..16）
+        "rls_probe_enabled",        # 真机物理辨识PRBS激励
+        "rls_probe_amplitude_digit",
+        "rls_probe_chip_divider",
         "position_actual_deg",  # 位置环反馈（机械角，相对启动捕获点）
         "position_target_deg",  # 位置环目标（机械角）
         "position_error_deg",   # 位置环误差
@@ -161,6 +165,11 @@ class TelemetryFrame:
         self.current_filter_enabled = False
         self.current_filter_alpha_q15 = 0
         self.speed_fifo_depth = 16
+        self.rls_probe_enabled = False
+        # 0.12 A at the nominal 0.000629 A/current-digit scale.  Hardware-like
+        # 0.2 A-rms noise tests showed the former 0.08 A default was marginal.
+        self.rls_probe_amplitude_digit = 190
+        self.rls_probe_chip_divider = 8
         self.position_actual_deg = 0.0
         self.position_target_deg = 0.0
         self.position_error_deg = 0.0
@@ -771,8 +780,8 @@ class CommManager(QObject):
         f1_batch_samples = int(f1_batch_samples)
         if f1_rate_hz not in (0, 1000, 2000, 4000, 8000, 16000):
             raise ValueError("F1连续流速率必须是 1/2/4/8/16 kHz")
-        if not 1 <= f1_batch_samples <= 32:
-            raise ValueError("F1批量点数必须在1..32之间")
+        if not 1 <= f1_batch_samples <= 19:
+            raise ValueError("F1/40批量点数必须在1..19之间（协议载荷上限768字节）")
         if (f1_rate_hz > 1000 and self._protocol_mode != "virtual-v2" and
                 self._kind not in ("以太网TCP", "RS-485+以太网")):
             self.logMessage.emit("[错误] 2~16kHz连续F1需要以太网遥测链路")
@@ -850,17 +859,45 @@ class CommManager(QObject):
             f1_rate_hz=rate_hz,
             f1_batch_samples=int(current["f1_batch_samples"]))
         self.logMessage.emit(
-            f"[状态] 上位机C++ RLS已复位并启动；固件RLS关闭，"
-            f"F1={rate_hz}Hz")
+            f"[状态] 上位机C++真机匹配ESO→三阶RLS已复位并启动；"
+            f"Lnom=0.66mH，ωo=4000rad/s，固件RLS关闭，F1={rate_hz}Hz")
+        return True
+
+    def host_rls_enabled(self) -> bool:
+        """返回当前数据路径是否已启用上位机 RLS。"""
+        processors = [
+            item for item in (
+                self._native_telemetry_processor,
+                self._native_telem_receiver,
+            ) if item is not None
+        ]
+        return bool(processors) and all(
+            bool(processor.host_rls_enabled) for processor in processors)
+
+    def set_host_rls_enabled(self, enabled: bool, *, reset: bool = False) -> bool:
+        """联动通信档位与上位机 RLS，不额外改写 F1 档位。"""
+        processors = [
+            item for item in (
+                self._native_telemetry_processor,
+                self._native_telem_receiver,
+            ) if item is not None
+        ]
+        if enabled and not processors:
+            self.logMessage.emit(
+                "[错误] C++遥测核心不可用，未启动RLS；请重新安装native_core")
+            return False
+        for processor in processors:
+            # 新建的 TCP 接收器尚未初始化 RLS 协方差，即使另一
+            # 条数据路径已启用，它也必须单独 reset 一次。
+            needs_reset = bool(reset or
+                               (enabled and not processor.host_rls_enabled))
+            processor.set_host_rls_enabled(
+                bool(enabled), reset=needs_reset)
         return True
 
     def stop_host_rls(self) -> None:
         """停止本地辨识，不改变当前 F1 波形档位。"""
-        for processor in (
-                self._native_telemetry_processor,
-                self._native_telem_receiver):
-            if processor is not None:
-                processor.set_host_rls_enabled(False, reset=False)
+        self.set_host_rls_enabled(False, reset=False)
 
     def set_f2_diagnostics(self, enabled: bool,
                            period_ms: int = 20) -> bool:
@@ -1113,11 +1150,31 @@ class CommManager(QObject):
                     continue
                 if frame.command == 0xF1:
                     payload_length = len(frame.payload)
-                    # 每样本字节数：22（含施加电压 Vd/Vq 和母线 Vbus）、16（仅相
-                    # 电流）、12（UART 精简帧，无相电流）。优先按 22 切分，兼容
-                    # 旧固件的 16；两者只有在长度同时整除 176 时才会歧义，而固件
-                    # 只发单样本或 16 样本批，实际不会出现。
-                    if payload_length == 12:
+                    # F1/40 新增最终PWM比较值和实际逆Park角，用于
+                    # 在上位机重构PWM平均施加电压。仍兼容F1/32和F1/30。
+                    # 使它与旧 22/16/12 字节格式无歧义。
+                    tagged_40 = (
+                        payload_length >= 40 and payload_length % 40 == 0 and
+                        all(struct.unpack_from("<H", frame.payload, index + 38)[0]
+                            == 0xF140
+                            for index in range(0, payload_length, 40)))
+                    tagged_32 = (
+                        payload_length >= 32 and payload_length % 32 == 0 and
+                        all(struct.unpack_from("<H", frame.payload, index + 30)[0]
+                            == 0xF132
+                            for index in range(0, payload_length, 32)))
+                    tagged_30 = (
+                        payload_length >= 30 and payload_length % 30 == 0 and
+                        all(struct.unpack_from("<H", frame.payload, index + 28)[0]
+                            == 0xF130
+                            for index in range(0, payload_length, 30)))
+                    if tagged_40:
+                        sample_size = 40
+                    elif tagged_32:
+                        sample_size = 32
+                    elif tagged_30:
+                        sample_size = 30
+                    elif payload_length == 12:
                         sample_size = 12
                     elif payload_length >= 22 and payload_length % 22 == 0:
                         sample_size = 22
@@ -1133,21 +1190,103 @@ class CommManager(QObject):
                     rate_hz = self._resolve_f1_rate_hz(payload_length)
                     decoded_samples = []
                     for chunk in chunks:
-                        tick_ms, angle_raw, speed_rpm, iq_raw, iqref_raw = \
-                            struct.unpack("<IHhhh", chunk[:12])
+                        tick_ms = struct.unpack_from("<I", chunk, 0)[0]
+                        if sample_size in (30, 32, 40):
+                            sample_seq, angle_raw, speed_rpm, iq_raw = \
+                                (struct.unpack_from("<HHhh", chunk, 4)
+                                 if sample_size != 40 else
+                                 (struct.unpack_from("<H", chunk, 4)[0],
+                                  struct.unpack_from("<H", chunk, 6)[0],
+                                  struct.unpack_from("<h", chunk, 10)[0],
+                                  struct.unpack_from("<h", chunk, 12)[0]))
+                            base_offset = 2 if sample_size == 40 else 0
+                            id_raw, iqref_raw, idref_raw = struct.unpack(
+                                "<hhh", chunk[12 + base_offset:18 + base_offset])
+                            if sample_size in (32, 40):
+                                vdda_offset = 36 if sample_size == 40 else 28
+                                vdda_mv = struct.unpack_from(
+                                    "<H", chunk, vdda_offset)[0]
+                                vdda_v = (vdda_mv / 1000.0
+                                          if 2800 <= vdda_mv <= 3600 else 3.30)
+                                current_scale = vdda_v / (
+                                    65536.0 * 0.01000 * 8.00)
+                            else:
+                                vdda_mv = 0
+                                vdda_v = 3.30
+                                current_scale = F1_CURRENT_A_PER_DIGIT
+                        else:
+                            angle_raw, speed_rpm, iq_raw = struct.unpack_from(
+                                "<Hhh", chunk, 4)
+                            iqref_raw = struct.unpack("<h", chunk[10:12])[0]
                         sample = {
                             "tick_ms": tick_ms,
                             "rate_hz": rate_hz,
                             "angle_deg": angle_raw * 360.0 / 65536.0,
                             "speed_rpm": float(speed_rpm),
-                            "iq_a": iq_raw * 0.000629,
-                            "iqref_a": iqref_raw * 0.000629,
+                            "iq_a": iq_raw * (current_scale if sample_size in (30, 32, 40)
+                                               else F1_CURRENT_A_PER_DIGIT),
+                            "iqref_a": iqref_raw * (
+                                current_scale if sample_size in (30, 32, 40)
+                                else F1_CURRENT_A_PER_DIGIT),
                         }
-                        if sample_size >= 16:
+                        if sample_size in (30, 32, 40):
+                            sample["sample_seq"] = sample_seq
+                            sample["sequence_source_direct"] = True
+                            sample["id_a"] = id_raw * current_scale
+                            sample["idref_a"] = idref_raw * current_scale
+                            sample["id_source_direct"] = True
+                            ia_raw, ib_raw = struct.unpack(
+                                "<hh", chunk[18 + base_offset:22 + base_offset])
+                            sample["ia_a"] = ia_raw * current_scale
+                            sample["ib_a"] = ib_raw * current_scale
+                            vd_raw, vq_raw = struct.unpack(
+                                "<hh", chunk[22 + base_offset:26 + base_offset])
+                            vbus_offset = 34 if sample_size == 40 else 26
+                            vbus_adc = struct.unpack_from(
+                                "<H", chunk, vbus_offset)[0]
+                            sample["vd_raw"] = vd_raw
+                            sample["vq_raw"] = vq_raw
+                            # Generated power-stage configuration uses a
+                            # ground-referenced 0.027 divider (no midpoint
+                            # bias): Vadc = Vbus * 0.027.
+                            sample["vbus_v"] = (
+                                vbus_adc / 65536.0 * vdda_v /
+                                F1_VBUS_PARTITION_FACTOR)
+                            if sample_size in (32, 40) and 2800 <= vdda_mv <= 3600:
+                                sample["vdda_v"] = vdda_mv / 1000.0
+                                sample["vdda_source_direct"] = True
+                            if sample_size == 40:
+                                actuation_angle_raw = struct.unpack_from(
+                                    "<H", chunk, 8)[0]
+                                duty_a, duty_b, duty_c = struct.unpack_from(
+                                    "<HHH", chunk, 28)
+                                half_period = 5250.0
+                                da, db, dc = (duty_a / half_period,
+                                              duty_b / half_period,
+                                              duty_c / half_period)
+                                vbus = sample["vbus_v"]
+                                alpha = vbus * (2.0 * da - db - dc) / 3.0
+                                beta = vbus * (dc - db) / math.sqrt(3.0)
+                                actuation_angle = (
+                                    actuation_angle_raw * 2.0 * math.pi / 65536.0)
+                                sample.update({
+                                    "actuation_angle_deg":
+                                        actuation_angle_raw * 360.0 / 65536.0,
+                                    "duty_a": duty_a, "duty_b": duty_b,
+                                    "duty_c": duty_c,
+                                    "vd_applied_v":
+                                        alpha * math.sin(actuation_angle) +
+                                        beta * math.cos(actuation_angle),
+                                    "vq_applied_v":
+                                        alpha * math.cos(actuation_angle) -
+                                        beta * math.sin(actuation_angle),
+                                    "applied_voltage_source_direct": True,
+                                })
+                        elif sample_size >= 16:
                             ia_raw, ib_raw = struct.unpack("<hh", chunk[12:16])
-                            sample["ia_a"] = ia_raw * 0.000629
-                            sample["ib_a"] = ib_raw * 0.000629
-                        if sample_size >= 22:
+                            sample["ia_a"] = ia_raw * F1_CURRENT_A_PER_DIGIT
+                            sample["ib_a"] = ib_raw * F1_CURRENT_A_PER_DIGIT
+                        if sample_size >= 22 and sample_size not in (30, 32, 40):
                             # Vd/Vq 是 PI 输出的施加电压，MCSDK 内部 s16 码值；
                             # 码值→伏特的比例离线用堵转 R*Iq 自标定，故此处保留
                             # 原始码值。Vbus 为母线电压（伏特，整数）。
@@ -1269,6 +1408,8 @@ class CommManager(QObject):
                         "b_dd0_si": b_dd0, "b_qq0_si": b_qq0,
                         "ld_mh": ld_est * 1e3, "lq_mh": lq_est * 1e3,
                         "rd_ohm": rd_est, "rq_ohm": rq_est,
+                        "rl_equivalent_method": "arx3_low_frequency_moment",
+                        "rl_physical_validated": False,
                     }
                     self.rlsCoeffReceived.emit(sample)
                     outputs.append(sample)
@@ -1454,6 +1595,7 @@ class CommManager(QObject):
         integer_fields = {
             "fault_code", "fault_history_code", "mc_state", "speed_kp", "speed_ki",
             "current_filter_alpha_q15", "speed_fifo_depth",
+            "rls_probe_amplitude_digit", "rls_probe_chip_divider",
             "stop_reason", "stop_command", "stop_rx_age_ms", "stop_run_ms",
         }
         # F407 uses signed centidegrees on the wire to avoid float formatting
@@ -1498,7 +1640,7 @@ class CommManager(QObject):
                 elif field in integer_fields:
                     value = int(value)
                 elif field in {"low_speed_warn", "position_saturated",
-                               "current_filter_enabled"}:
+                               "current_filter_enabled", "rls_probe_enabled"}:
                     value = _parse_bool(value)
                 elif field in {"sensor_source", "fault_text", "fault_history_text",
                                "bus_state"}:

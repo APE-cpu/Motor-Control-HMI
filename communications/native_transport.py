@@ -17,7 +17,14 @@ except (ImportError, OSError) as exc:
     _native = None
     _native_import_error = str(exc)
 else:
-    _native_import_error = ""
+    _native_schema = int(getattr(_native, "telemetry_schema_version", 0))
+    if _native_schema < 3:
+        _native_import_error = (
+            "motor_core_cpp版本过旧：当前原生遥测schema="
+            f"{_native_schema}，F1/40需要schema>=3；请重新安装native_core")
+        _native = None
+    else:
+        _native_import_error = ""
 
 
 def native_tcp_transport_available() -> bool:

@@ -36,7 +36,7 @@ from core import RuntimeStateMachine
 from core import RuntimeState
 from config.config import CMD_RESET_FAULT, CMD_START, CMD_STOP
 
-APP_VERSION = "1.9.1"
+APP_VERSION = "2.0.0"
 
 _STOP_REASON_TEXT = {
     0: "未记录",

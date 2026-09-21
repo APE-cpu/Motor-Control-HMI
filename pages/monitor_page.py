@@ -5,17 +5,23 @@ import math
 import os
 import time
 from collections import deque
-from PySide6.QtCore import Qt, QTimer, QPointF, QRectF
+from PySide6.QtCore import Qt, QThread, QTimer, QPointF, QRectF, Signal
 from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSizePolicy,
+    QDoubleSpinBox, QLabel, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSizePolicy,
     QTabWidget, QVBoxLayout, QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
 from communications.protocol import encode_frame
-from config.config import CMD_SET_PARAMS, MONITOR_PLOT_REFRESH_MS
+from communications.native_telemetry import run_offline_rls_analysis
+from config.config import (
+    CMD_SET_PARAMS, F1_CURRENT_A_PER_DIGIT, MONITOR_PLOT_REFRESH_MS,
+)
+from rls_offline import (
+    RlsCaptureBuffer, RlsCaptureSnapshot, load_rls_capture_csv,
+)
 from widgets.trend_curve import TrendCurve
 from waveform_storage import category_for_control_mode, create_waveform_record_dir
 from widgets.temperature_label import TemperatureLabel
@@ -96,6 +102,67 @@ def _make_curve_panel(curve: TrendCurve, title: str) -> QWidget:
     curve.add_header_widget(btn)
     v.addWidget(curve, 1)
     return panel
+
+
+def _write_curve_csv_snapshot(path: str, curves: list[dict]) -> None:
+    """在不访问 Qt 控件的情况下写出已固化的曲线数据。"""
+    with open(path, "w", newline="", encoding="utf-8-sig") as stream:
+        writer = csv.writer(stream)
+        writer.writerow([
+            "channel", "time_s", "series", "value", "sampling_rate_hz",
+            "source_filter", "display_filter", "unit",
+        ])
+        for item in curves:
+            times = item["times"]
+            for series, samples in item["series"]:
+                sample_times = times[-len(samples):] if samples else ()
+                for timestamp, value in zip(sample_times, samples):
+                    writer.writerow([
+                        item["channel"], f"{timestamp:.6f}", series,
+                        f"{float(value):.9g}",
+                        (f"{item['sampling_rate_hz']:.9g}"
+                         if item["sampling_rate_hz"] > 0 else ""),
+                        item["source_filter"], item["display_filter"],
+                        item["unit"],
+                    ])
+
+
+class _WaveformSaveWorker(QThread):
+    """将大 CSV 和 PNG 的磁盘 I/O 移出 GUI 线程。"""
+
+    completed = Signal(object)
+
+    def __init__(self, png_path: str, png: bytes, csv_path: str,
+                 curve_snapshot: list[dict], rls_csv_path: str,
+                 rls_snapshot: RlsCaptureSnapshot, parent=None) -> None:
+        super().__init__(parent)
+        self._png_path = png_path
+        self._png = png
+        self._csv_path = csv_path
+        self._curve_snapshot = curve_snapshot
+        self._rls_csv_path = rls_csv_path
+        self._rls_snapshot = rls_snapshot
+
+    def run(self) -> None:
+        result = {
+            "error": "",
+            "png_path": self._png_path,
+            "csv_path": self._csv_path,
+            "rls_csv_path": self._rls_csv_path,
+            "rls_exported": False,
+            "rls_count": self._rls_snapshot.sample_count,
+            "rls_duration_s": self._rls_snapshot.duration_s,
+        }
+        try:
+            with open(self._png_path, "wb") as stream:
+                stream.write(self._png)
+            _write_curve_csv_snapshot(self._csv_path, self._curve_snapshot)
+            if self._rls_snapshot.sample_count > 0:
+                self._rls_snapshot.write_csv(self._rls_csv_path)
+                result["rls_exported"] = True
+        except Exception as exc:
+            result["error"] = str(exc)
+        self.completed.emit(result)
 
 
 class _WaveformFilterDialog(QDialog):
@@ -451,6 +518,385 @@ class _EnergyOrb(QWidget):
         p.end()
 
 
+class _RlsCoefficientDialog(QDialog):
+    """完整显示 ARX(3,1) 的 d/q 各 7 个原始系数，不占主页面高度。"""
+
+    _COLORS = (
+        "#4fc3f7", "#81c784", "#ba68c8", "#ffb74d",
+        "#ff8a65", "#80cbc4", "#f06292",
+    )
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("RLS 完整 ARX 系数（d/q 各7项）")
+        self.resize(1180, 760)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        root = QVBoxLayout(self)
+        note = QLabel(
+            "原始系数顺序：θ=[a1, a2, a3, b_d0, b_d1, b_q0, b_q1]。"
+            "a 无量纲，b 为 A/V；它们是模型系数，不等于直接的 R/L。")
+        note.setStyleSheet("color:#90a4ae;")
+        note.setWordWrap(True)
+        root.addWidget(note)
+        d_names = (
+            "a1_d", "a2_d", "a3_d", "b_dd0", "b_dd1", "b_dq0", "b_dq1")
+        q_names = (
+            "a1_q", "a2_q", "a3_q", "b_qd0", "b_qd1", "b_qq0", "b_qq1")
+        self._d_curve = TrendCurve(
+            "d轴 ARX 完整7系数",
+            dict(zip(d_names, self._COLORS)),
+            y_label="a:无量纲 / b:A/V")
+        self._q_curve = TrendCurve(
+            "q轴 ARX 完整7系数",
+            dict(zip(q_names, self._COLORS)),
+            y_label="a:无量纲 / b:A/V")
+        for curve in (self._d_curve, self._q_curve):
+            curve.set_source_processing(
+                "上位机C++ RLS原始系数；未做显示平滑")
+            curve.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
+            root.addWidget(curve, 1)
+
+    def append_coefficients(self, theta_d, theta_q) -> bool:
+        try:
+            d = [float(value) for value in theta_d[:7]]
+            q = [float(value) for value in theta_q[:7]]
+        except (TypeError, ValueError, IndexError):
+            return False
+        if len(d) != 7 or len(q) != 7 or not all(
+                math.isfinite(value) for value in (*d, *q)):
+            return False
+        self._d_curve.append(dict(zip(self._d_curve._buffers, d)),
+                             redraw=self.isVisible())
+        self._q_curve.append(dict(zip(self._q_curve._buffers, q)),
+                             redraw=self.isVisible())
+        return True
+
+    def clear(self) -> None:
+        self._d_curve.clear()
+        self._q_curve.clear()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        self._d_curve.redraw()
+        self._q_curve.redraw()
+        super().showEvent(event)
+
+
+class _OfflineRlsWorker(QThread):
+    """在后台线程中读取大 CSV 并重放 C++ RLS，避免冻结界面。"""
+
+    completed = Signal(object, object, str)
+
+    def __init__(self, path: str = "", snapshot: RlsCaptureSnapshot | None = None,
+                 parent=None) -> None:
+        super().__init__(parent)
+        self._path = path
+        self._snapshot = snapshot
+
+    def run(self) -> None:
+        try:
+            dataset = (self._snapshot.to_columns() if self._snapshot is not None
+                       else load_rls_capture_csv(self._path))
+            analysis = run_offline_rls_analysis(dataset)
+        except Exception as exc:  # 错误需回到 UI 线程显示
+            self.completed.emit(None, None, str(exc))
+            return
+        self.completed.emit(dataset, analysis, "")
+
+
+class _OfflineRlsDialog(QDialog):
+    """离线 RLS 重放结果；独立窗口不占监控页高度。"""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("离线辨识（真机匹配ESO + IV物理验证）")
+        self.resize(1240, 760)
+        self.setAttribute(Qt.WA_DeleteOnClose, False)
+        self._worker = None
+        self._source_path = ""
+        root = QVBoxLayout(self)
+        self._status = QLabel(
+            "选择“RLS辨识数据.csv”后：ESO按真机采样率、"
+            "Lnom=0.66mH、ωo=4000rad/s与1拍电压延迟运行；"
+            "物理R/L仍只由独立F1/40闭环IV链路判定。")
+        self._status.setWordWrap(True)
+        self._status.setStyleSheet("color:#90a4ae;")
+        root.addWidget(self._status)
+        bar = QHBoxLayout()
+        self._btn_coeff = QPushButton("完整系数(7×2) ↗")
+        self._btn_coeff.setEnabled(False)
+        self._btn_coeff.clicked.connect(self._show_coefficients)
+        bar.addStretch(1)
+        bar.addWidget(self._btn_coeff)
+        root.addLayout(bar)
+
+        self._c_a = TrendCurve(
+            "离线 ARX 分母系数和 Σa",
+            {"Σa_d": "#4fc3f7", "Σa_q": "#ba68c8"})
+        self._c_l = TrendCurve(
+            "离线 ARX 本轴输入系数 b0",
+            {"b0_d": "#4db6ac", "b0_q": "#ff8a65"}, y_label="A/V")
+        self._c_r = TrendCurve(
+            "离线 ARX 本轴延迟输入系数 b1",
+            {"b1_d": "#81c784", "b1_q": "#f06292"}, y_label="A/V")
+        self._c_id = TrendCurve(
+            "d轴电流：原始 vs ESO",
+            {"原始 id": "#90a4ae", "ESO id_hat": "#4fc3f7"},
+            y_label="A", buffer_size=5000)
+        self._c_iq = TrendCurve(
+            "q轴电流：原始 vs ESO",
+            {"原始 iq": "#90a4ae", "ESO iq_hat": "#ff8a65"},
+            y_label="A", buffer_size=5000)
+        tabs = QTabWidget()
+        current_tab = QWidget()
+        current_layout = QHBoxLayout(current_tab)
+        current_layout.setContentsMargins(0, 0, 0, 0)
+        for curve, title in (
+                (self._c_id, "d轴 ESO 对照"),
+                (self._c_iq, "q轴 ESO 对照")):
+            curve.set_source_processing(
+                "真机匹配ESO（16kHz/Lnom=0.66mH/ωo=4000）电流对照")
+            current_layout.addWidget(_make_curve_panel(curve, title))
+        tabs.addTab(current_tab, "电流 / ESO 复现")
+
+        parameter_tab = QWidget()
+        panels = QHBoxLayout(parameter_tab)
+        panels.setContentsMargins(0, 0, 0, 0)
+        for curve, title in (
+                (self._c_a, "ARX Σa"),
+                (self._c_l, "本轴 b0"),
+                (self._c_r, "本轴 b1")):
+            curve.set_source_processing(
+                "离线 CSV → 真机匹配C++ ESO→三阶RLS；原始ARX系数，"
+                "不冒充物理R/L")
+            panels.addWidget(_make_curve_panel(curve, title))
+        tabs.addTab(parameter_tab, "RLS 参数收敛")
+        root.addWidget(tabs, 1)
+        self._coeff_dialog = _RlsCoefficientDialog(self)
+
+    def start(self, path: str) -> None:
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self._source_path = path
+        self._status.setText(
+            f"正在读取 {os.path.basename(path)} 并执行真机ESO/RLS与IV验证…")
+        self._status.setStyleSheet("color:#ffcc80;")
+        self._btn_coeff.setEnabled(False)
+        for curve in (self._c_a, self._c_l, self._c_r,
+                      self._c_id, self._c_iq):
+            curve.clear()
+        self._coeff_dialog.clear()
+        self.show()
+        self.raise_()
+        self._worker = _OfflineRlsWorker(path=path, parent=self)
+        self._worker.completed.connect(self._complete)
+        self._worker.start()
+
+    def start_snapshot(self, snapshot: RlsCaptureSnapshot,
+                       label: str = "当前冻结采集") -> None:
+        if self._worker is not None and self._worker.isRunning():
+            return
+        self._source_path = label
+        self._status.setText(
+            f"正在分析{label}，无需CSV写盘…")
+        self._status.setStyleSheet("color:#ffcc80;")
+        self._btn_coeff.setEnabled(False)
+        for curve in (self._c_a, self._c_l, self._c_r,
+                      self._c_id, self._c_iq):
+            curve.clear()
+        self._coeff_dialog.clear()
+        self.show()
+        self.raise_()
+        self._worker = _OfflineRlsWorker(snapshot=snapshot, parent=self)
+        self._worker.completed.connect(self._complete)
+        self._worker.start()
+
+    def _complete(self, dataset, analysis, error: str) -> None:
+        if error:
+            self._status.setText(f"离线辨识失败：{error}")
+            self._status.setStyleSheet("color:#ff8a80;")
+            return
+        results = list((analysis or {}).get("results", ()))
+        if not results:
+            self._status.setText("离线辨识未产生结果")
+            self._status.setStyleSheet("color:#ff8a80;")
+            return
+        ticks = [int(item.get("tick_ms", 0)) for item in results]
+        if ticks and any(ticks[index] != ticks[0]
+                         for index in range(1, len(ticks))):
+            # tick_ms 是 uint32，长时运行后可在文件中跨越回绕点。
+            times = [((tick - ticks[0]) & 0xFFFFFFFF) / 1000.0
+                     for tick in ticks]
+        else:
+            times = [index * 0.1 for index in range(len(results))]
+        for item in results:
+            theta_d = item.get("theta_d", ())
+            theta_q = item.get("theta_q", ())
+            try:
+                asum_d = sum(float(value) for value in theta_d[:3])
+                asum_q = sum(float(value) for value in theta_q[:3])
+            except (TypeError, ValueError, IndexError):
+                asum_d = float(item.get("a1_d", 0.0))
+                asum_q = float(item.get("a1_q", 0.0))
+            self._c_a.append({"Σa_d": asum_d, "Σa_q": asum_q}, redraw=False)
+            try:
+                b0_d = float(theta_d[3])
+                b1_d = float(theta_d[4])
+                b0_q = float(theta_q[5])
+                b1_q = float(theta_q[6])
+            except (TypeError, ValueError, IndexError):
+                b0_d = b1_d = b0_q = b1_q = float("nan")
+            self._c_l.append({
+                "b0_d": b0_d, "b0_q": b0_q,
+            }, redraw=False)
+            self._c_r.append({
+                "b1_d": b1_d, "b1_q": b1_q,
+            }, redraw=False)
+            self._coeff_dialog.append_coefficients(theta_d, theta_q)
+        trace = dict((analysis or {}).get("trace", {}))
+        trace_indices = list(trace.get("sample_index", ()))
+        for id_a, iq_a, id_hat, iq_hat in zip(
+                trace.get("id_a", ()), trace.get("iq_a", ()),
+                trace.get("id_hat_a", ()), trace.get("iq_hat_a", ())):
+            self._c_id.append({"原始 id": id_a, "ESO id_hat": id_hat},
+                              redraw=False)
+            self._c_iq.append({"原始 iq": iq_a, "ESO iq_hat": iq_hat},
+                              redraw=False)
+        trace_times = [index / float(dataset["rate_hz"])
+                       for index in trace_indices]
+        for curve in (self._c_id, self._c_iq):
+            curve._times.clear()
+            curve._times.extend(trace_times[-curve._times.maxlen:])
+        for curve in (self._c_a, self._c_l, self._c_r,
+                      self._coeff_dialog._d_curve,
+                      self._coeff_dialog._q_curve):
+            curve._times.clear()
+            curve._times.extend(times[-curve._times.maxlen:])
+            curve.redraw()
+        final = results[-1]
+        duration = float(dataset["count"]) / float(dataset["rate_hz"])
+        raw_finite = all(math.isfinite(float(value)) for value in (
+            *final.get("theta_d", ()), *final.get("theta_q", ())))
+        diagnostics = dict((analysis or {}).get("diagnostics", {}))
+        physical = dict((analysis or {}).get("physical_iv", {}))
+        reference = dict((analysis or {}).get("simulink_reference", {}))
+        legacy = dict((analysis or {}).get("legacy_evidence", {}))
+        physical_usable = physical.get("verdict") == "usable"
+        nominal_match = bool(physical.get("nominal_match", False))
+        identifiable = diagnostics.get("verdict") == "usable"
+        if not raw_finite:
+            verdict = "⚠ 原始系数出现 NaN/Inf"
+        elif physical_usable and nominal_match:
+            verdict = "真机闭环辨识通过，且与固件理论参数一致"
+        elif physical_usable:
+            verdict = "⚠ 物理辨识可重复，但偏离固件理论参数"
+        elif identifiable:
+            verdict = "数值重放完成；基础可辨识性检查通过"
+        else:
+            verdict = "⚠ 数值稳定不等于物理收敛；本数据不可用于R/L结论"
+        current_note = f"ESO电流对照 {len(trace_indices)} 点"
+        diagnostic_reasons = "；".join(
+            str(item) for item in diagnostics.get("reasons", ()))
+        diagnostic_line = (
+            f"\n可辨识性：{diagnostic_reasons}"
+            if diagnostic_reasons else "")
+        if physical_usable:
+            median_vdda = float(physical.get("median_vdda_v", float("nan")))
+            vdda_note = (f"VDDA={median_vdda:.4g} V，"
+                         if math.isfinite(median_vdda) else "")
+            physical_line = (
+                "\n真机IV物理结果（参考注入→电压/电流交叉谱）："
+                f"Ld/Lq={float(physical['ld_mh']):.6g}/"
+                f"{float(physical['lq_mh']):.6g} mH，"
+                f"Rd/Rq={float(physical['rd_ohm']):.6g}/"
+                f"{float(physical['rq_ohm']):.6g} Ω，"
+                f"离散极点a(d/q)={float(physical['d_axis']['a']):.6f}/"
+                f"{float(physical['q_axis']['a']):.6f}，"
+                f"延迟d/q={float(physical['d_axis']['delay_samples']):.3g}/"
+                f"{float(physical['q_axis']['delay_samples']):.3g} 拍，"
+                f"{vdda_note}"
+                f"电频率={float(physical['electrical_frequency_hz_from_angle']):.3g} Hz，"
+                f"转速P5～P95跨度="
+                f"{float(physical.get('speed_p90_span_rpm', float('nan'))):.3g} rpm，"
+                f"激励相关={float(physical['probe_reference_correlation']):.3f}，"
+                f"反馈滤波差异RMS(d/q)="
+                f"{float(physical['feedback_vs_raw_id_rmse_a']):.4g}/"
+                f"{float(physical['feedback_vs_raw_iq_rmse_a']):.4g} A；"
+                f"标称Rs/Ls={float(physical.get('nominal_r_ohm', .59)):.4g} Ω/"
+                f"{float(physical.get('nominal_l_mh', .66)):.4g} mH；"
+                f"标称判定={'通过' if nominal_match else '未通过'}")
+            if not nominal_match:
+                nominal_reasons = "；".join(
+                    str(item) for item in physical.get("nominal_reasons", ()))
+                if nominal_reasons:
+                    physical_line += f"（{nominal_reasons}）"
+        else:
+            physical_reasons = "；".join(
+                str(item) for item in physical.get("reasons", ()))
+            scale_parts = []
+            for key, label in (("median_vbus_v", "Vbus"),
+                               ("median_vdda_v", "VDDA")):
+                value = float(physical.get(key, float("nan")))
+                if math.isfinite(value):
+                    scale_parts.append(f"{label}={value:.4g} V")
+            candidate_parts = []
+            for key, label in (("d_axis", "d"), ("q_axis", "q")):
+                axis = physical.get(key)
+                if not isinstance(axis, dict):
+                    continue
+                r_value = float(axis.get("resistance_ohm", float("nan")))
+                l_value = float(axis.get("inductance_mh", float("nan")))
+                fit = float(axis.get("fit_nrmse", float("nan")))
+                delay = float(axis.get("delay_samples", float("nan")))
+                coherence = float(axis.get("median_coherence", float("nan")))
+                if math.isfinite(r_value) and math.isfinite(l_value):
+                    candidate_parts.append(
+                        f"{label}候选R/L={r_value:.4g}Ω/{l_value:.4g}mH，"
+                        f"残差={fit:.3f}，延迟={delay:.3g}拍，"
+                        f"相干={coherence:.3f}")
+            evidence = "；".join((*scale_parts, *candidate_parts))
+            details = "；".join(
+                item for item in (physical_reasons, evidence) if item)
+            physical_line = (f"\n真机IV物理辨识未通过：{details}"
+                             if details else "")
+        reference_warning = str(reference.get("warning", ""))
+        reference_line = (f"\n仿真复现边界：{reference_warning}"
+                          if reference_warning else "")
+        legacy_line = ""
+        if legacy.get("verdict") == "diagnostic_only":
+            park = dict(legacy.get("park_reconstruction", {}))
+            r_range = legacy.get("resistance_ohm_range", ())
+            l_range = legacy.get("shared_inductance_mh_range", ())
+            if len(r_range) == 2 and len(l_range) == 2:
+                legacy_line = (
+                    "\n旧格式证据（仅诊断）："
+                    f"相电流重建Iq相关={float(park.get('correlation', float('nan'))):.6f}，"
+                    f"RMSE={float(park.get('iq_rmse_a', float('nan'))):.4g} A；"
+                    f"升速拟合R范围={float(r_range[0]):.4g}～{float(r_range[1]):.4g} Ω，"
+                    f"共享L范围={float(l_range[0]):.4g}～{float(l_range[1]):.4g} mH；"
+                    "范围不稳定，不能作为Ld/Lq收敛值。")
+        self._status.setText(
+            f"{os.path.basename(self._source_path)}｜{dataset['count']} 点｜"
+            f"{dataset['rate_hz']} Hz｜{duration:.3f} s｜"
+            f"RLS更新 {int(final.get('updates', 0))}｜{current_note}｜{verdict}\n"
+            f"真机ESO：Lnom=0.66mH，ωo=4000，1拍电压延迟→ARX(3)，"
+            f"λ=1，P0=1e6｜电压源={analysis.get('voltage_source', '--')}｜"
+            f"末值Σa(d/q)={sum(map(float, final.get('theta_d', ())[:3])):.6g}/"
+            f"{sum(map(float, final.get('theta_q', ())[:3])):.6g}，"
+            f"b0(d/q)={float(final.get('theta_d', (float('nan'),) * 7)[3]):.6g}/"
+            f"{float(final.get('theta_q', (float('nan'),) * 7)[5]):.6g} A/V；"
+            "高阶ARX不直接换算物理R/L"
+            f"{diagnostic_line}{physical_line}{legacy_line}{reference_line}")
+        self._status.setStyleSheet(
+            "color:#81c784;" if raw_finite and physical_usable and nominal_match else
+            "color:#ffb74d;" if raw_finite else "color:#ff8a80;")
+        self._btn_coeff.setEnabled(True)
+
+    def _show_coefficients(self) -> None:
+        self._coeff_dialog.show()
+        self._coeff_dialog.raise_()
+        self._coeff_dialog.activateWindow()
+
+
 class _StatItem(QWidget):
     def __init__(self, title: str) -> None:
         super().__init__()
@@ -489,13 +935,29 @@ class MonitorPage(QWidget):
         self._high_rate_columns = {
             name: deque(maxlen=5000) for name in (
                 "angle_deg", "speed_rpm", "iq_a", "iqref_a", "ia_a",
-                "ib_a", "vd_raw", "vq_raw", "vbus_v")
+                "ib_a", "vd_raw", "vq_raw", "vbus_v",
+                "vd_applied_v", "vq_applied_v")
         }
+        self._high_rate_voltage_is_applied = False
         self._high_rate_rate_hz = 200
+        # F1每个FOC样本都携带speed_rpm，但编码器速度只在500 Hz中频任务
+        # 更新。用跨批次相位连续的抽取器恢复真实速度时间基准，不能把
+        # 16 kHz零阶保持的重复值当成独立测速样本。
+        self._speed_f1_source_rate_hz = 0
+        self._speed_f1_decimation_phase = 0
+        self._speed_curve_source = "none"
+        self._f0_speed_pending = False
         self._last_high_angle_time = 0.0
         self._last_telemetry_time: float = 0.0
         self._latest_vbus_v = 0.0
         self._latest_rls: dict = {}
+        self._last_rls_updates: int | None = None
+        # 绘图只留 5000 点；辨识数据用紧凑分批缓冲单独保留
+        # 最近 60 s，避免 16 kHz 下用 Python 逐点对象占用过多内存。
+        self._rls_capture = RlsCaptureBuffer(max_seconds=60.0)
+        self._rls_capture_active = True
+        self._rls_capture_had_probe = False
+        self._last_rls_probe_state = False
 
         root = QVBoxLayout(self)
 
@@ -520,9 +982,10 @@ class MonitorPage(QWidget):
             "不会停止电机，也不会修改控制参数。")
         self._btn_clear_curves.clicked.connect(self._clear_all_curves)
         title_row.addWidget(self._btn_clear_curves)
-        btn_save_all = QPushButton("保存所有波形")
-        btn_save_all.clicked.connect(self._save_all_curves)
-        title_row.addWidget(btn_save_all)
+        self._btn_save_all = QPushButton("保存所有波形")
+        self._btn_save_all.clicked.connect(self._save_all_curves)
+        title_row.addWidget(self._btn_save_all)
+        self._save_worker = None
         root.addLayout(title_row)
 
         # 窄屏下将运行控制拆成独立一行，避免与标题/报告按钮互相挤压。
@@ -634,7 +1097,9 @@ class MonitorPage(QWidget):
         root.addWidget(stat_box)
 
         # ---------- 曲线标签页（同屏只显示一排，高度翻倍）----------
-        self._c_speed = TrendCurve("转速 rpm", {"实际": "#4fc3f7", "给定": "#ffb74d"}, y_label="rpm")
+        self._c_speed = TrendCurve(
+            "转速 rpm", {"实际": "#4fc3f7", "给定": "#ffb74d"},
+            y_label="rpm", buffer_size=30000)
         self._c_current = TrendCurve(
             "q轴电流 Iq A", {"实际 Iq": "#81c784", "给定 Iq": "#ffb74d"},
             y_label="A", buffer_size=5000)
@@ -665,34 +1130,40 @@ class MonitorPage(QWidget):
         self._c_position_state = TrendCurve(
             "位置环限幅状态", {"速度限幅饱和": "#ff5252"},
             y_label="0/1", buffer_size=5000)
-        # 施加电压 Vd/Vq（PI 输出，MCSDK 内部码值）——卡尔曼建模的控制输入 u。
+        # 新 F1/40 由最终PWM比较值重构平均施加电压；旧帧回退到
+        # 受限PI命令的伏特换算，但会在数据源说明中明确标注。
         self._c_voltage = TrendCurve(
-            "施加电压 Vd/Vq (码值)", {"Vd": "#80cbc4", "Vq": "#ffab91"},
-            y_label="digit", buffer_size=5000)
-        # 上位机 C++ 在线 ARX/RLS：用完整 ARX(3,1) 系数的直流增益与低频
-        # 一阶矩换算等效 R/L，避免把三阶模型误当成只含 a1/b0 的一阶模型。
+            "PWM平均施加电压 Vd/Vq", {"Vd": "#80cbc4", "Vq": "#ffab91"},
+            y_label="V", buffer_size=5000)
+        # 上位机 C++ 在线 ARX/RLS：主页面只显示原始ARX摘要。一般的
+        # ARX(3,2输入)不能唯一映射成物理R/L；物理结果只由离线闭环IV给出。
         self._c_rls_L = TrendCurve(
-            "ARX 全系数等效电感 Ld/Lq (mH)",
-            {"Ld": "#4db6ac", "Lq": "#ff8a65"},
-            y_label="mH")
+            "ARX 本轴输入系数 b0 (A/V)",
+            {"b0_d": "#4db6ac", "b0_q": "#ff8a65"},
+            y_label="A/V")
         self._c_rls_a1 = TrendCurve(
             "ARX 分母系数和 Σa（一阶参考≈0.944）",
             {"Σa_d": "#4fc3f7", "Σa_q": "#ba68c8"},
             y_label="")
         self._c_rls_R = TrendCurve(
-            "ARX 全系数等效电阻 Rd/Rq (Ω)",
-            {"Rd": "#81c784", "Rq": "#f06292"},
-            y_label="Ω")
+            "ARX 本轴延迟输入系数 b1 (A/V)",
+            {"b1_d": "#81c784", "b1_q": "#f06292"},
+            y_label="A/V")
+        self._rls_coeff_dialog = _RlsCoefficientDialog(self)
+        self._offline_rls_dialog = _OfflineRlsDialog(self)
 
         # 慢速量没有额外的上位机采集滤波；F1 高速量会在收到
         # 数据后根据当前的“原始连续流 / 固件箱式平均”模式覆盖。
-        for curve in (self._c_speed, self._c_torque, self._c_sensor_q,
-                      self._c_position, self._c_position_speed,
-                      self._c_position_state):
+        self._c_speed.set_source_processing(
+            "等待F1速度；无F1时降级为F0 10 Hz单帧记录")
+        for curve in (self._c_torque, self._c_sensor_q, self._c_position,
+                      self._c_position_speed, self._c_position_state):
             curve.set_source_processing("F0常规遥测，上位机不做采集滤波")
         for curve in (self._c_rls_a1, self._c_rls_L, self._c_rls_R):
             curve.set_source_processing(
-                "上位机C++在线辨识（F1原始量；不占用电流环ISR）")
+                "上位机C++真机匹配ESO（16kHz/Lnom=0.66mH/ωo=4000）"
+                "→三阶RLS（λ=1，P0=1e6）；"
+                "显示原始ARX摘要，不作为物理R/L")
         self._filter_dialog = _WaveformFilterDialog(
             self._filter_specs(), self._refresh_filter_button, self)
 
@@ -725,25 +1196,66 @@ class MonitorPage(QWidget):
         rls_tab = QWidget()
         rls_v = QVBoxLayout(rls_tab)
         self._rls_status = QLabel(
-            "上位机RLS：0帧｜未收到数据｜点“启动/重置辨识”后启动电机")
+            "上位机RLS：0帧｜在通信页启用辨识档后会自动启动")
         self._rls_status.setStyleSheet("color:#90a4ae;")
+        self._rls_status.setToolTip(
+            "橙色=真机匹配ESO/ARX递推数值有效，但尚未形成物理R/L证据；"
+            "红色=原始系数数值无效。物理绿色只在离线独立激励IV验证通过时显示。")
         self._rls_status.setWordWrap(True)
         self._rls_status.setMaximumHeight(58)
         rls_bar = QHBoxLayout()
         rls_bar.addWidget(self._rls_status, 1)
-        self._btn_enable_rls = QPushButton("启动/重置辨识")
+        self._btn_enable_rls = QPushButton("重置辨识")
         self._btn_enable_rls.setToolTip(
             "在上位机C++核心中运行RLS；固件仅发送F1采样，不再计算RLS")
         self._btn_enable_rls.clicked.connect(self._on_enable_rls)
+        self._btn_rls_coefficients = QPushButton("完整系数(7×2) ↗")
+        self._btn_rls_coefficients.setToolTip(
+            "弹出 d/q 轴各7个 ARX 原始系数的完整波形，不改变主页高度")
+        self._btn_rls_coefficients.clicked.connect(
+            self._show_rls_coefficients)
+        self._btn_offline_rls = QPushButton("离线辨识 CSV…")
+        self._btn_offline_rls.setToolTip(
+            "导入保存的 RLS辨识数据.csv，在后台按真机ESO配置重放；"
+            "新F1/40数据优先使用PWM占空比重构电压，并执行独立"
+            "激励闭环IV物理验证；不需要连接电机")
+        self._btn_offline_rls.clicked.connect(self._select_offline_rls_csv)
+        self._btn_analyze_rls_capture = QPushButton("分析当前采集")
+        self._btn_analyze_rls_capture.setToolTip(
+            "直接分析关闭辨识激励后冻结的内存数据；不先写CSV，不阻塞界面")
+        self._btn_analyze_rls_capture.clicked.connect(
+            self._analyze_current_rls_capture)
+        self._probe_amplitude = QDoubleSpinBox()
+        self._probe_amplitude.setRange(0.02, 0.15)
+        self._probe_amplitude.setSingleStep(0.01)
+        self._probe_amplitude.setDecimals(2)
+        self._probe_amplitude.setValue(0.12)
+        self._probe_amplitude.setSuffix(" A")
+        self._probe_amplitude.setToolTip(
+            "d/q轴同时注入的独立PRBS幅值；0.12 A为真机噪声压力测试后的默认值；"
+            "运行中不允许改幅值")
+        self._probe_amplitude.editingFinished.connect(
+            self._on_probe_amplitude_edited)
+        self._btn_rls_probe = QPushButton("辨识激励：关")
+        self._btn_rls_probe.setCheckable(True)
+        self._btn_rls_probe.setToolTip(
+            "默认关闭。注入受限小幅PRBS参考，使闭环下的R/L可用工具变量辨识；"
+            "停机/掉线/保护动作后固件自动关闭。")
+        self._btn_rls_probe.clicked.connect(self._on_toggle_rls_probe)
+        rls_bar.addWidget(self._btn_offline_rls)
+        rls_bar.addWidget(self._btn_analyze_rls_capture)
+        rls_bar.addWidget(self._btn_rls_coefficients)
+        rls_bar.addWidget(self._probe_amplitude)
+        rls_bar.addWidget(self._btn_rls_probe)
         rls_bar.addWidget(self._btn_enable_rls)
         rls_v.addLayout(rls_bar)
         rls_curve_h = QHBoxLayout()
         rls_curve_h.addWidget(_make_curve_panel(
             self._c_rls_a1, "ARX Σa（一阶参考≈0.944）"))
         rls_curve_h.addWidget(_make_curve_panel(
-            self._c_rls_L, "全系数等效电感 (mH)"))
+            self._c_rls_L, "本轴输入系数 b0 (A/V)"))
         rls_curve_h.addWidget(_make_curve_panel(
-            self._c_rls_R, "全系数等效电阻 (Ω)"))
+            self._c_rls_R, "本轴延迟输入系数 b1 (A/V)"))
         rls_v.addLayout(rls_curve_h, 1)
 
         burst_tab = self._build_burst_tab()
@@ -785,6 +1297,7 @@ class MonitorPage(QWidget):
             self._on_high_rate_telemetry_columns)
         comm.rlsCoeffReceived.connect(self._on_rls_coeff)
         comm.burstReceived.connect(self._on_burst)
+        comm.statusChanged.connect(self._on_connection_status_changed)
 
         # ---------- 刷新定时器 ----------
         self._timer = QTimer(self)
@@ -817,6 +1330,7 @@ class MonitorPage(QWidget):
 
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._latest = frame
+        self._f0_speed_pending = True
         self._last_telemetry_time = datetime.datetime.now().timestamp()
         filter_state = (
             bool(getattr(frame, "current_filter_enabled", False)),
@@ -825,13 +1339,98 @@ class MonitorPage(QWidget):
         if filter_state != getattr(self, "_last_firmware_filter_state", None):
             self._last_firmware_filter_state = filter_state
             self._update_f1_processing_labels(self._high_rate_rate_hz)
+        if hasattr(self, "_btn_rls_probe"):
+            probe_enabled = bool(getattr(frame, "rls_probe_enabled", False))
+            if probe_enabled:
+                if not self._last_rls_probe_state:
+                    # The command being queued is not proof that the firmware
+                    # accepted it.  Start the physical capture only after the
+                    # device reports the probe active; this also excludes the
+                    # unexcited command/ACK latency prefix.
+                    self._rls_capture.clear()
+                    self._rls_capture_active = True
+                self._rls_capture_had_probe = True
+            if self._last_rls_probe_state and not probe_enabled:
+                # Freeze exactly the injected interval.  Otherwise the normal
+                # current that arrives while the operator reaches the Save
+                # button dilutes the late Welch windows and falsely looks like
+                # a loss of excitation.
+                self._rls_capture_active = False
+            self._last_rls_probe_state = probe_enabled
+            if self._btn_rls_probe.isChecked() != probe_enabled:
+                self._btn_rls_probe.blockSignals(True)
+                self._btn_rls_probe.setChecked(probe_enabled)
+                self._btn_rls_probe.blockSignals(False)
+            self._btn_rls_probe.setText(
+                "辨识激励：开" if probe_enabled else "辨识激励：关")
+            self._probe_amplitude.setEnabled(
+                not probe_enabled and int(getattr(frame, "mc_state", 0)) != 6)
+            amplitude_digit = int(getattr(
+                frame, "rls_probe_amplitude_digit", 0) or 0)
+            if (amplitude_digit > 0 and not probe_enabled and
+                    not self._probe_amplitude.hasFocus()):
+                self._probe_amplitude.setValue(
+                    amplitude_digit * F1_CURRENT_A_PER_DIGIT)
         if (not self._comm.is_sim_running() and not self._comm.is_connected() and
                 abs(frame.speed_actual) < 1e-9 and abs(frame.angle_actual) < 1e-9):
             self._angle_dial.reset()
 
-    def _on_high_rate_telemetry(self, sample: dict) -> None:
+    def _on_connection_status_changed(self, connected: bool, _message: str) -> None:
+        """断链时冻结已注入数据；重连后的普通流不得污染它。"""
+        if connected or not self._rls_capture_had_probe:
+            return
+        self._rls_capture_active = False
+        self._last_rls_probe_state = False
+        if hasattr(self, "_btn_rls_probe"):
+            self._btn_rls_probe.blockSignals(True)
+            self._btn_rls_probe.setChecked(False)
+            self._btn_rls_probe.setText("辨识激励：关")
+            self._btn_rls_probe.blockSignals(False)
+        if self._rls_capture.sample_count > 0:
+            self._rls_status.setText(
+                f"通信断开；已冻结 {self._rls_capture.duration_s:.3f} s "
+                "辨识数据，重连后可直接分析")
+            self._rls_status.setStyleSheet("color:#ffcc80;")
+
+    def _on_high_rate_telemetry(self, sample: dict, *, capture=True) -> None:
+        if capture and self._rls_capture_active:
+            capture_columns = {
+                "count": 1,
+                "rate_hz": int(sample.get("rate_hz", 200)),
+                "tick_ms": [int(sample.get("tick_ms", 0))],
+                **{name: [float(sample.get(name, 0.0))]
+                   for name in (
+                       "angle_deg", "speed_rpm", "iq_a", "iqref_a",
+                       "ia_a", "ib_a", "vd_raw", "vq_raw", "vbus_v")},
+            }
+            if "id_a" in sample:
+                capture_columns["id_a"] = [float(sample["id_a"])]
+                capture_columns["idref_a"] = [float(
+                    sample.get("idref_a", 0.0))]
+                capture_columns["id_source_direct"] = bool(
+                    sample.get("id_source_direct", True))
+            if "sample_seq" in sample:
+                capture_columns["sample_seq"] = [int(sample["sample_seq"])]
+                capture_columns["sequence_source_direct"] = bool(
+                    sample.get("sequence_source_direct", True))
+            if "vdda_v" in sample:
+                capture_columns["vdda_v"] = [float(sample["vdda_v"])]
+                capture_columns["vdda_source_direct"] = bool(
+                    sample.get("vdda_source_direct", True))
+            if all(name in sample for name in (
+                    "actuation_angle_deg", "duty_a", "duty_b", "duty_c",
+                    "vd_applied_v", "vq_applied_v")):
+                for name in ("actuation_angle_deg", "vd_applied_v",
+                             "vq_applied_v"):
+                    capture_columns[name] = [float(sample[name])]
+                for name in ("duty_a", "duty_b", "duty_c"):
+                    capture_columns[name] = [int(sample[name])]
+                capture_columns["applied_voltage_source_direct"] = bool(
+                    sample.get("applied_voltage_source_direct", True))
+            self._rls_capture.append_columns(capture_columns)
         self._high_rate_samples.append({
             "angle_deg": float(sample["angle_deg"]),
+            "speed_rpm": float(sample.get("speed_rpm", 0.0)),
             "iq_a": float(sample["iq_a"]),
             "iqref_a": float(sample["iqref_a"]),
             "ia_a": float(sample.get("ia_a", 0.0)),
@@ -840,22 +1439,111 @@ class MonitorPage(QWidget):
             "vd_raw": float(sample.get("vd_raw", 0.0)),
             "vq_raw": float(sample.get("vq_raw", 0.0)),
             "vbus_v": float(sample.get("vbus_v", 0.0)),
+            "vd_applied_v": float(sample.get("vd_applied_v", 0.0)),
+            "vq_applied_v": float(sample.get("vq_applied_v", 0.0)),
+            "applied_voltage_source_direct": bool(
+                sample.get("applied_voltage_source_direct", False)),
             "rate_hz": int(sample.get("rate_hz", 200)),
         })
+        self._high_rate_voltage_is_applied = bool(
+            sample.get("applied_voltage_source_direct", False))
         self._latest_vbus_v = float(sample.get("vbus_v", self._latest_vbus_v))
         self._last_high_angle_time = time.time()
 
+    def _extract_f1_speed(self, values, source_rate_hz: int) -> tuple[list[float], int]:
+        """把F1中的零阶保持速度恢复为测速器真实更新节拍。
+
+        标准连续流只允许1/2/4/8/16 kHz，均可整除500 Hz；兼容200 Hz
+        已低于测速器更新率，直接保留。抽取相位跨UI批次保持连续，避免
+        每33 ms重新从批首取点而制造时间轴抖动。
+        """
+        source_rate = max(1, int(source_rate_hz))
+        samples = [float(value) for value in values]
+        if not samples:
+            return [], min(500, source_rate)
+        if source_rate <= 500:
+            self._speed_f1_source_rate_hz = source_rate
+            self._speed_f1_decimation_phase = 0
+            return samples, source_rate
+
+        stride = max(1, round(source_rate / 500.0))
+        if self._speed_f1_source_rate_hz != source_rate:
+            self._speed_f1_source_rate_hz = source_rate
+            self._speed_f1_decimation_phase = 0
+        phase = self._speed_f1_decimation_phase
+        selected = []
+        for value in samples:
+            if phase == 0:
+                selected.append(value)
+            phase += 1
+            if phase >= stride:
+                phase = 0
+        self._speed_f1_decimation_phase = phase
+        return selected, max(1, round(source_rate / stride))
+
     def _on_high_rate_telemetry_batch(self, samples: list[dict]) -> None:
+        if samples and self._rls_capture_active:
+            capture_columns = {
+                "count": len(samples),
+                "rate_hz": int(samples[-1].get("rate_hz", 200)),
+                "tick_ms": [int(sample.get("tick_ms", 0))
+                            for sample in samples],
+                **{name: [float(sample.get(name, 0.0))
+                          for sample in samples]
+                   for name in (
+                       "angle_deg", "speed_rpm", "iq_a", "iqref_a",
+                       "ia_a", "ib_a", "vd_raw", "vq_raw", "vbus_v")},
+            }
+            if all("id_a" in sample for sample in samples):
+                capture_columns["id_a"] = [float(sample["id_a"])
+                                             for sample in samples]
+                capture_columns["idref_a"] = [float(
+                    sample.get("idref_a", 0.0)) for sample in samples]
+                capture_columns["id_source_direct"] = all(
+                    bool(sample.get("id_source_direct", True))
+                    for sample in samples)
+            if all("sample_seq" in sample for sample in samples):
+                capture_columns["sample_seq"] = [
+                    int(sample["sample_seq"]) for sample in samples]
+                capture_columns["sequence_source_direct"] = all(
+                    bool(sample.get("sequence_source_direct", True))
+                    for sample in samples)
+            if all("vdda_v" in sample for sample in samples):
+                capture_columns["vdda_v"] = [
+                    float(sample["vdda_v"]) for sample in samples]
+                capture_columns["vdda_source_direct"] = all(
+                    bool(sample.get("vdda_source_direct", True))
+                    for sample in samples)
+            applied_names = (
+                "actuation_angle_deg", "duty_a", "duty_b", "duty_c",
+                "vd_applied_v", "vq_applied_v")
+            if all(all(name in sample for name in applied_names)
+                   for sample in samples):
+                for name in ("actuation_angle_deg", "vd_applied_v",
+                             "vq_applied_v"):
+                    capture_columns[name] = [
+                        float(sample[name]) for sample in samples]
+                for name in ("duty_a", "duty_b", "duty_c"):
+                    capture_columns[name] = [
+                        int(sample[name]) for sample in samples]
+                capture_columns["applied_voltage_source_direct"] = all(
+                    bool(sample.get("applied_voltage_source_direct", True))
+                    for sample in samples)
+            self._rls_capture.append_columns(capture_columns)
         for sample in samples:
-            self._on_high_rate_telemetry(sample)
+            self._on_high_rate_telemetry(sample, capture=False)
 
     def _on_high_rate_telemetry_columns(self, columns: dict) -> None:
         count = int(columns.get("count", 0))
         if count <= 0:
             return
+        if self._rls_capture_active:
+            self._rls_capture.append_columns(columns)
         for name, buffer in self._high_rate_columns.items():
             values = columns.get(name, ())
             buffer.extend(values[:count])
+        self._high_rate_voltage_is_applied = bool(
+            columns.get("applied_voltage_source_direct", False))
         self._high_rate_rate_hz = max(1, int(columns.get("rate_hz", 200)))
         self._update_f1_processing_labels(self._high_rate_rate_hz)
         vbus = columns.get("vbus_v", ())
@@ -864,97 +1552,134 @@ class MonitorPage(QWidget):
         self._last_high_angle_time = time.time()
 
     def _on_rls_coeff(self, sample: dict) -> None:
-        """上位机在线辨识系数：画合理值，同时明示原始值和过滤原因。"""
+        """上位机在线辨识系数：忠实显示模型同构RLS原始摘要。"""
         self._latest_rls = sample
         self._rls_rx_frames = getattr(self, "_rls_rx_frames", 0) + 1
         updates = int(sample.get("updates", 0))
+        held = (self._last_rls_updates is not None and
+                updates == self._last_rls_updates)
+        self._last_rls_updates = updates
         innov = sample.get("innov_rms_a", sample.get("innov_rms_digit", 0.0))
         p_trace = sample.get("p_trace", 0.0)
         a1_d, a1_q = sample.get("a1_d"), sample.get("a1_q")
         theta_d = sample.get("theta_d")
         theta_q = sample.get("theta_q")
+        self._rls_coeff_dialog.append_coefficients(theta_d, theta_q)
         try:
             asum_d = sum(map(float, theta_d[:3]))
             asum_q = sum(map(float, theta_q[:3]))
         except (TypeError, IndexError):
             asum_d, asum_q = a1_d, a1_q
-        ld, lq = sample.get("ld_mh"), sample.get("lq_mh")
-
         def _number(x):
             return isinstance(x, (int, float)) and math.isfinite(float(x))
-
-        def _finite(x, lo, hi):
-            return _number(x) and lo <= float(x) <= hi
 
         def _fmt(x, spec=".4g"):
             return format(float(x), spec) if _number(x) else "NaN/Inf"
 
-        b_d = sample.get("b_dd0_si")
-        b_q = sample.get("b_qq0_si")
-        rd, rq = sample.get("rd_ohm"), sample.get("rq_ohm")
+        try:
+            b0_d, b1_d = float(theta_d[3]), float(theta_d[4])
+            b0_q, b1_q = float(theta_q[5]), float(theta_q[6])
+        except (TypeError, ValueError, IndexError):
+            b0_d = b1_d = b0_q = b1_q = float("nan")
         rejected = []
-        if not (_finite(a1_d, -8.0, 8.0) and _finite(a1_q, -8.0, 8.0)):
-            rejected.append(
-                f"a1越界[-8,8]({ _fmt(a1_d)}/{_fmt(a1_q)})")
-        if not (_finite(ld, 0.05, 10.0) and _finite(lq, 0.05, 10.0)):
-            rejected.append(
-                f"L越界[0.05,10]mH({_fmt(ld, '.6g')}/{_fmt(lq, '.6g')})")
-        if not (_finite(rd, 0.01, 20.0) and _finite(rq, 0.01, 20.0)):
-            rejected.append(
-                f"R越界[0.01,20]Ω({_fmt(rd)}/{_fmt(rq)})")
-
-        # ARX(3,1)任一原始系数或协方差诊断已经退化时，换算出的L/R即使
-        # 因巨大分子分母相消而落在物理范围内，也没有辨识意义。整帧统一
-        # 拒绝，避免出现“a1已发散但L/R看起来正常”的误导性曲线。
         if theta_d is not None and theta_q is not None:
             try:
-                ar_coeffs = [*theta_d[:3], *theta_q[:3]]
-                voltage_coeffs = [*theta_d[3:7], *theta_q[3:7]]
+                coefficients = [*theta_d[:7], *theta_q[:7]]
             except (TypeError, IndexError):
                 rejected.append("ARX系数数组不完整")
             else:
-                if not all(_finite(value, -8.0, 8.0)
-                           for value in ar_coeffs):
-                    rejected.append("AR系数整体越界[-8,8]")
-                if not all(_finite(value, -100.0, 100.0)
-                           for value in voltage_coeffs):
-                    rejected.append("电压系数整体越界[-100,100]A/V")
-        elif not (_finite(b_d, -100.0, 100.0) and
-                  _finite(b_q, -100.0, 100.0)):
-            rejected.append("本轴电压系数越界[-100,100]A/V")
+                if len(coefficients) != 14 or not all(
+                        _number(value) for value in coefficients):
+                    rejected.append("ARX系数含NaN/Inf或数组不完整")
+        elif not (_number(b0_d) and _number(b0_q)):
+            rejected.append("本轴电压系数含NaN/Inf")
 
-        if "p_trace" in sample and not _finite(p_trace, 1e-20, 1e12):
+        if "p_trace" in sample and not (
+                _number(p_trace) and float(p_trace) >= 0.0):
             rejected.append(f"P迹无效({_fmt(p_trace)})")
-        if not _finite(innov, 0.0, 1e6):
+        if not (_number(innov) and float(innov) >= 0.0):
             rejected.append(f"创新RMS无效({_fmt(innov)})")
 
         # 保持原因稳定且简洁，避免同一问题由a1和完整theta重复刷屏。
         rejected = list(dict.fromkeys(rejected))
 
-        ld_s, lq_s = _fmt(ld, ".6g"), _fmt(lq, ".6g")
-        reason = "；".join(rejected) if rejected else "无（三组曲线均已接收）"
-        validity = "整帧无效" if rejected else "有效"
+        arx_summary_available = all(
+            _number(value) for value in (b0_d, b1_d, b0_q, b1_q))
+        if rejected:
+            reason = "；".join(rejected)
+            validity = "整帧无效"
+            status_color = "#ff8a80"
+        else:
+            reason = ("ARX摘要可计算" if arx_summary_available else
+                      "ARX摘要暂不可计算；7×2原始系数仍有效")
+            validity = "模型同构数值有效（不代表物理R/L收敛）"
+            # 物理绿色只属于离线独立激励IV验证。在线ARX即使数值有限，
+            # 也只证明递推正常，因此保持警示橙色。
+            status_color = "#ffb74d"
         self._rls_status.setText(
             f"本地结果：{self._rls_rx_frames}帧｜RLS更新：{updates}｜"
-            f"全系数等效 Ld/Lq：{ld_s}/{lq_s} mH｜{validity}：{reason}\n"
+            f"递推：{'保持(未收到新递推)' if held else '更新'}｜"
+            f"{validity}：{reason}\n"
+            f"真机ESO：Lnom=0.66mH/ωo=4000/1拍电压延迟"
+            f"→ARX(3)/λ=1/P0=1e6/无投影｜"
             f"原始SI：a1={_fmt(a1_d)}/{_fmt(a1_q)}｜"
             f"Σa={_fmt(asum_d)}/{_fmt(asum_q)}｜"
-            f"b0={_fmt(b_d)}/{_fmt(b_q)} A/V｜"
+            f"本轴b0={_fmt(b0_d)}/{_fmt(b0_q)} A/V｜"
+            f"本轴b1={_fmt(b1_d)}/{_fmt(b1_q)} A/V｜"
             f"innov={_fmt(innov)} A｜P迹={_fmt(p_trace)}")
-        self._rls_status.setStyleSheet(
-            "color:#ff8a80;" if rejected else "color:#81c784;")
+        self._rls_status.setStyleSheet(f"color:{status_color};")
 
-        # 三组结果来自同一个ARX模型，必须整帧有效后一起接收。
+        # 原始14系数有限就持续画；不在在线图中伪装成物理R/L。
         if not rejected:
             self._c_rls_a1.append(
                 {"Σa_d": asum_d, "Σa_q": asum_q},
                 redraw=self._curve_is_active(self._c_rls_a1))
             self._c_rls_L.append(
-                {"Ld": ld, "Lq": lq},
+                {"b0_d": b0_d, "b0_q": b0_q},
                 redraw=self._curve_is_active(self._c_rls_L))
             self._c_rls_R.append(
-                {"Rd": rd, "Rq": rq},
+                {"b1_d": b1_d, "b1_q": b1_q},
                 redraw=self._curve_is_active(self._c_rls_R))
+
+    def _show_rls_coefficients(self) -> None:
+        self._rls_coeff_dialog.show()
+        self._rls_coeff_dialog.raise_()
+        self._rls_coeff_dialog.activateWindow()
+
+    def _select_offline_rls_csv(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "加载离线 RLS 辨识数据", "",
+            "RLS 辨识数据 (*.csv);;所有文件 (*)")
+        if path:
+            self._offline_rls_dialog.start(path)
+
+    def _analyze_current_rls_capture(self) -> None:
+        """直接分析冻结的F1/40内存快照，避免大CSV往返。"""
+        snapshot = self._rls_capture.snapshot()
+        problems = []
+        if self._rls_capture_active:
+            problems.append("请先关闭辨识激励，使采集区冻结")
+        if not self._rls_capture_had_probe:
+            problems.append("当前采集未记录到辨识PRBS开启状态")
+        if snapshot.rate_hz != 16000:
+            problems.append(f"采样率为{snapshot.rate_hz} Hz，不是16 kHz")
+        if snapshot.duration_s < 3.0:
+            problems.append(
+                f"有效时长仅{snapshot.duration_s:.3f} s，至少需要3 s")
+        if snapshot.dropped_samples:
+            problems.append(
+                f"主机环形缓冲已丢弃{snapshot.dropped_samples}点")
+        if (not snapshot.batches or not all(
+                all(name in batch for name in
+                    ("id_a", "idref_a", "sample_seq"))
+                for batch in snapshot.batches)):
+            problems.append("数据不是含Id/IdRef/连续序号的新F1格式")
+        if problems:
+            QMessageBox.warning(
+                self, "当前采集不能辨识", "\n".join(problems))
+            return
+        label = f"当前冻结采集（{snapshot.duration_s:.3f} s）"
+        self._offline_rls_dialog.start_snapshot(snapshot, label)
 
     # ------- 突发抓取波形 (16kHz) -------
     def _build_burst_tab(self) -> QWidget:
@@ -1005,8 +1730,10 @@ class MonitorPage(QWidget):
         if not _MP_PG_OK:
             return
         n = int(data.get("n", 0))
-        ia = np.asarray(data.get("ia", []), dtype=float) * 0.000629   # 码值→A
-        ib = np.asarray(data.get("ib", []), dtype=float) * 0.000629
+        ia = (np.asarray(data.get("ia", []), dtype=float) *
+              F1_CURRENT_A_PER_DIGIT)   # 码值→A
+        ib = (np.asarray(data.get("ib", []), dtype=float) *
+              F1_CURRENT_A_PER_DIGIT)
         ang = np.asarray(data.get("ang", []), dtype=float)            # 0..65535 = 0..360°
         if n == 0 or ia.size == 0:
             self._burst_status.setText("抓取回传为空。")
@@ -1048,7 +1775,7 @@ class MonitorPage(QWidget):
             self._c_voltage: 9,
             self._c_rls_a1: 1,          # 已是慢变量，无需平滑
             self._c_rls_L: 1,
-            self._c_rls_R: 5,           # R 反解噪声大，轻平滑便于读趋势
+            self._c_rls_R: 1,
         }
         for curve, n in windows.items():
             curve.set_smoothing(n if on else 1)
@@ -1066,8 +1793,8 @@ class MonitorPage(QWidget):
             ("位置限幅", self._c_position_state, 2),
             ("施加电压Vd/Vq", self._c_voltage, 16),
             ("RLS Σa", self._c_rls_a1, 3),
-            ("RLS 电感", self._c_rls_L, 3),
-            ("RLS 电阻", self._c_rls_R, 5),
+            ("RLS 本轴b0", self._c_rls_L, 3),
+            ("RLS 本轴b1", self._c_rls_R, 3),
         ]
 
     def _show_filter_panel(self) -> None:
@@ -1119,8 +1846,14 @@ class MonitorPage(QWidget):
         self._c_current.set_source_processing(
             f"{current_processing}；{control_filter}",
             rate_hz)
-        for curve in (self._c_phase_current, self._c_voltage):
-            curve.set_source_processing(current_processing, rate_hz)
+        self._c_phase_current.set_source_processing(
+            current_processing, rate_hz)
+        voltage_source = (
+            "最终PWM比较值+Vbus+执行Park角重构的平均dq电压"
+            if self._high_rate_voltage_is_applied else
+            "兼容回退：受限PI电压命令换算（非最终PWM电压）")
+        self._c_voltage.set_source_processing(
+            f"{current_processing}；{voltage_source}", rate_hz)
         self._c_angle.set_source_processing(angle_processing, rate_hz)
         dialog = getattr(self, "_filter_dialog", None)
         if dialog is not None and dialog.isVisible():
@@ -1132,8 +1865,8 @@ class MonitorPage(QWidget):
         return [
             ("相电流 Ia", "phase_ia"), ("相电流 Ib", "phase_ib"),
             ("q轴电流 Iq", "iq"), ("q轴电流给定 Iqref", "iqref"),
-            ("施加电压 Vd（码值）", "vd"),
-            ("施加电压 Vq（码值）", "vq"),
+            ("PWM平均施加电压 Vd", "vd"),
+            ("PWM平均施加电压 Vq", "vq"),
             ("实际转速", "speed"), ("转速给定", "speedref"),
             ("估算转矩", "torque"),
         ]
@@ -1145,8 +1878,8 @@ class MonitorPage(QWidget):
             "phase_ib": (self._c_phase_current, "Ib", "A"),
             "iq": (self._c_current, "实际 Iq", "A"),
             "iqref": (self._c_current, "给定 Iq", "A"),
-            "vd": (self._c_voltage, "Vd", "digit"),
-            "vq": (self._c_voltage, "Vq", "digit"),
+            "vd": (self._c_voltage, "Vd", "V"),
+            "vq": (self._c_voltage, "Vq", "V"),
             "speed": (self._c_speed, "实际", "rpm"),
             "speedref": (self._c_speed, "给定", "rpm"),
             "torque": (self._c_torque, "实际", "Nm"),
@@ -1165,6 +1898,10 @@ class MonitorPage(QWidget):
         self._high_rate_samples.clear()
         for buffer in self._high_rate_columns.values():
             buffer.clear()
+        self._rls_capture.clear()
+        self._rls_capture_had_probe = bool(
+            hasattr(self, "_btn_rls_probe") and
+            self._btn_rls_probe.isChecked())
         self._angle_dial.reset()
         for curve in (
                 self._c_speed, self._c_current, self._c_phase_current,
@@ -1177,10 +1914,16 @@ class MonitorPage(QWidget):
             stat.reset()
         self._latest_rls = {}
         self._rls_rx_frames = 0
+        self._last_rls_updates = None
+        self._rls_coeff_dialog.clear()
         self._rls_status.setText(
-            "上位机RLS：0帧｜未收到数据｜点“启动/重置辨识”后启动电机")
+            "上位机RLS：0帧｜在通信页启用辨识档后会自动启动")
         self._rls_status.setStyleSheet("color:#90a4ae;")
         self._last_high_angle_time = 0.0
+        self._speed_f1_source_rate_hz = 0
+        self._speed_f1_decimation_phase = 0
+        self._speed_curve_source = "none"
+        self._f0_speed_pending = False
         self._curves_were_active = False
         if _MP_PG_OK:
             for item_name in (
@@ -1208,6 +1951,61 @@ class MonitorPage(QWidget):
         else:
             self._rls_status.setText("上位机RLS：C++核心不可用，启动失败")
             self._rls_status.setStyleSheet("color:#ff8a80;")
+
+    def _on_toggle_rls_probe(self, checked: bool) -> None:
+        """显式切换真机辨识激励；从不随RLS按钮隐式启用。"""
+        if not self._comm.is_connected():
+            self._btn_rls_probe.blockSignals(True)
+            self._btn_rls_probe.setChecked(not checked)
+            self._btn_rls_probe.blockSignals(False)
+            QMessageBox.warning(self, "无法下发", "请先连接真实F407控制器。")
+            return
+        running = int(getattr(self._comm.latest_frame(), "mc_state", 0)) == 6
+        parts = [f"rls_probe_enabled={1 if checked else 0}"]
+        if checked and not running:
+            parts.extend((
+                f"rls_probe_amplitude_a={self._probe_amplitude.value():.3f}",
+                "rls_probe_chip_divider=8",
+            ))
+        pending_before = self._comm.protocol_status().get("pending_ack", 0)
+        sent = self._comm.send_frame(encode_frame(
+            CMD_SET_PARAMS, ";".join(parts).encode("utf-8")))
+        pending_after = self._comm.protocol_status().get("pending_ack", 0)
+        if not (sent or pending_after > pending_before):
+            self._btn_rls_probe.blockSignals(True)
+            self._btn_rls_probe.setChecked(not checked)
+            self._btn_rls_probe.blockSignals(False)
+            QMessageBox.warning(self, "未发送", "设备未接受辨识激励命令。")
+            return
+        self._btn_rls_probe.setText(
+            "辨识激励：开" if checked else "辨识激励：关")
+        self._probe_amplitude.setEnabled(not checked and not running)
+        if checked:
+            self._rls_capture.clear()
+            self._rls_capture_active = False
+            self._rls_capture_had_probe = False
+            self._comm.start_host_rls()
+            self._rls_status.setText(
+                "真机辨识激励命令已提交；等待固件确认后开始采集，"
+                "确认后请连续运行5～10 s")
+            self._rls_status.setStyleSheet("color:#ffcc80;")
+        else:
+            self._rls_capture_active = False
+            self._rls_status.setText(
+                f"辨识激励已关闭；已冻结 {self._rls_capture.duration_s:.3f} s "
+                "同步数据，可直接分析或保存CSV")
+            self._rls_status.setStyleSheet("color:#ffcc80;")
+
+    def _on_probe_amplitude_edited(self) -> None:
+        """停机时预配置激励幅值；不隐式开启PRBS。"""
+        if (not self._comm.is_connected() or
+                self._btn_rls_probe.isChecked() or
+                int(getattr(self._comm.latest_frame(), "mc_state", 0)) == 6):
+            return
+        payload = (
+            f"rls_probe_amplitude_a={self._probe_amplitude.value():.3f};"
+            "rls_probe_chip_divider=8").encode("utf-8")
+        self._comm.send_frame(encode_frame(CMD_SET_PARAMS, payload))
 
     def _orb_state(self) -> str:
         """由运行状态机和母线状态推导电机背景的故障优先级。"""
@@ -1241,6 +2039,9 @@ class MonitorPage(QWidget):
         for buffer in self._high_rate_columns.values():
             buffer.clear()
         if high_rate:
+            voltage_is_applied = all(bool(sample.get(
+                "applied_voltage_source_direct", False))
+                for sample in high_rate)
             for sample in high_rate:
                 high_columns["angle_deg"].append(float(sample["angle_deg"]))
                 high_columns["speed_rpm"].append(
@@ -1255,9 +2056,15 @@ class MonitorPage(QWidget):
                     float(sample.get("vq_raw", 0.0)))
                 high_columns["vbus_v"].append(
                     float(sample.get("vbus_v", 0.0)))
+                high_columns["vd_applied_v"].append(
+                    float(sample.get("vd_applied_v", 0.0)))
+                high_columns["vq_applied_v"].append(
+                    float(sample.get("vq_applied_v", 0.0)))
             self._high_rate_rate_hz = max(
                 1, int(high_rate[-1].get("rate_hz", 200)))
             self._update_f1_processing_labels(self._high_rate_rate_hz)
+        else:
+            voltage_is_applied = self._high_rate_voltage_is_applied
         high_count = len(high_columns["angle_deg"])
         self._speed_actual.set_value(f.speed_actual)
         self._speed_target.set_value(f.speed_target)
@@ -1335,9 +2142,45 @@ class MonitorPage(QWidget):
                 curve.resume_follow()
         self._curves_were_active = curves_active
         if curves_active:
-            self._c_speed.append(
-                {"实际": f.speed_actual, "给定": f.speed_target},
-                redraw=self._curve_is_active(self._c_speed))
+            speed_values = (high_columns["speed_rpm"]
+                            if len(high_columns["speed_rpm"]) == high_count
+                            else [])
+            f1_speed, speed_rate_hz = self._extract_f1_speed(
+                speed_values, self._high_rate_rate_hz)
+            if f1_speed:
+                if (self._speed_curve_source != "f1" or
+                    (self._c_speed._sample_rate_hz > 0.0 and
+                     abs(self._c_speed._sample_rate_hz - speed_rate_hz) > 0.5)):
+                    # 不允许F0不规则时间轴与F1固定500 Hz时间轴混在同一
+                    # FFT缓冲中；F1档位改变采样率时也重新建立时间基准。
+                    self._c_speed.clear()
+                    self._speed_curve_source = "f1"
+                self._c_speed.set_source_processing(
+                    f"F1连续流携带速度；按测速器500 Hz更新节拍从"
+                    f"{self._high_rate_rate_hz:g} Hz传输流抽取",
+                    speed_rate_hz)
+                self._c_speed.append_columns({
+                    "实际": f1_speed,
+                    # 给定转速来自F0；在F1速度时间轴上作零阶保持，便于
+                    # 时域对照。它不是500 Hz产生的新给定样本。
+                    "给定": [float(f.speed_target)] * len(f1_speed),
+                }, 1.0 / speed_rate_hz,
+                    redraw=self._curve_is_active(self._c_speed))
+                self._f0_speed_pending = False
+            elif (self._f0_speed_pending and
+                  time.time() - self._last_high_angle_time > 1.0):
+                # 串口无F1或仿真模式降级：每个F0帧只写一次，绝不再按
+                # 30 Hz UI定时器重复写入同一个慢遥测值。
+                if self._speed_curve_source != "f0":
+                    self._c_speed.clear()
+                    self._c_speed.reset_sample_rate()
+                    self._speed_curve_source = "f0"
+                self._c_speed.set_source_processing(
+                    "无F1速度，降级为F0常规遥测单帧记录（标称10 Hz）")
+                self._c_speed.append(
+                    {"实际": f.speed_actual, "给定": f.speed_target},
+                    redraw=self._curve_is_active(self._c_speed))
+                self._f0_speed_pending = False
             if high_count:
                 interval_s = 1.0 / max(self._high_rate_rate_hz, 1)
                 self._c_current.append_columns({
@@ -1349,9 +2192,20 @@ class MonitorPage(QWidget):
                     "Ib": high_columns["ib_a"],
                 }, interval_s,
                     redraw=self._curve_is_active(self._c_phase_current))
+                if (voltage_is_applied and
+                        len(high_columns["vd_applied_v"]) == high_count and
+                        len(high_columns["vq_applied_v"]) == high_count):
+                    voltage_d = high_columns["vd_applied_v"]
+                    voltage_q = high_columns["vq_applied_v"]
+                else:
+                    scale = [float(vbus) / (math.sqrt(3.0) * 32768.0)
+                             for vbus in high_columns["vbus_v"]]
+                    voltage_d = [raw * factor for raw, factor in zip(
+                        high_columns["vd_raw"], scale)]
+                    voltage_q = [raw * factor for raw, factor in zip(
+                        high_columns["vq_raw"], scale)]
                 self._c_voltage.append_columns({
-                    "Vd": high_columns["vd_raw"],
-                    "Vq": high_columns["vq_raw"],
+                    "Vd": voltage_d, "Vq": voltage_q,
                 }, interval_s, redraw=self._curve_is_active(self._c_voltage))
             else:
                 self._c_current.append(
@@ -1456,10 +2310,12 @@ class MonitorPage(QWidget):
         return bytes(buf.data())
 
     def _save_all_curves(self) -> None:
-        from PySide6.QtWidgets import QMessageBox
-        png = self.render_waveforms_png()
-        if not png:
-            QMessageBox.warning(self, "提示", "暂无波形数据（或未安装 pyqtgraph）")
+        if self._save_worker is not None and self._save_worker.isRunning():
+            QMessageBox.information(self, "正在保存", "上一份波形数据仍在后台写盘。")
+            return
+        if not any(len(item["times"])
+                   for item in self._curve_csv_snapshot()):
+            QMessageBox.warning(self, "提示", "暂无波形数据")
             return
         mode = (self._ctrl._current_mode()
                 if self._ctrl is not None and hasattr(self._ctrl, "_current_mode")
@@ -1474,18 +2330,62 @@ class MonitorPage(QWidget):
         if not path:
             record_dir.rmdir()
             return
-        with open(path, "wb") as f:
-            f.write(png)
+        # Qt/pyqtgraph 的离屏渲染必须在 GUI 线程完成；其余大文件
+        # 写盘全部移交工作线程。
+        png = self.render_waveforms_png()
+        if not png:
+            QMessageBox.warning(self, "提示", "无法渲染波形图（或未安装 pyqtgraph）")
+            return
         csv_path = os.path.join(os.path.dirname(path), "原始数据.csv")
-        self._write_curves_csv(csv_path)
+        rls_csv_path = os.path.join(
+            os.path.dirname(path), "RLS辨识数据.csv")
+        curve_snapshot = self._curve_csv_snapshot()
+        rls_snapshot = self._rls_capture.snapshot()
+        self._save_worker = _WaveformSaveWorker(
+            path, png, csv_path, curve_snapshot, rls_csv_path,
+            rls_snapshot, self)
+        self._save_worker.completed.connect(self._on_waveform_save_complete)
+        self._btn_save_all.setEnabled(False)
+        self._btn_save_all.setText("后台保存中…")
+        self._datasrc_label.setText("[ 波形正在后台写盘 ]")
+        self._datasrc_label.setStyleSheet(
+            "color:#ffcc80; font-weight:bold;")
+        self._save_worker.start()
+
+    def _on_waveform_save_complete(self, result: dict) -> None:
+        self._btn_save_all.setEnabled(True)
+        self._btn_save_all.setText("保存所有波形")
+        error = str(result.get("error", ""))
+        if error:
+            self._datasrc_label.setText("[ 波形保存失败 ]")
+            self._datasrc_label.setStyleSheet(
+                "color:#ff8a80; font-weight:bold;")
+            QMessageBox.warning(self, "保存失败", error)
+            return
+        path = str(result["png_path"])
+        csv_path = str(result["csv_path"])
+        rls_csv_path = str(result["rls_csv_path"])
+        self._datasrc_label.setText("[ 波形后台保存完成 ]")
+        self._datasrc_label.setStyleSheet(
+            "color:#69f0ae; font-weight:bold;")
+        rls_note = (
+            f"离线RLS：{os.path.basename(rls_csv_path)}\n"
+            f"  {int(result['rls_count'])} 点 / "
+            f"{float(result['rls_duration_s']):.3f} s"
+            if result.get("rls_exported") else
+            "离线RLS：未收到含电压和母线电压的同步F1帧")
         QMessageBox.information(
             self, "保存成功",
             f"本次实验已独立保存到：\n{os.path.dirname(path)}\n\n"
             f"波形图：{os.path.basename(path)}\n"
-            f"原始数据：{os.path.basename(csv_path)}")
+            f"原始数据：{os.path.basename(csv_path)}\n{rls_note}")
 
-    def _write_curves_csv(self, path: str) -> None:
-        """按原始采样时间导出所有曲线，不对不同采样率做伪对齐。"""
+    def _write_rls_capture_csv(self, path: str) -> None:
+        """导出可由 C++ RLS 逐帧重放的对齐宽表。"""
+        self._rls_capture.write_csv(path)
+
+    def _curve_csv_snapshot(self) -> list[dict]:
+        """在 GUI 线程快速固化曲线，供后台写盘。"""
         curves = [
             (self._c_speed, "speed"),
             (self._c_current, "iq_current"),
@@ -1498,31 +2398,30 @@ class MonitorPage(QWidget):
             (self._c_position_state, "position_state"),
             (self._c_voltage, "applied_voltage"),
             (self._c_rls_a1, "rls_a1"),
-            (self._c_rls_L, "rls_inductance_mh"),
-            (self._c_rls_R, "rls_resistance_ohm"),
+            (self._c_rls_L, "rls_own_b0_a_per_v"),
+            (self._c_rls_R, "rls_own_b1_a_per_v"),
+            (self._rls_coeff_dialog._d_curve, "rls_theta_d"),
+            (self._rls_coeff_dialog._q_curve, "rls_theta_q"),
         ]
-        with open(path, "w", newline="", encoding="utf-8-sig") as stream:
-            writer = csv.writer(stream)
-            writer.writerow([
-                "channel", "time_s", "series", "value", "sampling_rate_hz",
-                "source_filter", "display_filter", "unit",
-            ])
-            for curve, channel in curves:
-                times = list(curve._times)
-                snapshot_meta = curve.raw_snapshot(next(iter(curve._buffers)))
-                sample_rate_hz = float(snapshot_meta["sample_rate_hz"])
-                source_filter = str(snapshot_meta["source_processing"])
-                display_filter = str(snapshot_meta["display_filter"])
-                for series, values in curve._buffers.items():
-                    samples = list(values)
-                    sample_times = times[-len(samples):] if samples else []
-                    for timestamp, value in zip(sample_times, samples):
-                        writer.writerow([
-                            channel, f"{timestamp:.6f}", series,
-                            f"{float(value):.9g}",
-                            f"{sample_rate_hz:.9g}" if sample_rate_hz > 0 else "",
-                            source_filter, display_filter, curve._y_label,
-                        ])
+        snapshot = []
+        for curve, channel in curves:
+            snapshot_meta = curve.raw_snapshot(next(iter(curve._buffers)))
+            snapshot.append({
+                "channel": channel,
+                "times": tuple(curve._times),
+                "series": tuple(
+                    (series, tuple(values))
+                    for series, values in curve._buffers.items()),
+                "sampling_rate_hz": float(snapshot_meta["sample_rate_hz"]),
+                "source_filter": str(snapshot_meta["source_processing"]),
+                "display_filter": str(snapshot_meta["display_filter"]),
+                "unit": curve._y_label,
+            })
+        return snapshot
+
+    def _write_curves_csv(self, path: str) -> None:
+        """按原始采样时间导出所有曲线，不对不同采样率做伪对齐。"""
+        _write_curve_csv_snapshot(path, self._curve_csv_snapshot())
 
     def _on_set_speed(self) -> None:
         """在 READY 预设目标，或在 RUNNING 在线修改目标。"""

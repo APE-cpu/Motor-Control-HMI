@@ -14,18 +14,32 @@ namespace motor_core {
 
 struct F1Sample {
     std::uint32_t tick_ms = 0;
+    std::uint16_t sample_sequence = 0;
     std::uint32_t rate_hz = 1000;
     double angle_deg = 0.0;
+    double actuation_angle_deg = 0.0;
     double speed_rpm = 0.0;
     double iq_a = 0.0;
+    double id_a = 0.0;
     double iqref_a = 0.0;
+    double idref_a = 0.0;
     double ia_a = 0.0;
     double ib_a = 0.0;
     double vd_raw = 0.0;
     double vq_raw = 0.0;
     double vbus_v = 0.0;
+    double vdda_v = 0.0;
+    std::uint16_t duty_a = 0;
+    std::uint16_t duty_b = 0;
+    std::uint16_t duty_c = 0;
+    double vd_applied_v = 0.0;
+    double vq_applied_v = 0.0;
     bool has_phase_current = false;
+    bool has_sample_sequence = false;
+    bool has_direct_dq_current = false;
     bool has_voltage = false;
+    bool has_vdda = false;
+    bool has_applied_voltage = false;
 };
 
 struct BurstCapture {
@@ -66,6 +80,8 @@ struct F3Sample {
     double innov_rms_a = 0.0;
     double innov_rms_digit = 0.0;
     double p_trace = 0.0;
+    double id_hat_a = 0.0;
+    double iq_hat_a = 0.0;
     std::array<float, 7> theta_d{};
     std::array<float, 7> theta_q{};
     double a1_d = 0.0;

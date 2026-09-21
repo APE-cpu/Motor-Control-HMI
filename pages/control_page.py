@@ -98,6 +98,9 @@ _FIRMWARE_RUNTIME_KEYS = (
     "current_filter_enabled",
     "current_filter_alpha_q15",
     "speed_fifo_depth",
+    "rls_probe_enabled",
+    "rls_probe_amplitude_a",
+    "rls_probe_chip_divider",
 )
 _TELEMETRY_FRESH_S = 1.5
 _CURRENT_LOOP_SAMPLE_RATE_HZ = 16000.0

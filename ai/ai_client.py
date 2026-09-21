@@ -19,7 +19,7 @@ class AIClient:
                 "Content-Type": "application/json",
                 "Accept": "application/json, text/event-stream",
                 "Authorization": f"Bearer {self.api_key}",
-                "User-Agent": "MotorControlHMI/1.9.1 (OpenAI-compatible client)",
+                "User-Agent": "MotorControlHMI/2.0.0 (OpenAI-compatible client)",
             },
             method="POST",
         )

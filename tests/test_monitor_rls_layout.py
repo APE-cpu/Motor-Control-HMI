@@ -52,14 +52,14 @@ def test_RLS曲线在现有页面高度内自适应而不撑高页面():
     scroll.close()
 
 
-def test_RLS原始系数失效时三组曲线整帧拒绝():
+def test_RLS原始系数出现NaN时三组曲线整帧拒绝():
     page = MonitorPage(CommManager())
     sample = _valid_sample()
     sample.update({
-        "a1_d": -5.2e11,
-        "b_dd0_si": -3.1e11,
-        "p_trace": 0.0,
-        "theta_d": (-5.2e11, 1.0, 1.0, -3.1e11, 1.0, 0.0, 0.0),
+        "a1_d": float("nan"),
+        "b_dd0_si": float("nan"),
+        "p_trace": float("nan"),
+        "theta_d": (float("nan"), 1.0, 1.0, -3.1e11, 1.0, 0.0, 0.0),
     })
 
     page._on_rls_coeff(sample)
@@ -80,7 +80,18 @@ def test_RLS有效帧三组曲线同步追加():
     assert len(page._c_rls_a1._times) == 1
     assert len(page._c_rls_L._times) == 1
     assert len(page._c_rls_R._times) == 1
-    assert "有效：无" in page._rls_status.text()
+    assert "模型同构数值有效（不代表物理R/L收敛）：ARX摘要可计算" in page._rls_status.text()
+    assert "#ffb74d" in page._rls_status.styleSheet()
+    page.close()
+
+
+def test_RLS更新计数不变时明示保持而非假装收敛():
+    page = MonitorPage(CommManager())
+    page._on_rls_coeff(_valid_sample())
+    page._on_rls_coeff(_valid_sample())
+
+    assert "递推：保持" in page._rls_status.text()
+    assert "未收到新递推" in page._rls_status.text()
     page.close()
 
 
@@ -99,4 +110,77 @@ def test_RLS三阶曲线显示分母系数和而非误导性单一a1():
     assert abs(page._c_rls_a1._buffers["Σa_d"][-1] - 0.94) < 1e-12
     assert abs(page._c_rls_a1._buffers["Σa_q"][-1] - 0.93) < 1e-12
     assert "Σa=0.94/0.93" in page._rls_status.text()
+    page.close()
+
+
+def test_RLS不再把数值投影到旧物理边界():
+    page = MonitorPage(CommManager())
+    sample = _valid_sample()
+    sample.update({"ld_mh": 0.05, "lq_mh": 0.0501254})
+
+    page._on_rls_coeff(sample)
+
+    assert "约束饱和" not in page._rls_status.text()
+    assert "Lnom=0.66mH/ωo=4000/1拍电压延迟→ARX(3)" in \
+        page._rls_status.text()
+    assert "#ffb74d" in page._rls_status.styleSheet()
+    assert len(page._c_rls_a1._times) == 1
+    assert len(page._c_rls_L._times) == 1
+    assert len(page._c_rls_R._times) == 1
+    assert page._c_rls_L._buffers["b0_d"][-1] == 0.08
+    assert "不代表物理R/L收敛" in page._rls_status.text()
+    page.close()
+
+
+def test_RLS完整系数弹窗保留dq各7条原始波形():
+    page = MonitorPage(CommManager())
+
+    page._on_rls_coeff(_valid_sample())
+
+    dialog = page._rls_coeff_dialog
+    assert len(dialog._d_curve._buffers) == 7
+    assert len(dialog._q_curve._buffers) == 7
+    assert all(len(values) == 1 for values in dialog._d_curve._buffers.values())
+    assert all(len(values) == 1 for values in dialog._q_curve._buffers.values())
+    page._show_rls_coefficients()
+    assert dialog.isVisible()
+    dialog.close()
+    page.close()
+
+
+def test_离线辨识入口位于RLS标签页且不增加主页高度():
+    page = MonitorPage(CommManager())
+
+    assert page._btn_offline_rls.text() == "离线辨识 CSV…"
+    assert page._offline_rls_dialog.isWindow()
+    assert "真机匹配ESO" in page._offline_rls_dialog.windowTitle()
+    assert "Lnom=0.66mH" in page._offline_rls_dialog._status.text()
+    assert "F1/40" in page._offline_rls_dialog._status.text()
+    assert set(page._offline_rls_dialog._c_id._buffers) == {
+        "原始 id", "ESO id_hat"}
+    assert set(page._offline_rls_dialog._c_iq._buffers) == {
+        "原始 iq", "ESO iq_hat"}
+    assert page.sizeHint().height() < 900
+    page.close()
+
+
+def test_离线RLS数值稳定但激励不足时不得标为物理收敛():
+    page = MonitorPage(CommManager())
+    dialog = page._offline_rls_dialog
+    dialog._complete(
+        {"count": 16000, "rate_hz": 16000},
+        {
+            "results": [_valid_sample()],
+            "trace": {},
+            "diagnostics": {
+                "verdict": "not_identifiable",
+                "reasons": ["d轴激励不足", "q轴电流与转速共线"],
+            },
+        },
+        "",
+    )
+
+    assert "数值稳定不等于物理收敛" in dialog._status.text()
+    assert "d轴激励不足" in dialog._status.text()
+    assert "#ffb74d" in dialog._status.styleSheet()
     page.close()

@@ -3,9 +3,28 @@
 运行方式：python main.py [--no-training]
   --no-training  隐藏模型训练页
 打包 exe 中若未打入 torch（lite 包），训练页自动隐藏。
+
 """
 import importlib.util
+from pathlib import Path
 import sys
+
+
+def _print_runtime_check() -> None:
+    """Headless diagnostic used by launchers and installation checks."""
+    import motor_core_cpp
+
+    print(f"python={Path(sys.executable).resolve()}")
+    print(f"motor_core_cpp={Path(motor_core_cpp.__file__).resolve()}")
+    print(
+        "telemetry_schema_version="
+        f"{int(getattr(motor_core_cpp, 'telemetry_schema_version', 0))}")
+
+
+if __name__ == "__main__":
+    if "--runtime-check" in sys.argv:
+        _print_runtime_check()
+        raise SystemExit(0)
 
 # 强制 stdout/stderr 使用 UTF-8，避免第三方库输出 emoji 时 GBK 报错
 if hasattr(sys.stdout, "reconfigure"):
@@ -33,10 +52,9 @@ class _WheelValueGuard(QObject):
 def _training_enabled() -> bool:
     if "--no-training" in sys.argv:
         return False
-    if getattr(sys, "frozen", False):
-        # lite 打包排除了 torch，此时训练页无法工作，自动隐藏
-        return importlib.util.find_spec("torch") is not None
-    return True
+    # lite 打包或精简开发环境可能没有 torch；此时训练页自动隐藏，
+    # 其余监控、控制、辨识功能仍可正常启动。
+    return importlib.util.find_spec("torch") is not None
 
 
 def main() -> int:

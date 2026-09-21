@@ -56,6 +56,48 @@ J = Σ(T·dω/dt) / Σ(dω/dt)²</p>
 <li>滑行段要有足够的降速采样点（默认至少 3 点），转速点 2 取高些能拉长滑行曲线</li>
 <li>ψf / 极对数填错会等比例地缩放 Kt，进而系统性地偏移 B/Tc/J——务必用准确的铭牌值</li>
 </ul>
+
+<hr>
+<h2>电气参数 R / L / ψf 的离线辨识</h2>
+<p>参数辨识页的“电气参数”标签使用两条彼此独立的链路，避免把数值收敛误认为
+物理参数正确。</p>
+
+<h3>链路一：dq 电压方程</h3>
+<p style="font-family: Consolas, monospace; background-color:#10131a; padding:8px;">
+ud = R·id + L·(did/dt − ωe·iq) − ωe·ψq<br>
+uq = R·iq + L·(diq/dt + ωe·id) + ωe·ψd</p>
+<p>旧格式 CSV 缺少独立 d/q 激励，只能在表贴式电机假设下求一个共享 L；
+程序对 50/100/200 ms 三种时间块以及 0/5 s 两个起点分别拟合，显示中位数和范围。
+新版带直接 Id/IdRef、连续样本序号及独立 PRBS 的数据则走闭环工具变量验证。</p>
+
+<h3>链路二：七参数 ARX 的低频投影</h3>
+<p style="font-family: Consolas, monospace; background-color:#10131a; padding:8px;">
+H(q)=(b0·q+b1·q²)/(1−a1·q−a2·q²−a3·q³)<br>
+Req=(1−a1−a2−a3)/(b0+b1)<br>
+Leq=Req·Ts·[(b0+2b1)/(b0+b1)+(a1+2a2+3a3)/(1−a1−a2−a3)]</p>
+<p>该投影保持直流增益和一阶矩；对原始一阶离散模型会退化为
+R=(1−a1)/b0、L=Ts/b0。它只能作为等效 R/L 校验，不能证明一般双输入
+ARX(3)与真实 PMSM 参数一一对应。</p>
+
+<h3>为什么七参数不能推出磁链</h3>
+<p>七个回归量只有三拍电流历史和 d/q 两轴的两拍延迟电压，里面没有
+ωe、反电动势、常数项或 ESO 扰动状态。磁链只通过 ωe·ψf 进入电压方程，
+因此从这七个系数中不能唯一恢复 ψf。界面会明确显示“不可辨识”，不会用假设值
+补出一个看似收敛的磁链。</p>
+<p>当速度环升速数据近似满足 ωe≈κ·iq+c 时，q轴方程</p>
+<p style="font-family: Consolas, monospace; background-color:#10131a; padding:8px;">
+uq = R·iq + L·diq/dt + ωe·ψf<br>
+≈ (R+κ·ψf)·iq + L·diq/dt + c·ψf</p>
+<p>如果回归器没有显式 ωe 项，ARX 会把 κ·ψf 当成附加电阻，因而
+Req≈R+κ·ψf；在一阶模型中表现为 a1 被污染，在当前三阶模型中则分散到
+a1/a2/a3，其低频等效量是 Σa。参数页会用实测 dωe/diq 检查这个关系。</p>
+
+<h3>可信度规则</h3>
+<ul>
+<li>ARX 投影出现负电感、非正电阻或直流奇点：投影无效</li>
+<li>ARX 等效 R/L 与独立 dq/PRBS 结果超出容差：交叉校验不通过</li>
+<li>即使 R/L 一致，磁链仍须由 dq 电压方程或反电动势实验获得</li>
+</ul>
 """
 
 

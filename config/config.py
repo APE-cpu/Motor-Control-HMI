@@ -210,6 +210,13 @@ TELEM_LEN_CAN = struct.calcsize(TELEM_FMT_CAN)  # = 8
 
 # 缩放系数
 TELEM_CURRENT_SCALE = 100.0   # mA → A
+# MCSDK current digit uses the left-aligned 16-bit ADC domain.  Keep the
+# physical hardware constants explicit so identification does not inherit the
+# older rounded 0.000629 A/digit approximation.
+F1_CURRENT_A_PER_DIGIT = 3.30 / (65536.0 * 0.01000 * 8.00)
+# Must match the generated firmware power_stage_parameters.h definition.
+# The bus ADC is ground-referenced: Vadc = Vbus * factor.
+F1_VBUS_PARTITION_FACTOR = 0.0270
 TELEM_ANGLE_SCALE = 100.0     # 0.01° → °
 TELEM_TEMP_OFFSET = 40.0      # int8 + 40 → °C
 TELEM_TORQUE_FROM_CURRENT = 0.05   # current(A) × 系数 ≈ torque(Nm)，原型估算用
