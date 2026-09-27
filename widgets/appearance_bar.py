@@ -1,7 +1,7 @@
 """Brand title and visible appearance controls."""
 from PySide6.QtCore import Qt, QSignalBlocker
 from PySide6.QtGui import QPainter, QPixmap, QColor
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QComboBox
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QComboBox, QCheckBox
 
 from runtime_paths import resource_path
 from ui_theme import (APP_NAME, APP_SUBTITLE, THEMES,
@@ -44,6 +44,9 @@ class AppearanceBar(QWidget):
         layout.addWidget(subtitle)
         layout.addStretch()
         manager = appearance_manager()
+        self.diagnostic_toggle = QCheckBox("右侧诊断助手")
+        self.diagnostic_toggle.setToolTip("启用或关闭右侧聊天栏")
+        layout.addWidget(self.diagnostic_toggle)
         layout.addWidget(QLabel("配色"))
         self.theme_combo = QComboBox()
         self.theme_combo.setAccessibleName("界面配色")

@@ -1,9 +1,7 @@
 """装饰层不能挤占内容、阻挡输入或遗留后台动画。"""
 from PySide6.QtCore import QAbstractAnimation, Qt
-from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication, QLabel, QVBoxLayout, QWidget
 from widgets.page_artwork import IllustratedPageFrame
-from runtime_paths import resource_path
 
 
 def test_background_overlaps_full_page_and_preserves_title():
@@ -25,31 +23,29 @@ def test_background_overlaps_full_page_and_preserves_title():
         frame.close()
 
 
-def test_real_sprite_alpha_and_animation_lifecycle():
+def test_structure_pages_keep_plots_opaque_across_themes():
+    import pyqtgraph as pg
+    from ui_theme import appearance_manager, THEMES
     app = QApplication.instance()
-    atlas = QImage(str(resource_path("assets", "page_art", "motor_parts.png")))
-    assert not atlas.isNull() and atlas.hasAlphaChannel()
-    assert atlas.pixelColor(0, 0).alpha() == 0
-    assert atlas.pixelColor(atlas.width() // 2 - 1, atlas.height() // 2 - 1).alpha() == 0
-    frame = IllustratedPageFrame(QWidget(), "twin")
+    manager = appearance_manager()
+    original = manager.theme_id
+    page = QWidget()
+    plot = pg.PlotWidget()
+    QVBoxLayout(page).addWidget(plot)
+    frame = IllustratedPageFrame(page, "vector")
     frame.resize(1100, 740)
     frame.show()
     app.processEvents()
-    art = frame.artwork
     try:
-        art.start_transition("vector")
-        assert art._animation.state() == QAbstractAnimation.Running
-        assert len(art._parts) == 4
-        initial, opened, assembled = (art.part_poses(t) for t in (0, .4, .82))
-        assert opened[3][0] - opened[0][0] > initial[3][0] - initial[0][0]
-        assert assembled == initial
-        art._animation.setCurrentTime(art.DURATION_MS)
-        assert art._animation.state() == QAbstractAnimation.Stopped
-        assert art._progress == 1.0
-        art.start_transition("identify")
-        frame.hide()
-        app.processEvents()
-        assert art._animation.state() == QAbstractAnimation.Stopped
-        assert art._progress == 1.0
+        assert not frame.artwork._image.isNull()
+        assert not frame.artwork.findChildren(QAbstractAnimation)
+        for key, theme in THEMES.items():
+            manager.apply_theme(key, persist=False)
+            manager.style_root(page)
+            app.processEvents()
+            color = plot.backgroundBrush().color()
+            assert color.alpha() == 255
+            assert color.name() == theme.field
     finally:
         frame.close()
+        manager.apply_theme(original, persist=False)

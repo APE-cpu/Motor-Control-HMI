@@ -1,5 +1,6 @@
 """主窗口：左侧导航 + 右侧 QStackedWidget。"""
 from collections.abc import Callable
+import os
 
 from PySide6.QtCore import (
     Qt, QParallelAnimationGroup, QPropertyAnimation, QEasingCurve,
@@ -14,6 +15,7 @@ from PySide6.QtWidgets import (
     QScrollArea,
     QStackedWidget,
     QStatusBar,
+    QSplitter,
     QWidget,
 )
 
@@ -35,6 +37,7 @@ from pages.frequency_response_page import FrequencyResponsePage
 from widgets.side_nav import SideNav
 from widgets.appearance_bar import AppearanceBar
 from widgets.page_artwork import IllustratedPageFrame
+from widgets.diagnostic_sidebar import DiagnosticSidebar
 from ui_theme import APP_NAME, APP_SUBTITLE, appearance_manager
 from communications.comm_manager import CommManager, decode_motor_fault_code
 from logs.operation_logger import logger
@@ -101,6 +104,8 @@ class MainWindow(QMainWindow):
         self._startup_done = 0
         self._startup_total = 17 if enable_training else 16
         self.setWindowTitle(f"{APP_NAME} · {APP_SUBTITLE} v{APP_VERSION}")
+        if tree_name := os.environ.get("YUHENG_WORKTREE"):
+            self.setWindowTitle(f"{self.windowTitle()} [{tree_name}]")
         self.resize(1280, 800)
 
         # 通信管理器：所有页面共享同一个通信会话
@@ -230,8 +235,27 @@ class MainWindow(QMainWindow):
 
         self._startup_step("组装主界面")
         layout.addWidget(self.nav)
-        layout.addWidget(self.stack, 1)
+        self.work_area = QSplitter(Qt.Horizontal)
+        self.work_area.setChildrenCollapsible(False)
+        self.work_area.addWidget(self.stack)
+        self.diagnostic_sidebar = DiagnosticSidebar(self.ai_page)
+        self.work_area.addWidget(self.diagnostic_sidebar)
+        self.work_area.setStretchFactor(0, 1)
+        self.work_area.setStretchFactor(1, 0)
+        self.work_area.setSizes([1000, 350])
+        layout.addWidget(self.work_area, 1)
         self.setCentralWidget(central)
+
+        self.diagnostic_sidebar.closeRequested.connect(
+            lambda: self.appearance_bar.diagnostic_toggle.setChecked(False))
+        self.diagnostic_sidebar.settingsRequested.connect(
+            lambda: self.nav.select_page(self.stack.indexOf(self.ai_page)))
+        self.appearance_bar.diagnostic_toggle.toggled.connect(self._set_diagnostic_sidebar)
+        self.stack.currentChanged.connect(self._sync_diagnostic_sidebar)
+        sidebar_enabled = appearance_manager().settings.value(
+            "diagnostic/sidebar_enabled", False, type=bool)
+        self.appearance_bar.diagnostic_toggle.setChecked(sidebar_enabled)
+        self._sync_diagnostic_sidebar()
 
         self.nav.currentIndexChanged.connect(self._switch_page)
         self.nav.select_page(0)
@@ -255,6 +279,21 @@ class MainWindow(QMainWindow):
                        self.stack.currentWidget()):
             if widget is not None:
                 appearance.style_root(widget)
+        if self.diagnostic_sidebar.isVisible():
+            appearance.style_root(self.diagnostic_sidebar)
+
+    def _set_diagnostic_sidebar(self, enabled: bool) -> None:
+        settings = appearance_manager().settings
+        settings.setValue("diagnostic/sidebar_enabled", enabled)
+        settings.sync()
+        self._sync_diagnostic_sidebar()
+
+    def _sync_diagnostic_sidebar(self, *_args) -> None:
+        visible = (self.appearance_bar.diagnostic_toggle.isChecked()
+                   and self.stack.currentWidget() is not self.ai_page)
+        self.diagnostic_sidebar.setVisible(visible)
+        if visible:
+            appearance_manager().style_root(self.diagnostic_sidebar)
 
     def _startup_step(self, label: str) -> None:
         if self._startup_progress is not None:
@@ -266,8 +305,6 @@ class MainWindow(QMainWindow):
 
     def _clear_page_transition(self) -> None:
         """停止并拆除页面过渡，保证窗口关闭时不残留 Qt 动画回调。"""
-        for artwork_frame in self.stack.findChildren(IllustratedPageFrame):
-            artwork_frame.artwork.stop_transition()
         for name in ("_page_transition_group", "_page_fade_in"):
             animation = getattr(self, name, None)
             if animation is not None:
@@ -306,15 +343,9 @@ class MainWindow(QMainWindow):
         # 快速连点时先完整清理上一场未完成的过渡。
         self._clear_page_transition()
 
-        # 机械插图页只让底层零件重组，控件和读数保持稳定。
-        frame = next_page.parentWidget() if next_page is not None else None
-        if isinstance(frame, IllustratedPageFrame):
-            previous = self.stack.currentWidget()
-            previous_frame = previous.parentWidget() if previous is not None else None
-            source_key = (previous_frame.artwork.key
-                          if isinstance(previous_frame, IllustratedPageFrame) else None)
+        # 插图页直接切换，波形及读数不参与装饰动画。
+        if next_page is not None and isinstance(next_page.parentWidget(), IllustratedPageFrame):
             self.stack.setCurrentIndex(index)
-            frame.artwork.start_transition(source_key)
             return
 
         # ResponsiveStack 对外返回内容页；这里需要直接取得实际承载的
