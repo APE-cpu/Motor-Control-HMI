@@ -219,7 +219,12 @@ F1_CURRENT_A_PER_DIGIT = 3.30 / (65536.0 * 0.01000 * 8.00)
 F1_VBUS_PARTITION_FACTOR = 0.0270
 TELEM_ANGLE_SCALE = 100.0     # 0.01° → °
 TELEM_TEMP_OFFSET = 40.0      # int8 + 40 → °C
-TELEM_TORQUE_FROM_CURRENT = 0.05   # current(A) × 系数 ≈ torque(Nm)，原型估算用
+# 电磁转矩常数 Kt（N·m/A）：下位机不测转矩，上位机统一按 Te = Kt·Iq 计算。
+# 0.035 与 F407 固件注释一致（按反电动势 3.0 V/krpm 线电压有效值推得）；
+# 铭牌 2.95 V/krpm 若为相电压峰值则应为 1.5·p·ψf ≈ 0.0423。
+# 待反电动势实测（空载拖动，测线电压）确认后在此修改。
+TORQUE_CONSTANT_NM_PER_A = 0.035
+TELEM_TORQUE_FROM_CURRENT = TORQUE_CONSTANT_NM_PER_A   # 旧名兼容
 
 
 # ============ 位置传感器参数 ============

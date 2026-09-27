@@ -10,7 +10,7 @@ import math
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSignalBlocker
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox,
@@ -421,9 +421,11 @@ class FourierAnalysisPage(QWidget):
         self._snapshot_provider = snapshot_provider
         self._loaded_sources: dict[str, dict] = {}
         self._source_items = source_items or []
+        self._signal_entries: list[dict] = []
         self._order_lms_dialog = None
         self._updating_selection_region = False
         self._last_result = None
+        self._harmonic_hz = {"speed": 0.0, "angle": 0.0}
 
         root = QVBoxLayout(self)
         title = QLabel("离线傅里叶分析")
@@ -437,13 +439,37 @@ class FourierAnalysisPage(QWidget):
         intro.setWordWrap(True)
         root.addWidget(intro)
 
+        # 来源、文件、类别、信号逐级筛选，避免所有 CSV 列堆在一个菜单里。
+        source_row = QHBoxLayout()
+        source_row.addWidget(QLabel("数据来源"))
+        self._source_combo = QComboBox()
+        self._source_combo.addItem("实机数据", "live")
+        self._source_combo.addItem("CSV数据", "loaded")
+        source_row.addWidget(self._source_combo)
+        self._file_label = QLabel("文件")
+        self._file_combo = QComboBox()
+        source_row.addWidget(self._file_label)
+        source_row.addWidget(self._file_combo)
+        source_row.addWidget(QLabel("类别"))
+        self._category_combo = QComboBox()
+        source_row.addWidget(self._category_combo)
+        source_row.addWidget(QLabel("信号"))
+        self._signal_combo = QComboBox()
+        source_row.addWidget(self._signal_combo, 2)
+        root.addLayout(source_row)
+        for label, key in self._source_items:
+            self._signal_entries.append({
+                "source": "live", "file": "", "category":
+                self._signal_category(key, label), "label": label,
+                "token": ("live", key),
+            })
+        self._source_combo.currentIndexChanged.connect(self._refresh_categories)
+        self._file_combo.currentIndexChanged.connect(self._refresh_categories)
+        self._category_combo.currentIndexChanged.connect(self._refresh_signals)
+        self._refresh_categories()
+
         controls = QGroupBox("分析设置")
         grid = QGridLayout(controls)
-        grid.addWidget(QLabel("信号"), 0, 0)
-        self._signal_combo = QComboBox()
-        for label, key in self._source_items:
-            self._signal_combo.addItem(label, ("live", key))
-        grid.addWidget(self._signal_combo, 0, 1)
 
         grid.addWidget(QLabel("窗函数"), 0, 2)
         self._window_combo = QComboBox()
@@ -494,6 +520,33 @@ class FourierAnalysisPage(QWidget):
         self._use_plot_interval.setToolTip(
             "拖动时域图中蓝色区域或两侧边界，松开后自动按该区间重新计算FFT")
         grid.addWidget(self._use_plot_interval, 3, 2, 1, 2)
+        self._show_speed_harmonics = QCheckBox("转速倍频竖线")
+        self._show_speed_harmonics.setChecked(False)
+        self._show_speed_harmonics.setToolTip(
+            "按当前FFT区间内同一来源的实际转速计算 rpm/60；显示1倍至选定倍数")
+        self._speed_harmonic_order = QSpinBox()
+        self._speed_harmonic_order.setRange(1, 100000)
+        self._speed_harmonic_order.setValue(3)
+        self._speed_harmonic_order.setSuffix(" 倍")
+        self._speed_harmonic_order.setToolTip("转速标线显示到第几倍频；分析后按频谱显示上限自动限制")
+        self._show_angle_harmonics = QCheckBox("电角度倍频竖线")
+        self._show_angle_harmonics.setChecked(False)
+        self._show_angle_harmonics.setToolTip(
+            "按当前FFT区间内的高速电角度展开斜率估算电频率；显示1倍至选定倍数")
+        self._angle_harmonic_order = QSpinBox()
+        self._angle_harmonic_order.setRange(1, 100000)
+        self._angle_harmonic_order.setValue(3)
+        self._angle_harmonic_order.setSuffix(" 倍")
+        self._angle_harmonic_order.setToolTip("电角度标线显示到第几倍频；分析后按频谱显示上限自动限制")
+        self._show_speed_harmonics.toggled.connect(self._on_harmonic_toggle)
+        self._show_angle_harmonics.toggled.connect(self._on_harmonic_toggle)
+        self._speed_harmonic_order.valueChanged.connect(self._update_harmonic_visibility)
+        self._angle_harmonic_order.valueChanged.connect(self._update_harmonic_visibility)
+        self._max_freq.valueChanged.connect(self._on_harmonic_toggle)
+        grid.addWidget(self._show_speed_harmonics, 4, 0)
+        grid.addWidget(self._speed_harmonic_order, 4, 1)
+        grid.addWidget(self._show_angle_harmonics, 4, 2)
+        grid.addWidget(self._angle_harmonic_order, 4, 3)
         self._points_combo.currentIndexChanged.connect(
             self._disable_custom_interval)
         self._signal_combo.currentIndexChanged.connect(
@@ -516,7 +569,7 @@ class FourierAnalysisPage(QWidget):
         self._order_lms_btn.clicked.connect(self._open_order_lms)
         buttons.addWidget(self._order_lms_btn)
         buttons.addStretch(1)
-        grid.addLayout(buttons, 4, 0, 1, 4)
+        grid.addLayout(buttons, 5, 0, 1, 4)
         root.addWidget(controls)
 
         metrics = QGroupBox("分析结果")
@@ -580,6 +633,10 @@ class FourierAnalysisPage(QWidget):
                 size=7, pen=pg.mkPen("#ffcc80"),
                 brush=pg.mkBrush("#ff8f00"))
             self._plot.addItem(self._peak_markers)
+            self._harmonic_lines = {}
+            for kind in ("speed", "angle"):
+                for order in (1, 2, 3):
+                    self._add_harmonic_line(kind, order)
             self._peak_text_items = []
             root.addWidget(self._plot_container, 1)
         else:
@@ -599,6 +656,64 @@ class FourierAnalysisPage(QWidget):
         self._detail.setStyleSheet("color:#90a4ae; font-size:11px;")
         self._detail.setWordWrap(True)
         root.addWidget(self._detail)
+
+    @staticmethod
+    def _signal_category(key: str, label: str = "") -> str:
+        token = f"{key} {label}".lower()
+        if any(part in token for part in (
+                "speed", "转速", "rpm")):
+            return "转速"
+        if any(part in token for part in (
+                "angle", "角度", "位置", "θ")):
+            return "角度"
+        if any(part in token for part in (
+                "voltage", "vd", "vq", "v_alpha", "v_beta", "vα", "vβ",
+                "电压", "母线", "vbus")):
+            return "电压"
+        if any(part in token for part in (
+                "current", "phase_", "iq", "i_alpha", "i_beta",
+                "iα", "iβ", "电流")):
+            return "电流"
+        if any(part in token for part in ("torque", "转矩")):
+            return "转矩"
+        return "其他"
+
+    def _refresh_categories(self, _index=None) -> None:
+        loaded = self._source_combo.currentData() == "loaded"
+        self._file_label.setVisible(loaded)
+        self._file_combo.setVisible(loaded)
+        source = "loaded" if loaded else "live"
+        selected_file = self._file_combo.currentData() if loaded else ""
+        categories = [
+            item["category"] for item in self._signal_entries
+            if item["source"] == source and item["file"] == selected_file
+        ]
+        previous = self._category_combo.currentData()
+        with QSignalBlocker(self._category_combo):
+            self._category_combo.clear()
+            for category in ("转速", "角度", "电流", "电压", "转矩", "其他"):
+                if category in categories:
+                    self._category_combo.addItem(category, category)
+            previous_index = self._category_combo.findData(previous)
+            if previous_index >= 0:
+                self._category_combo.setCurrentIndex(previous_index)
+        self._refresh_signals()
+
+    def _refresh_signals(self, _index=None) -> None:
+        source = self._source_combo.currentData()
+        selected_file = self._file_combo.currentData() if source == "loaded" else ""
+        category = self._category_combo.currentData()
+        previous = self._signal_combo.currentData()
+        with QSignalBlocker(self._signal_combo):
+            self._signal_combo.clear()
+            for item in self._signal_entries:
+                if (item["source"] == source and item["file"] == selected_file
+                        and item["category"] == category):
+                    self._signal_combo.addItem(item["label"], item["token"])
+            previous_index = self._signal_combo.findData(previous)
+            if previous_index >= 0:
+                self._signal_combo.setCurrentIndex(previous_index)
+        self._disable_custom_interval()
 
     def _selected_snapshot(self) -> tuple[str, dict]:
         token = self._signal_combo.currentData()
@@ -659,7 +774,134 @@ class FourierAnalysisPage(QWidget):
             "fft_values": values,
         })
         self._last_result = result
+        self._last_analysis_snapshot = analysis_snapshot
         self._show_result(label, analysis_snapshot, result, analysis_kind)
+        self._update_harmonic_references(analysis_snapshot, result)
+
+    def _on_harmonic_toggle(self, _checked=None) -> None:
+        if self._last_result is not None:
+            self._update_harmonic_references(
+                self._last_analysis_snapshot, self._last_result)
+        else:
+            self._update_harmonic_visibility()
+
+    def _add_harmonic_line(self, kind: str, order: int) -> None:
+        name, color = (("转速", "#ffb74d") if kind == "speed"
+                       else ("电角度", "#80cbc4"))
+        line = pg.InfiniteLine(
+            pos=0.0, angle=90, movable=False,
+            pen=pg.mkPen(color, width=1.2, style=Qt.DashLine),
+            label=f"{name}{order}×",
+            labelOpts={"color": color, "position": 0.9})
+        self._plot.addItem(line)
+        line.hide()
+        self._harmonic_lines[(kind, order)] = line
+
+    def _reference_snapshot(self, category: str) -> dict | None:
+        source = self._source_combo.currentData()
+        if source == "live":
+            if self._snapshot_provider is None:
+                return None
+            try:
+                return self._snapshot_provider(
+                    "speed" if category == "speed" else "angle")
+            except (KeyError, ValueError):
+                return None
+        path = self._file_combo.currentData()
+        matches = [item for item in self._signal_entries
+                   if item["source"] == "loaded" and item["file"] == path
+                   and item["category"] == ("转速" if category == "speed"
+                                             else "角度")]
+        if category == "speed":
+            matches = [item for item in matches
+                       if item.get("channel") == "speed"
+                       and item.get("series") in ("实际", "实际转速")]
+        else:
+            matches = [item for item in matches
+                       if item.get("channel") == "electrical_angle"
+                       and item.get("series") in ("高速电角度", "电角度")]
+        return (self._loaded_sources[matches[0]["token"][1]]
+                if matches else None)
+
+    def _update_harmonic_references(self, snapshot: dict, result: dict) -> None:
+        times = snapshot.get("fft_times", ())
+        if not times:
+            return
+        start, end = float(times[0]), float(times[-1])
+        for kind in ("speed", "angle"):
+            enabled = (self._show_speed_harmonics.isChecked()
+                       if kind == "speed" else
+                       self._show_angle_harmonics.isChecked())
+            reference = self._reference_snapshot(kind) if enabled else None
+            self._harmonic_hz[kind] = self._estimate_reference_hz(
+                kind, reference, start, end)
+        self._harmonic_limit_hz = min(
+            float(self._max_freq.value()) or result["sample_rate_hz"] / 2.0,
+            result["sample_rate_hz"] / 2.0)
+        for kind, control in (("speed", self._speed_harmonic_order),
+                              ("angle", self._angle_harmonic_order)):
+            base_hz = self._harmonic_hz[kind]
+            if base_hz > 0.0:
+                maximum = max(1, min(2147483647, math.floor(
+                    self._harmonic_limit_hz / base_hz + 1e-9)))
+                with QSignalBlocker(control):
+                    control.setMaximum(maximum)
+        self._update_harmonic_visibility()
+
+    @staticmethod
+    def _estimate_reference_hz(kind: str, snapshot: dict | None,
+                               start: float, end: float) -> float:
+        if not snapshot:
+            return 0.0
+        values = np.asarray(snapshot.get("values", ()), dtype=float)
+        if values.size < 2:
+            return 0.0
+        times = np.asarray(snapshot.get("times", ()), dtype=float)
+        if times.size != values.size:
+            rate = float(snapshot.get("sample_rate_hz", 0.0))
+            if rate <= 0.0:
+                return 0.0
+            times = np.arange(values.size) / rate
+        selected = np.isfinite(values) & np.isfinite(times)
+        selected &= (times >= start) & (times <= end)
+        if selected.sum() < 2:
+            return 0.0
+        values, times = values[selected], times[selected]
+        if kind == "speed":
+            return float(np.median(np.abs(values))) / 60.0
+        elapsed = float(times[-1] - times[0])
+        if elapsed <= 0.0:
+            return 0.0
+        unwrapped = np.unwrap(np.deg2rad(values))
+        return abs(float(unwrapped[-1] - unwrapped[0])) / (2.0 * math.pi * elapsed)
+
+    def _update_harmonic_visibility(self, _checked=None) -> None:
+        for kind, checkbox, control in (
+                ("speed", self._show_speed_harmonics,
+                 self._speed_harmonic_order),
+                ("angle", self._show_angle_harmonics,
+                 self._angle_harmonic_order)):
+            selected = (control.value() if checkbox.isChecked()
+                        and self._harmonic_hz[kind] > 0.0 else 0)
+            target = max(3, selected)
+            for order in range(4, target + 1):
+                if (kind, order) not in self._harmonic_lines:
+                    self._add_harmonic_line(kind, order)
+            for key in [key for key in self._harmonic_lines
+                        if key[0] == kind and key[1] > target]:
+                self._plot.removeItem(self._harmonic_lines.pop(key))
+        for (kind, order), line in getattr(self, "_harmonic_lines", {}).items():
+            enabled = (self._show_speed_harmonics.isChecked()
+                       if kind == "speed" else
+                       self._show_angle_harmonics.isChecked())
+            frequency = self._harmonic_hz[kind] * order
+            selected = (self._speed_harmonic_order.value() if kind == "speed"
+                        else self._angle_harmonic_order.value())
+            show = (enabled and order <= selected and frequency > 0.0 and
+                    frequency <= getattr(self, "_harmonic_limit_hz", 0.0))
+            if show:
+                line.setPos(frequency)
+            line.setVisible(show)
 
     def _disable_custom_interval(self, _index=None) -> None:
         """选择信号或快捷样本数后，下一次恢复快捷区间。"""
@@ -883,7 +1125,9 @@ class FourierAnalysisPage(QWidget):
                             "display_filter", "FFT使用CSV原始列"),
                         "unit": row.get("unit", ""),
                         "analysis_kind": (
-                            "ac" if channel == "phase_current" else "dc"),
+                            "ac" if channel in (
+                                "phase_current", "stationary_current",
+                                "stationary_voltage") else "dc"),
                     })
                     item["times"].append(float(row["time_s"]))
                     item["values"].append(float(row["value"]))
@@ -898,6 +1142,17 @@ class FourierAnalysisPage(QWidget):
             return
 
         source_path = Path(path)
+        resolved_path = str(source_path.resolve())
+        # 重载同一文件时替换目录和数据，避免菜单出现重复项。
+        self._signal_entries = [item for item in self._signal_entries
+                                if item["file"] != resolved_path]
+        for key in list(self._loaded_sources):
+            if key.startswith(f"{resolved_path}::"):
+                del self._loaded_sources[key]
+        file_index = self._file_combo.findData(resolved_path)
+        if file_index < 0:
+            self._file_combo.addItem(source_path.name, resolved_path)
+            file_index = self._file_combo.findData(resolved_path)
         for (channel, series), item in grouped.items():
             if float(item["sample_rate_hz"]) <= 0.0:
                 diffs = [b - a for a, b in zip(item["times"], item["times"][1:])
@@ -905,11 +1160,19 @@ class FourierAnalysisPage(QWidget):
                 if diffs:
                     ordered = sorted(diffs)
                     item["sample_rate_hz"] = 1.0 / ordered[len(ordered) // 2]
-            key = f"{source_path.resolve()}::{channel}::{series}"
+            key = f"{resolved_path}::{channel}::{series}"
             self._loaded_sources[key] = item
-            self._signal_combo.addItem(
-                f"CSV · {channel} / {series}", ("loaded", key))
-        self._signal_combo.setCurrentIndex(self._signal_combo.count() - len(grouped))
+            self._signal_entries.append({
+                "source": "loaded", "file": resolved_path,
+                "category": self._signal_category(channel, series),
+                "label": f"{channel} / {series}",
+                "channel": channel, "series": series,
+                "token": ("loaded", key),
+            })
+        self._source_combo.setCurrentIndex(
+            self._source_combo.findData("loaded"))
+        self._file_combo.setCurrentIndex(file_index)
+        self._refresh_categories()
         self._processing.setText(
             f"已加载 {source_path.name}：{len(grouped)} 组信号。"
             "选择信号后点击“开始离线 FFT”。")

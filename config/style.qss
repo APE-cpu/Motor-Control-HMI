@@ -206,7 +206,7 @@ QScrollBar::add-line:horizontal, QScrollBar::sub-line:horizontal { width: 0; }
 
 /* ---------- 侧边导航 ---------- */
 QLabel#NavHeaderLabel {
-    color: #4d5a6b;
+    color: #8fa3b8;
     font-size: 11px;
     font-weight: bold;
     letter-spacing: 1px;
@@ -227,7 +227,7 @@ QListWidget#SideNav::item {
     border-left: 3px solid transparent;
 }
 QListWidget#SideNav::item:disabled {      /* 分组标题卡片：左右顶满 */
-    color: #4d5a6b;
+    color: #8fa3b8;
     font-size: 11px;
     font-weight: bold;
     padding: 0;
@@ -255,3 +255,10 @@ QToolTip {
     padding: 4px 8px;
 }
 QMessageBox, QDialog { background-color: #1d222c; }
+
+/* 应用名称与外观选择 */
+QWidget#AppearanceBar {
+    background-color: #10131a;
+    border-bottom: 1px solid #2c3442;
+}
+QWidget#AppearanceBar QComboBox { min-width: 85px; }

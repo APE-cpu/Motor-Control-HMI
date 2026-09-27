@@ -92,9 +92,12 @@ class NativeTcpV2Receiver:
     def drain_f1(self, max_samples: int = 8192) -> list[dict]:
         return list(self._receiver.drain_f1(max(1, int(max_samples))))
 
-    def drain_f1_columns(self, max_samples: int = 8192) -> dict:
+    def drain_f1_columns(self, max_samples: int = 8192,
+                         vector_trail=None) -> dict:
+        count = max(1, int(max_samples))
         return dict(self._receiver.drain_f1_columns(
-            max(1, int(max_samples))))
+            count, vector_trail) if vector_trail is not None else
+            self._receiver.drain_f1_columns(count))
 
     def drain_f2(self, max_samples: int = 512) -> list[dict]:
         return list(self._receiver.drain_f2(max(1, int(max_samples))))

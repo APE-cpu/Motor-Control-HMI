@@ -1,5 +1,7 @@
 import math
 import os
+import csv
+from types import SimpleNamespace
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -13,6 +15,7 @@ from pages.fourier_page import (
     compute_spectrum,
     compute_order_lms,
 )
+from pages.monitor_page import MonitorPage
 from widgets.trend_curve import TrendCurve
 
 
@@ -106,6 +109,122 @@ def test_fourier_page_accepts_current_buffer_provider():
     assert "50.000 Hz" in page._metric_fund.text()
     assert "无滤波" in page._processing.text()
     assert "50.000 Hz" in page._peak_summary.text()
+    page.close()
+
+
+def test_stationary_frame_snapshots_use_mcsdk_clarke_and_actuation_angle():
+    class RawCurve:
+        def __init__(self, columns):
+            self.columns = columns
+
+        def raw_snapshot(self, name):
+            return {
+                "values": self.columns[name], "times": [0.0, 0.001],
+                "sample_rate_hz": 1000.0, "source_processing": "F1原始点",
+                "display_filter": "FFT使用原始缓冲",
+            }
+
+    monitor = SimpleNamespace(
+        _c_phase_current=RawCurve({"Ia": [1.0, 0.0], "Ib": [0.0, 1.0]}),
+        _c_voltage=RawCurve({"Vd": [1.0, 1.0], "Vq": [2.0, 2.0]}),
+        _voltage_angles_deg=[0.0, 90.0],
+        _high_rate_voltage_is_applied=True,
+    )
+    ibeta = MonitorPage.fourier_snapshot(monitor, "i_beta")
+    valpha = MonitorPage.fourier_snapshot(monitor, "v_alpha")
+    vbeta = MonitorPage.fourier_snapshot(monitor, "v_beta")
+
+    assert ibeta["values"] == pytest.approx(
+        [-1 / math.sqrt(3), -2 / math.sqrt(3)])
+    assert valpha["values"] == pytest.approx([2.0, 1.0])
+    assert vbeta["values"] == pytest.approx([1.0, -2.0])
+    assert "执行角" in valpha["source_processing"]
+
+
+def test_fourier_harmonic_switches_use_speed_and_electrical_angle():
+    _app()
+    rate = 1000.0
+    times = np.arange(2000) / rate
+    signals = {
+        "phase_ia": np.sin(2 * np.pi * 50 * times),
+        "speed": np.full(times.size, 600.0),
+        "angle": (40.0 * 360.0 * times) % 360.0,
+    }
+
+    def provider(key):
+        return {
+            "times": times.tolist(), "values": signals[key].tolist(),
+            "sample_rate_hz": rate, "unit": "A", "analysis_kind": "ac",
+        }
+
+    page = FourierAnalysisPage(provider, [
+        ("相电流 Ia", "phase_ia"), ("实际转速", "speed"),
+        ("高速电角度", "angle")])
+    page._category_combo.setCurrentIndex(
+        page._category_combo.findData("电流"))
+    page._show_speed_harmonics.setChecked(True)
+    page._show_angle_harmonics.setChecked(True)
+    page._analyze_selected()
+
+    assert page._harmonic_hz["speed"] == pytest.approx(10.0)
+    assert page._harmonic_hz["angle"] == pytest.approx(40.0, rel=1e-3)
+    for order in (1, 2, 3):
+        assert page._harmonic_lines[("speed", order)].value() == pytest.approx(10 * order)
+        assert page._harmonic_lines[("angle", order)].value() == pytest.approx(40 * order, rel=1e-3)
+        assert page._harmonic_lines[("speed", order)].isVisible()
+    assert page._speed_harmonic_order.maximum() == 50  # Nyquist 限制
+    assert page._angle_harmonic_order.maximum() == 12
+    page._speed_harmonic_order.setValue(8)
+    page._angle_harmonic_order.setValue(6)
+    assert page._harmonic_lines[("speed", 8)].value() == pytest.approx(80)
+    assert page._harmonic_lines[("angle", 6)].value() == pytest.approx(240, rel=1e-3)
+    assert page._harmonic_lines[("speed", 8)].isVisible()
+    page._max_freq.setValue(100)
+    assert page._speed_harmonic_order.maximum() == 10
+    assert page._angle_harmonic_order.maximum() == 2
+    assert not page._harmonic_lines[("angle", 3)].isVisible()
+    assert all(not line.isVisible() or line.value() <= 100
+               for line in page._harmonic_lines.values())
+    page._show_speed_harmonics.setChecked(False)
+    assert not page._harmonic_lines[("speed", 1)].isVisible()
+    assert page._harmonic_lines[("angle", 1)].isVisible()
+    page.close()
+
+
+def test_csv_sources_are_grouped_by_file_and_signal_category(tmp_path):
+    _app()
+    path = tmp_path / "capture.csv"
+    with path.open("w", encoding="utf-8-sig", newline="") as stream:
+        writer = csv.writer(stream)
+        writer.writerow(("channel", "time_s", "series", "value",
+                         "sampling_rate_hz", "unit"))
+        for index in range(64):
+            t = index / 1000.0
+            writer.writerow(("speed", t, "实际", 600.0, 1000, "rpm"))
+            writer.writerow(("electrical_angle", t, "高速电角度",
+                             (40 * 360 * t) % 360, 1000, "°"))
+            writer.writerow(("stationary_current", t, "Iα",
+                             math.sin(2 * math.pi * 50 * t), 1000, "A"))
+    page = FourierAnalysisPage(lambda _key: {}, [("相电流 Ia", "phase_ia")])
+    page.load_csv(str(path))
+
+    assert page._source_combo.currentData() == "loaded"
+    assert page._file_combo.currentData() == str(path.resolve())
+    assert page._category_combo.count() == 3
+    page._category_combo.setCurrentIndex(
+        page._category_combo.findData("电流"))
+    assert page._signal_combo.count() == 1
+    assert "Iα" in page._signal_combo.currentText()
+    page._show_speed_harmonics.setChecked(True)
+    page._show_angle_harmonics.setChecked(True)
+    page._analyze_selected()
+    assert page._last_result["sample_count"] == 64
+    assert "交流量模式" in page._processing.text()
+    assert page._harmonic_hz["speed"] == pytest.approx(10.0)
+    assert page._harmonic_hz["angle"] == pytest.approx(40.0, rel=1e-3)
+    page.load_csv(str(path))
+    assert len([item for item in page._signal_entries
+                if item["file"] == str(path.resolve())]) == 3
     page.close()
 
 

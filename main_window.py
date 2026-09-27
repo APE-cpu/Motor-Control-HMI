@@ -1,10 +1,13 @@
 """主窗口：左侧导航 + 右侧 QStackedWidget。"""
+from collections.abc import Callable
+
 from PySide6.QtCore import (
     Qt, QParallelAnimationGroup, QPropertyAnimation, QEasingCurve,
 )
 from PySide6.QtWidgets import (
     QGraphicsOpacityEffect,
     QHBoxLayout,
+    QVBoxLayout,
     QLabel,
     QMainWindow,
     QFrame,
@@ -30,6 +33,9 @@ from pages.digital_twin_page import DigitalTwinPage
 from pages.fourier_page import FourierAnalysisPage
 from pages.frequency_response_page import FrequencyResponsePage
 from widgets.side_nav import SideNav
+from widgets.appearance_bar import AppearanceBar
+from widgets.page_artwork import IllustratedPageFrame
+from ui_theme import APP_NAME, APP_SUBTITLE, appearance_manager
 from communications.comm_manager import CommManager, decode_motor_fault_code
 from logs.operation_logger import logger
 from core import RuntimeStateMachine
@@ -58,14 +64,15 @@ class ResponsiveStack(QStackedWidget):
         super().__init__()
         self._content_pages: list[QWidget] = []
 
-    def addWidget(self, page: QWidget) -> int:  # noqa: N802 - Qt API
+    def addWidget(self, page: QWidget, artwork_key: str | None = None) -> int:  # noqa: N802 - Qt API
         page.setMinimumWidth(980)
         scroll = QScrollArea()
         scroll.setFrameShape(QFrame.NoFrame)
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll.setWidget(page)
+        content = IllustratedPageFrame(page, artwork_key) if artwork_key else page
+        scroll.setWidget(content)
         index = super().addWidget(scroll)
         self._content_pages.append(page)
         return index
@@ -76,8 +83,8 @@ class ResponsiveStack(QStackedWidget):
         return super().indexOf(widget)
 
     def currentWidget(self) -> QWidget | None:  # noqa: N802 - Qt API
-        current = super().currentWidget()
-        return current.widget() if isinstance(current, QScrollArea) else current
+        index = self.currentIndex()
+        return self._content_pages[index] if 0 <= index < len(self._content_pages) else None
 
     def widget(self, index: int) -> QWidget | None:
         if 0 <= index < len(self._content_pages):
@@ -86,9 +93,14 @@ class ResponsiveStack(QStackedWidget):
 
 
 class MainWindow(QMainWindow):
-    def __init__(self, enable_training: bool = True) -> None:
+    def __init__(self, enable_training: bool = True,
+                 progress: Callable[[int, int, str], None] | None = None) -> None:
+        """progress(已完成步数, 总步数, 当前步骤名)：启动画面进度回调。"""
         super().__init__()
-        self.setWindowTitle(f"电机控制上位机 v{APP_VERSION}")
+        self._startup_progress = progress
+        self._startup_done = 0
+        self._startup_total = 17 if enable_training else 16
+        self.setWindowTitle(f"{APP_NAME} · {APP_SUBTITLE} v{APP_VERSION}")
         self.resize(1280, 800)
 
         # 通信管理器：所有页面共享同一个通信会话
@@ -107,7 +119,13 @@ class MainWindow(QMainWindow):
 
         # 中心容器：左右布局
         central = QWidget()
-        layout = QHBoxLayout(central)
+        outer_layout = QVBoxLayout(central)
+        outer_layout.setContentsMargins(0, 0, 0, 0)
+        outer_layout.setSpacing(0)
+        self.appearance_bar = AppearanceBar()
+        outer_layout.addWidget(self.appearance_bar)
+        layout = QHBoxLayout()
+        outer_layout.addLayout(layout, 1)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(0)
 
@@ -119,67 +137,83 @@ class MainWindow(QMainWindow):
         digital_twin_idx = manual_idx + 1
         fourier_idx = digital_twin_idx + 1
         frequency_response_idx = fourier_idx + 1
-        ai_section = [("🛠 诊断助手", 6), ("🧠 边缘AI", 7)]
+        ai_section = [("诊断助手", 6), ("边缘AI", 7)]
         if enable_training:
-            ai_section.append(("🎓 模型训练", 8))
+            ai_section.append(("模型训练", 8))
         nav_sections = [
-            ("运行控制", [("📊 监控页面", 0), ("🎮 电机控制", 1),
-                          ("🧬 数字孪生", digital_twin_idx),
-                          ("🧪 实验管理", experiment_idx)]),
-            ("分析可视化", [("🌀 矢量可视化", 2), ("⚡ 功率流", 3),
-                            ("🔍 参数辨识", 4), ("🌊 离线傅里叶", fourier_idx),
-                            ("📐 波特图与传函", frequency_response_idx),
-                            ("🔬 电流采样诊断", sampling_idx)]),
+            ("运行控制", [("监控页面", 0), ("电机控制", 1),
+                          ("数字孪生", digital_twin_idx),
+                          ("实验管理", experiment_idx)]),
+            ("分析可视化", [("矢量可视化", 2), ("功率流", 3),
+                            ("参数辨识", 4), ("离线傅里叶", fourier_idx),
+                            ("波特图与传函", frequency_response_idx),
+                            ("电流采样诊断", sampling_idx)]),
             ("AI 智能", ai_section),
-            ("系统", [("📡 通信设置", 5), ("📋 操作记录", log_idx),
-                    ("📖 使用说明书", manual_idx)]),
+            ("系统", [("通信设置", 5), ("操作记录", log_idx),
+                    ("使用说明书", manual_idx)]),
         ]
 
         self.nav = SideNav(nav_sections)
         self.stack = ResponsiveStack()
 
+        self._startup_step("电机控制页")
         self.control_page = ControlPage(self.comm_manager, self.runtime_state)
+        self._startup_step("数字孪生页")
         self.digital_twin_page = DigitalTwinPage(
             self.comm_manager, self.runtime_state)
         self.control_page.set_simulation_snapshot_provider(
             self.digital_twin_page.mechanical_snapshot)
+        self._startup_step("监控页面")
         self.monitor_page = MonitorPage(
             self.comm_manager, self.control_page, self.runtime_state)
+        self._startup_step("离线傅里叶页")
         self.fourier_page = FourierAnalysisPage(
             self.monitor_page.fourier_snapshot,
             self.monitor_page.fourier_source_items())
+        self._startup_step("波特图与传函页")
         self.frequency_response_page = FrequencyResponsePage(
             self.monitor_page.fourier_snapshot,
             self.control_page.current_loop_analysis_snapshot)
+        self._startup_step("矢量可视化页")
         self.vector_page = VectorPage(self.comm_manager)
+        self._startup_step("功率流页")
         self.power_flow_page = PowerFlowPage(self.comm_manager)
+        self._startup_step("参数辨识页")
         self.identify_page = IdentifyPage(self.comm_manager)
+        self._startup_step("通信设置页")
         self.communication_page = CommunicationPage(self.comm_manager)
+        self._startup_step("诊断助手页")
         self.ai_page = AIPage(
             self.comm_manager,
             monitor_page=self.monitor_page,
             firmware_config_provider=(
                 self.control_page.current_loop_analysis_snapshot),
         )
+        self._startup_step("边缘AI页")
         self.edge_ai_page = EdgeAIPage(self.comm_manager)
+        self._startup_step("操作记录页")
         self.operation_log_page = OperationLogPage()
+        self._startup_step("使用说明书")
         self.manual_page = ManualPage()
+        self._startup_step("实验管理页")
         self.experiment_page = ExperimentPage(
             self.comm_manager, software_version=APP_VERSION,
             snapshot_provider=self.control_page.experiment_snapshot,
             runtime_state=self.runtime_state)
+        self._startup_step("电流采样诊断页")
         self.current_sampling_page = CurrentSamplingPage(self.comm_manager)
 
         self.stack.addWidget(self.monitor_page)
         self.stack.addWidget(self.control_page)
-        self.stack.addWidget(self.vector_page)
+        self.stack.addWidget(self.vector_page, "vector")
         self.stack.addWidget(self.power_flow_page)
-        self.stack.addWidget(self.identify_page)
+        self.stack.addWidget(self.identify_page, "identify")
         self.stack.addWidget(self.communication_page)
         self.stack.addWidget(self.ai_page)
         self.stack.addWidget(self.edge_ai_page)
 
         if enable_training:
+            self._startup_step("模型训练页")
             from pages.training_page import TrainingPage
             self.training_page = TrainingPage(self.comm_manager, self.control_page)
             self.stack.addWidget(self.training_page)
@@ -188,12 +222,13 @@ class MainWindow(QMainWindow):
         self.stack.addWidget(self.experiment_page)
         self.stack.addWidget(self.operation_log_page)
         self.stack.addWidget(self.manual_page)
-        self.stack.addWidget(self.digital_twin_page)
+        self.stack.addWidget(self.digital_twin_page, "twin")
         # 放在物理页面序列末尾，不改动已有页面索引；
         # 导航仍将它归在“分析可视化”分组。
-        self.stack.addWidget(self.fourier_page)
+        self.stack.addWidget(self.fourier_page, "fourier")
         self.stack.addWidget(self.frequency_response_page)
 
+        self._startup_step("组装主界面")
         layout.addWidget(self.nav)
         layout.addWidget(self.stack, 1)
         self.setCentralWidget(central)
@@ -208,13 +243,31 @@ class MainWindow(QMainWindow):
             lambda ok, msg: bar.showMessage(f"通信：{'已连接' if ok else '未连接'} - {msg}")
         )
         bar.showMessage("通信：未连接")
+        appearance = appearance_manager()
+        appearance.register_window(self)
+        appearance.themeChanged.connect(self._style_visible_theme)
+        appearance.apply_theme(appearance.theme_id, persist=False)
         logger.log("软件启动")
+
+    def _style_visible_theme(self, _theme_id: str) -> None:
+        appearance = appearance_manager()
+        for widget in (self.appearance_bar, self.nav, self.statusBar(),
+                       self.stack.currentWidget()):
+            if widget is not None:
+                appearance.style_root(widget)
+
+    def _startup_step(self, label: str) -> None:
+        if self._startup_progress is not None:
+            self._startup_progress(self._startup_done, self._startup_total, label)
+        self._startup_done += 1
 
     # ---------- 页面切换过渡：旧页左滑淡出 + 新页淡入 ----------
     _TRANSITION_MS = 190
 
     def _clear_page_transition(self) -> None:
         """停止并拆除页面过渡，保证窗口关闭时不残留 Qt 动画回调。"""
+        for artwork_frame in self.stack.findChildren(IllustratedPageFrame):
+            artwork_frame.artwork.stop_transition()
         for name in ("_page_transition_group", "_page_fade_in"):
             animation = getattr(self, name, None)
             if animation is not None:
@@ -242,6 +295,9 @@ class MainWindow(QMainWindow):
     def _switch_page(self, index: int) -> None:
         if index == self.stack.currentIndex():
             return
+        next_page = self.stack.widget(index)
+        if next_page is not None:
+            appearance_manager().style_root(next_page)
         # 未显示的窗口（启动装配和无界面测试）无需创建截图、特效与动画；
         # 直接切页也避免在窗口从未进入事件循环时留下原生图形效果对象。
         if not self.isVisible():
@@ -249,6 +305,17 @@ class MainWindow(QMainWindow):
             return
         # 快速连点时先完整清理上一场未完成的过渡。
         self._clear_page_transition()
+
+        # 机械插图页只让底层零件重组，控件和读数保持稳定。
+        frame = next_page.parentWidget() if next_page is not None else None
+        if isinstance(frame, IllustratedPageFrame):
+            previous = self.stack.currentWidget()
+            previous_frame = previous.parentWidget() if previous is not None else None
+            source_key = (previous_frame.artwork.key
+                          if isinstance(previous_frame, IllustratedPageFrame) else None)
+            self.stack.setCurrentIndex(index)
+            frame.artwork.start_transition(source_key)
+            return
 
         # ResponsiveStack 对外返回内容页；这里需要直接取得实际承载的
         # QScrollArea，确保截图和淡入效果覆盖完整页面。
@@ -476,9 +543,16 @@ class MainWindow(QMainWindow):
             event.ignore()
             return
         self._clear_page_transition()
+
         self.nav.stop_animations()
         self.monitor_page.stop_visual_animations()
         self.experiment_page.shutdown()
+        appearance = appearance_manager()
+        try:
+            appearance.themeChanged.disconnect(self._style_visible_theme)
+        except (RuntimeError, TypeError):
+            pass
+        appearance.unregister_window(self)
         try:
             self.comm_manager.disconnect()
         except Exception:

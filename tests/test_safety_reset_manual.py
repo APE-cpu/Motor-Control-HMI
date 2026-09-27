@@ -113,6 +113,7 @@ def test_矢量页在数据源停止后清空并停止演示旋转():
     _app()
     comm = CommManager()
     page = VectorPage(comm)
+    page.show()
     page._chk_enabled.setChecked(True)
     page._i_plot.append(1.0, 2.0)
     page._psi_plot.append(0.1, 0.2)

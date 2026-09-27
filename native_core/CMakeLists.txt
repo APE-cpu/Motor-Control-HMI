@@ -10,6 +10,7 @@ pybind11_add_module(motor_core_cpp
     src/protocol_v2.cpp
     src/telemetry_processor.cpp
     src/tcp_v2_receiver.cpp
+    src/vector_trail.cpp
 )
 target_include_directories(motor_core_cpp PRIVATE include)
 target_compile_features(motor_core_cpp PRIVATE cxx_std_17)

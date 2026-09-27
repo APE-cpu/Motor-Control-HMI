@@ -48,11 +48,11 @@ set BUILD_NAME=%BUILD_NAME%-v%APP_VERSION%
 
 echo [1/4] Building optional C++ communication core...
 set NATIVE_CORE=
-python -m pip install --force-reinstall ".\native_core"
+python -m pip install --no-deps --upgrade --target ".\native_core_runtime" ".\native_core"
 if errorlevel 1 (
     echo   [!] Native core build failed; executable will use the Python fallback.
 ) else (
-    set NATIVE_CORE=--hidden-import motor_core_cpp
+    set NATIVE_CORE=--paths native_core_runtime --hidden-import motor_core_cpp
     echo   [+] Native communication core enabled.
 )
 
@@ -80,6 +80,7 @@ if defined SIMULINK_HOST_DLL (echo   [+] Found Simulink C++ host DLL, bundling i
 if "%MODE%"=="lite" (
     pyinstaller --noconfirm --clean --onefile --windowed ^
       --name "%BUILD_NAME%" ^
+      --icon "assets/app_icon_charcoal.ico" ^
       --add-data "config/style.qss;config" ^
       --add-data "assets;assets" ^
       --add-data "README.md;." ^
@@ -104,6 +105,7 @@ if "%MODE%"=="lite" (
     rem PyInstaller 默认不收，缺了它 exe 里扫描版 PDF OCR 会静默失效
     pyinstaller --noconfirm --clean --onefile --windowed ^
       --name "%BUILD_NAME%" ^
+      --icon "assets/app_icon_charcoal.ico" ^
       --add-data "config/style.qss;config" ^
       --add-data "assets;assets" ^
       --add-data "README.md;." ^

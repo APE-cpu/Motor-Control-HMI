@@ -1,5 +1,21 @@
 {
-  "base_url": "https://api.deepseek.com/v1",
-  "api_key": "",
-  "model": "deepseek-v4-pro"
+  "selected_profile": "JEV",
+  "profiles": {
+    "JEV": {
+      "base_url": "https://api.typesafe.ai/v1",
+      "api_key": "",
+      "model": "jev-latest",
+      "provider": "jev"
+    },
+    "Laya（本地）": {
+      "base_url": "http://127.0.0.1:8766",
+      "api_key": "",
+      "model": "laya",
+      "provider": "laya",
+      "native_executable": "C:/laya-build-vulkan-current2/bin/Release/laya-cli.exe",
+      "native_model_dir": "C:/laya-models/english",
+      "backend": "vulkan",
+      "precision": "bf16"
+    }
+  }
 }

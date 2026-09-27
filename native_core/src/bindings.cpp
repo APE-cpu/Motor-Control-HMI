@@ -1,12 +1,17 @@
 #include "motor_core/protocol_v2.hpp"
 #include "motor_core/telemetry_processor.hpp"
 #include "motor_core/tcp_v2_receiver.hpp"
+#include "motor_core/vector_trail.hpp"
 
+#include <pybind11/numpy.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 
+#include <algorithm>
 #include <cstdint>
 #include <cmath>
+#include <memory>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -134,7 +139,8 @@ py::list f1_samples_to_python(
 }
 
 py::dict f1_samples_to_columns(
-        const std::vector<motor_core::F1Sample>& samples) {
+        const std::vector<motor_core::F1Sample>& samples,
+        const std::shared_ptr<motor_core::VectorTrail>& vector_trail = nullptr) {
     const auto size = static_cast<Py_ssize_t>(samples.size());
     py::list tick_ms(size);
     py::list sample_seq(size);
@@ -243,6 +249,29 @@ py::dict f1_samples_to_columns(
     output["vd_applied_v"] = std::move(vd_applied_v);
     output["vq_applied_v"] = std::move(vq_applied_v);
     output["applied_voltage_source_direct"] = direct_applied_voltage;
+    output["vector_native"] = vector_trail != nullptr;
+    return output;
+}
+
+py::array_t<double> numeric_array(const std::vector<double>& values) {
+    py::array_t<double> array(values.size());
+    std::copy(values.begin(), values.end(), array.mutable_data());
+    return array;
+}
+
+py::dict vector_snapshot_to_python(
+        const motor_core::VectorTrailSnapshot& snapshot) {
+    py::dict output;
+    output["current_x"] = numeric_array(snapshot.current_x);
+    output["current_y"] = numeric_array(snapshot.current_y);
+    output["flux_x"] = numeric_array(snapshot.flux_x);
+    output["flux_y"] = numeric_array(snapshot.flux_y);
+    output["current_tip"] = py::make_tuple(
+        snapshot.current_tip[0], snapshot.current_tip[1]);
+    output["flux_tip"] = py::make_tuple(
+        snapshot.flux_tip[0], snapshot.flux_tip[1]);
+    output["clarke_missing"] = snapshot.clarke_missing;
+    output["generation"] = snapshot.generation;
     return output;
 }
 
@@ -379,7 +408,24 @@ PYBIND11_MODULE(motor_core_cpp, module) {
     // Increment when the Python/native telemetry contract changes.  The host
     // checks this independently from the package version so a stale .pyd can
     // never silently parse a new F1 wire layout with an older ABI.
-    module.attr("telemetry_schema_version") = 3;
+    module.attr("telemetry_schema_version") = 4;
+
+    py::class_<motor_core::VectorTrail,
+               std::shared_ptr<motor_core::VectorTrail>>(module, "VectorTrail")
+        .def(py::init<>())
+        .def("configure", &motor_core::VectorTrail::configure,
+             py::arg("enabled"), py::arg("clarke"),
+             py::arg("psi_f"), py::arg("lq"))
+        .def("clear", &motor_core::VectorTrail::clear)
+        .def("snapshot", [](const motor_core::VectorTrail& trail,
+                             bool unlimited, py::object spin_angle) {
+            std::optional<double> spin;
+            if (!spin_angle.is_none()) {
+                spin = spin_angle.cast<double>();
+            }
+            return vector_snapshot_to_python(trail.snapshot(unlimited, spin));
+        }, py::arg("unlimited") = false,
+           py::arg("spin_angle") = py::none());
 
     module.def(
         "crc16_ccitt",
@@ -598,15 +644,20 @@ PYBIND11_MODULE(motor_core_cpp, module) {
         .def(
             "drain_f1_columns",
             [](motor_core::TelemetryProcessor& processor,
-               std::size_t max_samples) {
+               std::size_t max_samples,
+               std::shared_ptr<motor_core::VectorTrail> vector_trail) {
                 std::vector<motor_core::F1Sample> samples;
                 {
                     py::gil_scoped_release release;
                     samples = processor.drain_f1(max_samples);
+                    if (vector_trail) {
+                        vector_trail->append_samples(samples);
+                    }
                 }
-                return f1_samples_to_columns(samples);
+                return f1_samples_to_columns(samples, vector_trail);
             },
-            py::arg("max_samples") = 8192)
+            py::arg("max_samples") = 8192,
+            py::arg("vector_trail") = nullptr)
         .def(
             "drain_f2",
             [](motor_core::TelemetryProcessor& processor,
@@ -695,15 +746,20 @@ PYBIND11_MODULE(motor_core_cpp, module) {
         .def(
             "drain_f1_columns",
             [](motor_core::TcpV2Receiver& receiver,
-               std::size_t max_samples) {
+               std::size_t max_samples,
+               std::shared_ptr<motor_core::VectorTrail> vector_trail) {
                 std::vector<motor_core::F1Sample> samples;
                 {
                     py::gil_scoped_release release;
                     samples = receiver.drain_f1(max_samples);
+                    if (vector_trail) {
+                        vector_trail->append_samples(samples);
+                    }
                 }
-                return f1_samples_to_columns(samples);
+                return f1_samples_to_columns(samples, vector_trail);
             },
-            py::arg("max_samples") = 8192)
+            py::arg("max_samples") = 8192,
+            py::arg("vector_trail") = nullptr)
         .def(
             "drain_f2",
             [](motor_core::TcpV2Receiver& receiver,

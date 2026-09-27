@@ -26,6 +26,7 @@ from widgets.trend_curve import TrendCurve
 from waveform_storage import category_for_control_mode, create_waveform_record_dir
 from widgets.temperature_label import TemperatureLabel
 from config.config import TEMP_HIGH_THRESHOLD, TEMP_NORMAL_THRESHOLD
+from core.torque_estimate import F1TorqueEstimator, torque_from_iq
 
 try:
     import numpy as np
@@ -934,10 +935,12 @@ class MonitorPage(QWidget):
         self._high_rate_samples = deque(maxlen=5000)
         self._high_rate_columns = {
             name: deque(maxlen=5000) for name in (
-                "angle_deg", "speed_rpm", "iq_a", "iqref_a", "ia_a",
+                "angle_deg", "actuation_angle_deg", "speed_rpm", "iq_a", "iqref_a", "ia_a",
                 "ib_a", "vd_raw", "vq_raw", "vbus_v",
                 "vd_applied_v", "vq_applied_v")
         }
+        # 与 Vd/Vq 原始缓冲逐点对齐；FFT 时才做逆 Park 变换。
+        self._voltage_angles_deg = deque(maxlen=5000)
         self._high_rate_voltage_is_applied = False
         self._high_rate_rate_hz = 200
         # F1每个FOC样本都携带speed_rpm，但编码器速度只在500 Hz中频任务
@@ -947,6 +950,12 @@ class MonitorPage(QWidget):
         self._speed_f1_decimation_phase = 0
         self._speed_curve_source = "none"
         self._f0_speed_pending = False
+        # 转矩由上位机按 Kt·Iq 计算：有 F1 时用高速 Iq 分块平均（500 Hz），
+        # 无 F1 时每个 F0 帧只写一次。
+        self._torque_estimator = F1TorqueEstimator()
+        self._torque_curve_source = "none"
+        self._f0_torque_pending = False
+        self._torque_display = 0.0
         self._last_high_angle_time = 0.0
         self._last_telemetry_time: float = 0.0
         self._latest_vbus_v = 0.0
@@ -1331,6 +1340,7 @@ class MonitorPage(QWidget):
     def _on_telemetry(self, frame: TelemetryFrame) -> None:
         self._latest = frame
         self._f0_speed_pending = True
+        self._f0_torque_pending = True
         self._last_telemetry_time = datetime.datetime.now().timestamp()
         filter_state = (
             bool(getattr(frame, "current_filter_enabled", False)),
@@ -1430,6 +1440,8 @@ class MonitorPage(QWidget):
             self._rls_capture.append_columns(capture_columns)
         self._high_rate_samples.append({
             "angle_deg": float(sample["angle_deg"]),
+            "actuation_angle_deg": float(sample.get(
+                "actuation_angle_deg", sample["angle_deg"])),
             "speed_rpm": float(sample.get("speed_rpm", 0.0)),
             "iq_a": float(sample["iq_a"]),
             "iqref_a": float(sample["iqref_a"]),
@@ -1864,15 +1876,59 @@ class MonitorPage(QWidget):
         """离线傅里叶页的当前缓冲信号列表。"""
         return [
             ("相电流 Ia", "phase_ia"), ("相电流 Ib", "phase_ib"),
+            ("静止坐标电流 Iα", "i_alpha"),
+            ("静止坐标电流 Iβ", "i_beta"),
             ("q轴电流 Iq", "iq"), ("q轴电流给定 Iqref", "iqref"),
             ("PWM平均施加电压 Vd", "vd"),
             ("PWM平均施加电压 Vq", "vq"),
+            ("静止坐标电压 Vα", "v_alpha"),
+            ("静止坐标电压 Vβ", "v_beta"),
             ("实际转速", "speed"), ("转速给定", "speedref"),
+            ("高速电角度", "angle"),
             ("估算转矩", "torque"),
         ]
 
     def fourier_snapshot(self, key: str) -> dict:
         """为离线分析复制原始缓冲，不传递显示平滑后的数据。"""
+        if key in ("i_alpha", "i_beta"):
+            ia = self._c_phase_current.raw_snapshot("Ia")
+            ib = self._c_phase_current.raw_snapshot("Ib")
+            count = min(len(ia["values"]), len(ib["values"]))
+            snapshot = dict(ia)
+            snapshot["values"] = (
+                ia["values"][-count:] if key == "i_alpha" else
+                [-(a + 2.0 * b) / math.sqrt(3.0)
+                 for a, b in zip(ia["values"][-count:], ib["values"][-count:])]
+            ) if count else []
+            snapshot["times"] = ia["times"][-count:] if count else []
+            snapshot["unit"] = "A"
+            snapshot["analysis_kind"] = "ac"
+            snapshot["source_processing"] = (
+                f"{ia['source_processing']}；由Ia/Ib按MCSDK Clarke符号约定计算"
+                if key == "i_beta" else ia["source_processing"])
+            return snapshot
+        if key in ("v_alpha", "v_beta"):
+            vd = self._c_voltage.raw_snapshot("Vd")
+            vq = self._c_voltage.raw_snapshot("Vq")
+            count = min(len(vd["values"]), len(vq["values"]),
+                        len(self._voltage_angles_deg))
+            angles = list(self._voltage_angles_deg)[-count:] if count else []
+            values = []
+            for d, q, angle in zip(vd["values"][-count:],
+                                   vq["values"][-count:], angles):
+                radians = math.radians(angle)
+                values.append(d * math.sin(radians) + q * math.cos(radians)
+                              if key == "v_alpha" else
+                              d * math.cos(radians) - q * math.sin(radians))
+            snapshot = dict(vd)
+            snapshot.update(values=values,
+                            times=vd["times"][-count:] if count else [],
+                            unit="V", analysis_kind="ac",
+                            source_processing=(
+                                f"{vd['source_processing']}；按执行角逆Park变换"
+                                if self._high_rate_voltage_is_applied else
+                                f"{vd['source_processing']}；按电角度逆Park估算"))
+            return snapshot
         sources = {
             "phase_ia": (self._c_phase_current, "Ia", "A"),
             "phase_ib": (self._c_phase_current, "Ib", "A"),
@@ -1880,6 +1936,7 @@ class MonitorPage(QWidget):
             "iqref": (self._c_current, "给定 Iq", "A"),
             "vd": (self._c_voltage, "Vd", "V"),
             "vq": (self._c_voltage, "Vq", "V"),
+            "angle": (self._c_angle, "高速电角度", "°"),
             "speed": (self._c_speed, "实际", "rpm"),
             "speedref": (self._c_speed, "给定", "rpm"),
             "torque": (self._c_torque, "实际", "Nm"),
@@ -1898,6 +1955,7 @@ class MonitorPage(QWidget):
         self._high_rate_samples.clear()
         for buffer in self._high_rate_columns.values():
             buffer.clear()
+        self._voltage_angles_deg.clear()
         self._rls_capture.clear()
         self._rls_capture_had_probe = bool(
             hasattr(self, "_btn_rls_probe") and
@@ -1924,6 +1982,9 @@ class MonitorPage(QWidget):
         self._speed_f1_decimation_phase = 0
         self._speed_curve_source = "none"
         self._f0_speed_pending = False
+        self._torque_estimator.reset()
+        self._torque_curve_source = "none"
+        self._f0_torque_pending = False
         self._curves_were_active = False
         if _MP_PG_OK:
             for item_name in (
@@ -2044,6 +2105,8 @@ class MonitorPage(QWidget):
                 for sample in high_rate)
             for sample in high_rate:
                 high_columns["angle_deg"].append(float(sample["angle_deg"]))
+                high_columns["actuation_angle_deg"].append(float(
+                    sample.get("actuation_angle_deg", sample["angle_deg"])))
                 high_columns["speed_rpm"].append(
                     float(sample.get("speed_rpm", 0.0)))
                 high_columns["iq_a"].append(float(sample["iq_a"]))
@@ -2066,11 +2129,19 @@ class MonitorPage(QWidget):
         else:
             voltage_is_applied = self._high_rate_voltage_is_applied
         high_count = len(high_columns["angle_deg"])
+        # 上位机转矩：F1 高速 Iq 分块平均 × Kt；本次刷新没凑满一块时沿用上一块，
+        # F1 中断超过 1 s 才退回 F0 单帧 Iq × Kt。
+        f1_torque = (self._torque_estimator.push(
+            high_columns["iq_a"], self._high_rate_rate_hz) if high_count else [])
+        if f1_torque:
+            self._torque_display = sum(f1_torque) / len(f1_torque)
+        elif time.time() - self._last_high_angle_time > 1.0:
+            self._torque_display = torque_from_iq(f.current_actual)
         self._speed_actual.set_value(f.speed_actual)
         self._speed_target.set_value(f.speed_target)
         self._current_actual.set_value(f.current_actual)
         self._current_target.set_value(f.current_target)
-        self._torque_actual.set_value(f.torque_actual)
+        self._torque_actual.set_value(self._torque_display)
         self._torque_target.set_value(f.torque_target)
         position_mode_selected = False
         if self._ctrl is not None and hasattr(self._ctrl, "_current_mode"):
@@ -2121,7 +2192,7 @@ class MonitorPage(QWidget):
 
         self._stat_speed.feed(f.speed_actual)
         self._stat_current.feed(f.current_actual)
-        self._stat_torque.feed(f.torque_actual)
+        self._stat_torque.feed(self._torque_display)
 
         # 停机后设备遥测全部归零（固件在非 RUN 状态只发零值），此时继续追加
         # 只会让曲线滚动平直的零线，并在约一分钟内把刚跑完的实验数据挤出
@@ -2207,13 +2278,45 @@ class MonitorPage(QWidget):
                 self._c_voltage.append_columns({
                     "Vd": voltage_d, "Vq": voltage_q,
                 }, interval_s, redraw=self._curve_is_active(self._c_voltage))
+                voltage_angles = (high_columns["actuation_angle_deg"]
+                                  if voltage_is_applied and
+                                  len(high_columns["actuation_angle_deg"]) == high_count
+                                  else high_columns["angle_deg"])
+                self._voltage_angles_deg.extend(voltage_angles)
             else:
                 self._c_current.append(
                     {"实际 Iq": f.current_actual, "给定 Iq": f.current_target},
                     redraw=self._curve_is_active(self._c_current))
-            self._c_torque.append(
-                {"实际": f.torque_actual},
-                redraw=self._curve_is_active(self._c_torque))
+            estimator = self._torque_estimator
+            if f1_torque:
+                torque_rate_hz = 1.0 / estimator.interval_s
+                if (self._torque_curve_source != "f1" or
+                    (self._c_torque._sample_rate_hz > 0.0 and
+                     abs(self._c_torque._sample_rate_hz - torque_rate_hz) > 0.5)):
+                    # 与速度曲线同理：F0 不规则时间轴不能与 F1 固定节拍混在一起
+                    self._c_torque.clear()
+                    self._torque_curve_source = "f1"
+                self._c_torque.set_source_processing(
+                    f"上位机计算 Te = Kt·Iq（Kt={estimator.kt:g} N·m/A）；"
+                    f"F1 {self._high_rate_rate_hz:g} Hz Iq 每 "
+                    f"{estimator.block_samples} 点平均",
+                    torque_rate_hz)
+                self._c_torque.append_columns(
+                    {"实际": f1_torque}, estimator.interval_s,
+                    redraw=self._curve_is_active(self._c_torque))
+                self._f0_torque_pending = False
+            elif (self._f0_torque_pending and
+                  time.time() - self._last_high_angle_time > 1.0):
+                if self._torque_curve_source != "f0":
+                    self._c_torque.clear()
+                    self._c_torque.reset_sample_rate()
+                    self._torque_curve_source = "f0"
+                self._c_torque.set_source_processing(
+                    f"无F1：F0 单帧 Iq × Kt（Kt={estimator.kt:g} N·m/A，标称10 Hz）")
+                self._c_torque.append(
+                    {"实际": torque_from_iq(f.current_actual)},
+                    redraw=self._curve_is_active(self._c_torque))
+                self._f0_torque_pending = False
 
             if high_count:
                 self._c_angle.append_columns({
@@ -2417,6 +2520,22 @@ class MonitorPage(QWidget):
                 "display_filter": str(snapshot_meta["display_filter"]),
                 "unit": curve._y_label,
             })
+        for key, channel, series in (
+                ("i_alpha", "stationary_current", "Iα"),
+                ("i_beta", "stationary_current", "Iβ"),
+                ("v_alpha", "stationary_voltage", "Vα"),
+                ("v_beta", "stationary_voltage", "Vβ")):
+            signal = self.fourier_snapshot(key)
+            if signal["values"]:
+                snapshot.append({
+                    "channel": channel,
+                    "times": tuple(signal["times"]),
+                    "series": ((series, tuple(signal["values"])),),
+                    "sampling_rate_hz": float(signal["sample_rate_hz"]),
+                    "source_filter": signal["source_processing"],
+                    "display_filter": signal["display_filter"],
+                    "unit": signal["unit"],
+                })
         return snapshot
 
     def _write_curves_csv(self, path: str) -> None:

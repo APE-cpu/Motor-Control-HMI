@@ -21,6 +21,8 @@ from PySide6.QtWidgets import (
 )
 
 from ai.ai_client import AIClient
+from ai.jev_client import JevClient
+from ai.laya_client import LayaClient
 from ai.diagnostic_tools import create_read_only_registry
 from ai.harness import (
     AgentRuntime, AuditLog, DiagnosticTelemetryStore, ToolContext, ToolExecutor,
@@ -37,6 +39,19 @@ _REPORT_DIR = writable_path("reports", ".keep").parent
 _TOOL_AUDIT_FILE = writable_path("logs", "ai_tool_audit.jsonl")
 
 _AI_PRESETS = {
+    "JEV": {
+        "base_url": "https://api.typesafe.ai/v1",
+        "model": "jev-latest",
+        "provider": "jev"},
+    "Laya（本地）": {
+        "base_url": "http://127.0.0.1:8766",
+        "model": "laya",
+        "provider": "laya",
+        "native_executable": (
+            "C:/laya-build-vulkan-current2/bin/Release/laya-cli.exe"),
+        "native_model_dir": "C:/laya-models/english",
+        "backend": "vulkan",
+        "precision": "bf16"},
     "DeepSeek": {
         "base_url": "https://api.deepseek.com", "model": "deepseek-v4-pro"},
     "Kimi": {
@@ -129,6 +144,26 @@ class _ToolWorker(QObject):
             reply = self._runtime.run(
                 self._messages, on_event=self.event.emit)
             self.finished.emit(reply)
+        except Exception as exc:
+            self.error.emit(str(exc))
+
+
+class _DecisionWorker(QObject):
+    """JEV/Laya 不支持聊天流；在后台执行一次结构化诊断。"""
+
+    finished = Signal(str)
+    error = Signal(str)
+
+    def __init__(self, client, question: str, snapshot: str) -> None:
+        super().__init__()
+        self._client = client
+        self._question = question
+        self._snapshot = snapshot
+
+    def run(self) -> None:
+        try:
+            self.finished.emit(self._client.diagnose(
+                self._question, self._snapshot, timeout=AI_REQUEST_TIMEOUT))
         except Exception as exc:
             self.error.emit(str(exc))
 
@@ -242,15 +277,15 @@ class AIPage(QWidget):
     def _build_chat_box(self) -> QGroupBox:
         box = QGroupBox("诊断对话 · AI可自主调用只读工具")
         v = QVBoxLayout(box)
-        tool_status = QLabel(
+        self._tool_status = QLabel(
             "只读Harness已启用：运行状态｜固件参数｜同步波形快照｜时域分析｜"
             "FFT｜电流环模型。不会改参数、启停电机或烧录固件。")
-        tool_status.setWordWrap(True)
-        tool_status.setStyleSheet(
+        self._tool_status.setWordWrap(True)
+        self._tool_status.setStyleSheet(
             "color:#80cbc4; background:rgba(24,93,96,70);"
             "border:1px solid #285b63; border-radius:6px; padding:6px;")
-        tool_status.setToolTip(f"工具调用审计日志：\n{_TOOL_AUDIT_FILE}")
-        v.addWidget(tool_status)
+        self._tool_status.setToolTip(f"工具调用审计日志：\n{_TOOL_AUDIT_FILE}")
+        v.addWidget(self._tool_status)
         self._chat_display = QPlainTextEdit()
         self._chat_display.setReadOnly(True)
         v.addWidget(self._chat_display, 1)
@@ -388,8 +423,37 @@ class AIPage(QWidget):
         self._api_key.setText(cfg.get("api_key", ""))
         self._model.setText(cfg.get("model", AI_DEFAULT_MODEL))
         self._apply_config()
-        key_state = "密钥已保存" if cfg.get("api_key") else "请填写该模型的密钥"
-        self._config_status.setText(f"已选择 {name}（{key_state}）")
+        provider = cfg.get("provider", _AI_PRESETS.get(name, {}).get(
+            "provider", "openai"))
+        if provider == "laya":
+            key_state = "本地模型无需密钥"
+        else:
+            key_state = "密钥已保存" if cfg.get("api_key") else "请填写该模型的密钥"
+        capability = {
+            "jev": "结构化快速判定",
+            "laya": "本地离线结构化判定",
+        }.get(provider, "对话与工具诊断")
+        self._config_status.setText(
+            f"已选择 {name}（{key_state}；{capability}）")
+        if hasattr(self, "_chk_tools"):
+            is_decision_model = provider in {"jev", "laya"}
+            self._chk_tools.setEnabled(not is_decision_model)
+            self._api_key.setEnabled(provider != "laya")
+            self._api_key.setPlaceholderText(
+                "本地模型无需密钥" if provider == "laya" else "sk-...")
+            if provider == "jev":
+                self._tool_status.setText(
+                    "JEV结构化判定：直接评估当前文本遥测快照，不调用Harness，"
+                    "不生成长文本，也不会改参数、启停电机或烧录固件。")
+            elif provider == "laya":
+                self._tool_status.setText(
+                    "Laya本地离线判定：按需启动laya.cpp（Vulkan/BF16），"
+                    "由独立工作线程等待冷启动，只访问127.0.0.1，"
+                    "不调用Harness、不上传遥测，也不会改参数、启停电机或烧录固件。")
+            else:
+                self._tool_status.setText(
+                    "只读Harness已启用：运行状态｜固件参数｜同步波形快照｜"
+                    "时域分析｜FFT｜电流环模型。不会改参数、启停电机或烧录固件。")
 
     def _load_config(self) -> None:
         try:
@@ -403,32 +467,71 @@ class AIPage(QWidget):
                     "api_key": cfg.get("api_key", ""),
                     "model": cfg.get("model", _AI_PRESETS["DeepSeek"]["model"]),
                 }
-            selected = cfg.get("selected_profile", "DeepSeek")
+            selected = cfg.get("selected_profile", "JEV")
             index = self._profile.findText(selected)
             self._profile.setCurrentIndex(index if index >= 0 else 0)
             self._on_profile_changed(self._profile.currentText())
         except FileNotFoundError:
-            pass
+            self._saved_profiles = {}
+            self._profile.setCurrentText("JEV")
+            self._on_profile_changed("JEV")
         except Exception as e:
             self._config_status.setText(f"加载失败：{e}")
 
     def _save_config_file(self, url: str, key: str, model: str) -> None:
         name = self._profile.currentText()
         self._saved_profiles = getattr(self, "_saved_profiles", {})
+        preset = _AI_PRESETS.get(name, {})
         self._saved_profiles[name] = {
-            "base_url": url, "api_key": key, "model": model}
+            "base_url": url, "api_key": key, "model": model,
+            "provider": preset.get("provider", "openai")}
+        for field in (
+                "service_dir", "native_executable", "native_model_dir",
+                "backend", "precision", "device"):
+            if field in preset:
+                self._saved_profiles[name][field] = preset[field]
         cfg = {"selected_profile": name, "profiles": self._saved_profiles}
         with open(_CONFIG_FILE, "w", encoding="utf-8") as f:
             json.dump(cfg, f, ensure_ascii=False, indent=2)
 
     def _apply_config(self) -> None:
-        url = _normalize_url(self._base_url.text().strip())
+        name = self._profile.currentText()
+        cfg = (getattr(self, "_saved_profiles", {}).get(name)
+               or _AI_PRESETS.get(name, {}))
+        provider = cfg.get("provider", "openai")
+        raw_url = self._base_url.text().strip()
+        url = raw_url.rstrip("/") if provider == "laya" else _normalize_url(raw_url)
         key = self._api_key.text().strip()
         model = self._model.text().strip()
-        self._client = AIClient(url, key, model)
-        self._agent_runtime = AgentRuntime(
-            self._client, self._tool_registry, self._tool_executor,
-            max_rounds=8)
+        old_laya = getattr(self, "_laya_client", None)
+        if old_laya is not None:
+            old_laya.close()
+        self._laya_client = None
+        if provider == "jev":
+            self._jev_client = JevClient(url, key, model)
+            self._client = None
+            self._agent_runtime = None
+        elif provider == "laya":
+            preset = _AI_PRESETS["Laya（本地）"]
+            self._laya_client = LayaClient(
+                url, cfg.get("service_dir"),
+                native_executable=(cfg.get("native_executable") or
+                                   preset.get("native_executable")),
+                native_model_dir=(cfg.get("native_model_dir") or
+                                  preset.get("native_model_dir")),
+                backend=cfg.get("backend", preset.get("backend", "vulkan")),
+                precision=cfg.get(
+                    "precision", preset.get("precision", "bf16")),
+                device=cfg.get("device", preset.get("device", 0)))
+            self._jev_client = None
+            self._client = None
+            self._agent_runtime = None
+        else:
+            self._jev_client = None
+            self._client = AIClient(url, key, model)
+            self._agent_runtime = AgentRuntime(
+                self._client, self._tool_registry, self._tool_executor,
+                max_rounds=8)
 
     # -------- slots --------
     def _on_save_config(self) -> None:
@@ -441,8 +544,13 @@ class AIPage(QWidget):
         self._apply_config()
         try:
             self._save_config_file(url, key, model)
+            provider = _AI_PRESETS.get(
+                self._profile.currentText(), {}).get("provider", "openai")
+            credential_state = (
+                "本地模型无需密钥" if provider == "laya" else "密钥已保存")
             self._config_status.setText(
-                f"已保存 {self._profile.currentText()}（模型：{model}，密钥已保存）")
+                f"已保存 {self._profile.currentText()}"
+                f"（模型：{model}，{credential_state}）")
             logger.log("保存AI配置", f"模型={model}")
         except Exception as e:
             self._config_status.setText(f"内存已保存，文件写入失败：{e}")
@@ -641,7 +749,9 @@ class AIPage(QWidget):
         question = self._input.text().strip()
         if not question:
             return
-        if not hasattr(self, "_client"):
+        decision_client = (getattr(self, "_jev_client", None)
+                           or getattr(self, "_laya_client", None))
+        if getattr(self, "_client", None) is None and decision_client is None:
             self._append_chat("系统", "请先填写 API 配置并点击「保存配置」。")
             return
         # Qt控件只在UI线程读取；后台工具仅访问这份不可变参数副本。
@@ -662,6 +772,11 @@ class AIPage(QWidget):
         self._btn_send.setEnabled(False)
         self._btn_send.setText("等待回复…")
         logger.log("AI分析提问", (question + suffix)[:80])
+
+        if attachments and decision_client is not None:
+            self._append_chat(
+                "系统", "当前结构化决策模型只接收文本状态，不支持图片；本次忽略附件。")
+            attachments = []
 
         if attachments:
             user_content = [{"type": "text", "text": question}]
@@ -701,14 +816,17 @@ class AIPage(QWidget):
         ]
 
         self._stream_started = False
-        use_tools = (self._chk_tools.isChecked() and not attachments and
-                     self._agent_runtime is not None)
-        if use_tools:
-            self._worker = _ToolWorker(self._agent_runtime, messages)
-            self._worker.event.connect(self._on_tool_event)
+        if decision_client is not None:
+            self._worker = _DecisionWorker(decision_client, question, snapshot)
         else:
-            self._worker = _Worker(self._client, messages)
-            self._worker.chunk.connect(self._on_chunk)
+            use_tools = (self._chk_tools.isChecked() and not attachments and
+                     self._agent_runtime is not None)
+            if use_tools:
+                self._worker = _ToolWorker(self._agent_runtime, messages)
+                self._worker.event.connect(self._on_tool_event)
+            else:
+                self._worker = _Worker(self._client, messages)
+                self._worker.chunk.connect(self._on_chunk)
         self._worker.finished.connect(self._on_stream_done)
         self._worker.error.connect(self._on_stream_error)
         threading.Thread(target=self._worker.run, daemon=True).start()

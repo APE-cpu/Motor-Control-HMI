@@ -20,7 +20,7 @@ from config.config import (
     F1_CURRENT_A_PER_DIGIT, F1_VBUS_PARTITION_FACTOR,
     FRAME_HEADER, FRAME_TAIL,
     TELEM_ANGLE_SCALE, TELEM_CURRENT_SCALE, TELEM_FMT, TELEM_FMT_CAN,
-    TELEM_LEN, TELEM_LEN_CAN, TELEM_TEMP_OFFSET, TELEM_TORQUE_FROM_CURRENT,
+    TELEM_LEN, TELEM_LEN_CAN, TELEM_TEMP_OFFSET, TORQUE_CONSTANT_NM_PER_A,
     TELEM_FLAG_DRIVER_FAULT, TELEM_FLAG_EMERGENCY_FAULT,
     TELEM_FLAG_LOW_SPEED_WARN, TELEM_FLAG_OVERCURRENT_FAULT,
 )
@@ -45,7 +45,8 @@ from .native_transport import (
     native_tcp_transport_mode,
 )
 from .native_telemetry import (
-    NativeTelemetryProcessor, native_telemetry_enabled,
+    NativeTelemetryProcessor, create_native_vector_trail,
+    native_telemetry_enabled,
 )
 from .protocol_v2 import (
     MessageType, ProtocolV2Error, V2Frame,
@@ -273,6 +274,7 @@ class CommManager(QObject):
         }
         # 数字孪生 L1：PMSM 物理模型（虚拟下位机）
         self._motor_sim = MotorSim()
+        self._native_vector_trail = create_native_vector_trail()
 
     # ------------------ 公共接口 ------------------
     def connect(self, kind: str, **cfg) -> bool:
@@ -1655,6 +1657,9 @@ class CommManager(QObject):
         if (telemetry.fault_code and
                 telemetry.fault_text in {"", "MCSDK fault active"}):
             telemetry.fault_text = decode_motor_fault_code(telemetry.fault_code)
+        # 下位机不测转矩：不采用固件上报值，统一按上位机 Kt·Iq 计算
+        telemetry.torque_actual = telemetry.current_actual * TORQUE_CONSTANT_NM_PER_A
+        telemetry.torque_target = telemetry.current_target * TORQUE_CONSTANT_NM_PER_A
         telemetry.data_source = (
             "sim" if self._protocol_mode == "virtual-v2" else "real")
         return telemetry
@@ -1933,7 +1938,8 @@ class CommManager(QObject):
         try:
             frames = receiver.drain(self._NATIVE_TELEM_DRAIN_MAX_FRAMES)
             columns = receiver.drain_f1_columns(
-                self._NATIVE_TELEM_DRAIN_MAX_SAMPLES)
+                self._NATIVE_TELEM_DRAIN_MAX_SAMPLES,
+                self._native_vector_trail)
             f2_samples = receiver.drain_f2(
                 self._NATIVE_TELEM_DRAIN_MAX_DIAGNOSTICS)
             f3_samples = receiver.drain_f3(
@@ -2312,7 +2318,7 @@ class CommManager(QObject):
             TELEM_FLAG_OVERCURRENT_FAULT | TELEM_FLAG_DRIVER_FAULT |
             TELEM_FLAG_EMERGENCY_FAULT)
         f.fault_text = "；".join(fault_names)
-        f.torque_actual = f.current_actual * TELEM_TORQUE_FROM_CURRENT
+        f.torque_actual = f.current_actual * TORQUE_CONSTANT_NM_PER_A
         f.torque_target = self._latest_frame.torque_target
         # 真机协议暂无母线字段，沿用上一帧（待协议扩展 CMD 后替换）
         f.vdc = self._latest_frame.vdc
@@ -2342,7 +2348,7 @@ class CommManager(QObject):
         f.speed_target = float(spd_tgt)
         f.current_actual = cur_ma / TELEM_CURRENT_SCALE
         f.angle_raw = float(raw)
-        f.torque_actual = f.current_actual * TELEM_TORQUE_FROM_CURRENT
+        f.torque_actual = f.current_actual * TORQUE_CONSTANT_NM_PER_A
         f.sensor_source = self._active_sensor_name
         f.data_source = "real_partial"
         return f

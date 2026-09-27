@@ -73,6 +73,13 @@ from contaminating the identification interval.
 The hot F1 UI path uses a columnar batch (`drain_f1_columns`) so one Python
 object carries whole arrays of angle, speed, current, and voltage values. The
 legacy list-of-dictionaries API remains available for compatibility and tests.
+When the vector page is visible and enabled, `drain_f1_columns` also hands the
+decoded C++ F1 samples to a `VectorTrail` object before creating Python columns.
+The native trail continuously selects at most 1000 points/s, computes the
+current/flux coordinates, and retains at most 4000 points. The ~30 Hz UI refresh
+receives numeric NumPy arrays rather than per-point Python objects. The Python
+columns remain available to the monitor, CSV recorder, and other pages; the
+simulation and compatibility paths still use their existing Python renderer.
 
 Build and install into the active Python environment:
 
@@ -80,10 +87,20 @@ Build and install into the active Python environment:
 python -m pip install .
 ```
 
+For the source launcher, install a locally built copy beside the project
+without replacing a `.pyd` held open by an existing HMI process:
+
+```powershell
+python -m pip install --no-deps --upgrade --target ..\native_core_runtime .
+```
+
+The source launcher prefers `native_core_runtime`; it falls back to the
+environment's installed extension when that directory is absent.
+
 The application selects `motor_core_cpp` automatically when it is importable.
-The module also exports `telemetry_schema_version=3`; both the standalone
-telemetry parser and the native TCP receiver reject an older binary instead of
-silently interpreting tagged F1/40 frames with a stale ABI.
+The module exports `telemetry_schema_version=4`. The host requires schema 3 or
+newer for F1/40; a schema-3 binary keeps the Python vector fallback, while
+schema 4 exposes `VectorTrail` for the native point-cloud path.
 Set `MOTOR_HMI_NATIVE_PROTOCOL=python` to force the Python decoder, or
 `MOTOR_HMI_NATIVE_PROTOCOL=native` to fail fast when the native extension is
 missing. `auto` is the default and safely falls back to Python.

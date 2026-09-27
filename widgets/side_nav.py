@@ -19,6 +19,8 @@ from PySide6.QtGui import (
 from PySide6.QtWidgets import (
     QListWidget, QListWidgetItem, QWidget, QHBoxLayout, QLabel,
 )
+from ui_theme import appearance_manager, current_theme, theme_color
+from widgets.nav_icons import navigation_icon
 
 
 class _DotMatrix(QWidget):
@@ -82,6 +84,11 @@ class _DotMatrix(QWidget):
         self._timer.timeout.connect(self._tick)
         self._phase = "idle"
         self._t = 0
+        appearance_manager().themeChanged.connect(self._refresh_colors)
+
+    def _refresh_colors(self, _theme_id=None) -> None:
+        self._colors = [self._lerp_color(c / (self.COLS - 1)) for c in range(self.COLS)]
+        self.update()
 
     # ---------- 公共接口 ----------
 
@@ -106,9 +113,11 @@ class _DotMatrix(QWidget):
 
     @classmethod
     def _lerp_color(cls, t: float) -> QColor:
-        r = cls._C0[0] + (cls._C1[0] - cls._C0[0]) * t
-        g = cls._C0[1] + (cls._C1[1] - cls._C0[1]) * t
-        b = cls._C0[2] + (cls._C1[2] - cls._C0[2]) * t
+        low = QColor(current_theme().primary).lighter(125)
+        high = QColor(current_theme().accent)
+        r = low.red() + (high.red() - low.red()) * t
+        g = low.green() + (high.green() - low.green()) * t
+        b = low.blue() + (high.blue() - low.blue()) * t
         return QColor(int(r), int(g), int(b))
 
     @staticmethod
@@ -299,11 +308,11 @@ class _HeaderRow(QWidget):
         # 左右顶满:只留上下 1px 缝隙,避免与相邻元素粘连
         rect = self.rect().adjusted(0, 1, 0, -1)
         if self._hover:
-            p.setBrush(QColor("#19212e"))
-            p.setPen(QPen(QColor(120, 152, 186, 90), 1))
+            p.setBrush(theme_color("#19212e"))
+            p.setPen(QPen(theme_color("#3b4557"), 1))
         else:
-            p.setBrush(QColor("#151b27"))
-            p.setPen(QPen(QColor("#232b38"), 1))
+            p.setBrush(theme_color("#151b27"))
+            p.setPen(QPen(theme_color("#232b38"), 1))
         p.drawRoundedRect(rect, 4, 4)
         p.end()
         super().paintEvent(ev)
@@ -336,8 +345,8 @@ class _Indicator(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.Antialiasing)
         g = QLinearGradient(0, 0, 0, self.height())
-        g.setColorAt(0.0, QColor(*_DotMatrix._C0))
-        g.setColorAt(1.0, QColor(*_DotMatrix._C1))
+        g.setColorAt(0.0, theme_color("#1976d2"))
+        g.setColorAt(1.0, theme_color("#4fc3f7"))
         p.setPen(Qt.NoPen)
         p.setBrush(g)
         p.drawRoundedRect(self.rect(), self.W / 2, self.W / 2)
@@ -359,8 +368,9 @@ class SideNav(QListWidget):
         self.setMinimumWidth(140)
         self.setMaximumWidth(180)
         self.setFocusPolicy(Qt.NoFocus)
-        self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.setIconSize(QSize(20, 20))
 
         self._headers: List[_HeaderRow] = []
         self._header_rows: List[int] = []
@@ -386,6 +396,7 @@ class SideNav(QListWidget):
             cur_row += 1
             for text, page_idx in entries:
                 item = QListWidgetItem(text)
+                item.setIcon(navigation_icon(text, current_theme()))
                 item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                 item.setData(Qt.UserRole, page_idx)
                 self.addItem(item)
@@ -393,6 +404,7 @@ class SideNav(QListWidget):
                 cur_row += 1
 
         self.currentRowChanged.connect(self._on_row_changed)
+        appearance_manager().themeChanged.connect(self._refresh_icons)
         # 悬停追踪:条目区走 viewport 事件,标题卡片走自身 enterEvent
         self.viewport().setMouseTracking(True)
         self.viewport().installEventFilter(self)
@@ -405,6 +417,13 @@ class SideNav(QListWidget):
         # 回调，避免窗口快速销毁后访问已经释放的 C++ 控件。
 
     # ---------- 卡片几何:强制占满整行 ----------
+
+    def _refresh_icons(self, _theme_id=None) -> None:
+        theme = current_theme()
+        for row in range(self.count()):
+            item = self.item(row)
+            if item.data(Qt.UserRole) >= 0:
+                item.setIcon(navigation_icon(item.text(), theme))
 
     def updateGeometries(self) -> None:  # noqa: N802 - Qt signature
         super().updateGeometries()

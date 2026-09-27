@@ -4,13 +4,55 @@ from collections import deque
 from PySide6.QtWidgets import QApplication
 
 from communications.comm_manager import CommManager, TelemetryFrame
-from pages.ai_page import AIPage
+from pages.ai_page import AIPage, _AI_PRESETS
 from pages.control_page import ControlPage
 from PySide6.QtWidgets import QInputDialog, QMessageBox
 
 
 def _app():
     return QApplication.instance() or QApplication([])
+
+
+def test_jev是ai诊断默认档案():
+    assert next(iter(_AI_PRESETS)) == "JEV"
+    assert _AI_PRESETS["JEV"] == {
+        "base_url": "https://api.typesafe.ai/v1",
+        "model": "jev-latest",
+        "provider": "jev",
+    }
+
+
+def test_laya本地档案可切换且不要求密钥(tmp_path, monkeypatch):
+    _app()
+    monkeypatch.setattr("pages.ai_page._CONFIG_FILE", tmp_path / "missing.json")
+    page = AIPage(CommManager())
+    page._profile.setCurrentText("Laya（本地）")
+
+    assert page._base_url.text() == "http://127.0.0.1:8766"
+    assert page._model.text() == "laya"
+    assert page._api_key.isEnabled() is False
+    assert page._chk_tools.isEnabled() is False
+    assert type(page._laya_client).__name__ == "LayaClient"
+    assert page._laya_client.is_native is True
+    assert page._laya_client.backend == "vulkan"
+    assert page._laya_client.precision == "bf16"
+    assert "本地离线" in page._config_status.text()
+    assert "无需密钥" in page._config_status.text()
+
+
+def test_无本地配置时默认选择jev(tmp_path, monkeypatch):
+    _app()
+    monkeypatch.setattr("pages.ai_page._CONFIG_FILE", tmp_path / "missing.json")
+    page = AIPage(CommManager())
+    assert page._profile.currentText() == "JEV"
+    assert page._model.text() == "jev-latest"
+    assert page._base_url.text() == "https://api.typesafe.ai/v1"
+    assert page._chk_tools.isEnabled() is False
+    assert "不调用Harness" in page._tool_status.text()
+
+    page._profile.setCurrentText("Kimi")
+    assert page._chk_tools.isEnabled() is True
+    assert "只读Harness已启用" in page._tool_status.text()
 
 
 def test_ai高速历史按列保存不复制逐样本字典():

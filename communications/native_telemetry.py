@@ -74,6 +74,12 @@ def native_telemetry_available() -> bool:
     return _native is not None and hasattr(_native, "TelemetryProcessor")
 
 
+def create_native_vector_trail():
+    """创建 F1 原生点云缓存；旧版二进制自然退回 Python 绘图链。"""
+    return (_native.VectorTrail() if _native is not None
+            and hasattr(_native, "VectorTrail") else None)
+
+
 def native_telemetry_mode() -> str:
     mode = os.getenv("MOTOR_HMI_NATIVE_TELEMETRY", "auto").strip().lower()
     if mode not in {"auto", "native", "python"}:
@@ -262,9 +268,12 @@ class NativeTelemetryProcessor:
     def drain_f1(self, max_samples: int = 8192) -> list[dict]:
         return list(self._processor.drain_f1(max(1, int(max_samples))))
 
-    def drain_f1_columns(self, max_samples: int = 8192) -> dict:
+    def drain_f1_columns(self, max_samples: int = 8192,
+                         vector_trail=None) -> dict:
+        count = max(1, int(max_samples))
         return dict(self._processor.drain_f1_columns(
-            max(1, int(max_samples))))
+            count, vector_trail) if vector_trail is not None else
+            self._processor.drain_f1_columns(count))
 
     def drain_f2(self, max_samples: int = 512) -> list[dict]:
         return list(self._processor.drain_f2(max(1, int(max_samples))))

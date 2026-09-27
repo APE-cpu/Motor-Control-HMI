@@ -7,8 +7,45 @@ import pytest
 
 from config.config import F1_CURRENT_A_PER_DIGIT
 from communications.native_telemetry import (
-    NativeTelemetryProcessor, native_telemetry_available,
+    NativeTelemetryProcessor, create_native_vector_trail,
+    native_telemetry_available,
 )
+
+
+def test_native_vector_trail_consumes_f1_without_python_point_objects():
+    import numpy as np
+
+    trail = create_native_vector_trail()
+    assert trail is not None
+    trail.configure(True, False, 0.006, 0.00066)
+    processor = NativeTelemetryProcessor()
+    processor.set_f1_rate_hz(16000)
+    sample = struct.pack(
+        "<IHHhhhhhhhhhHH", 42, 73, 32768, 500, 2000, -321, 1990, 25,
+        1200, -600, -1000, 6000,
+        round(24.0 * 0.0270 / 3.30 * 65536.0), 0xF130)
+    assert processor.ingest(0xF1, sample * 160)
+    columns = processor.drain_f1_columns(vector_trail=trail)
+    snapshot = trail.snapshot()
+
+    assert columns["vector_native"] is True
+    assert len(snapshot["current_x"]) == 10  # 16 kHz → 1 kHz
+    assert isinstance(snapshot["current_x"], np.ndarray)
+    assert snapshot["current_x"] == pytest.approx([0.0] * 10, abs=1e-12)
+    assert snapshot["current_y"] == pytest.approx(
+        [-columns["iq_a"][0]] * 10)
+    assert snapshot["flux_x"] == pytest.approx([-0.006] * 10, abs=1e-12)
+
+    trail.configure(True, True, 0.006, 0.00066)
+    assert processor.ingest(0xF1, sample * 16)
+    processor.drain_f1_columns(vector_trail=trail)
+    clarke_snapshot = trail.snapshot()
+    assert len(clarke_snapshot["current_x"]) == 1
+    assert clarke_snapshot["current_x"][0] == pytest.approx(
+        columns["ia_a"][0])
+    assert clarke_snapshot["current_y"][0] == pytest.approx(
+        (columns["ia_a"][0] + 2 * columns["ib_a"][0]) /
+        math.sqrt(3.0))
 
 
 def test_CppESO_RLS逐样本复现R2024b_ESOrls黄金轨迹():

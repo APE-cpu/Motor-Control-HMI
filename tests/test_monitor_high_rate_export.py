@@ -92,7 +92,7 @@ def test_columnar_high_rate_batch_drives_curves_without_sample_dicts():
     page.close()
 
 
-def test_F1_40监控曲线优先显示PWM重构电压():
+def test_F1_40监控曲线优先显示PWM重构电压(tmp_path):
     _app()
     page = MonitorPage(CommManager())
     page._timer.stop()
@@ -100,7 +100,9 @@ def test_F1_40监控曲线优先显示PWM重构电压():
     page._last_telemetry_time = time.time()
     page._on_high_rate_telemetry_columns({
         "count": 2, "rate_hz": 16000,
-        "angle_deg": [0.0, 1.0], "speed_rpm": [100.0, 100.0],
+        "angle_deg": [0.0, 1.0],
+        "actuation_angle_deg": [90.0, 0.0],
+        "speed_rpm": [100.0, 100.0],
         "iq_a": [0.1, 0.1], "iqref_a": [0.1, 0.1],
         "ia_a": [0.1, 0.1], "ib_a": [-0.05, -0.05],
         "vd_raw": [30000.0, 30000.0], "vq_raw": [30000.0, 30000.0],
@@ -114,6 +116,20 @@ def test_F1_40监控曲线优先显示PWM重构电压():
     assert list(page._c_voltage._buffers["Vd"])[-2:] == [1.25, 1.5]
     assert list(page._c_voltage._buffers["Vq"])[-2:] == [2.5, 2.75]
     assert page.fourier_snapshot("vq")["unit"] == "V"
+    assert page.fourier_snapshot("v_alpha")["values"] == pytest.approx(
+        [1.25, 2.75])
+    assert page.fourier_snapshot("v_beta")["values"] == pytest.approx(
+        [-2.5, 1.5])
+    output = tmp_path / "waveforms.csv"
+    page._write_curves_csv(str(output))
+    with output.open(encoding="utf-8-sig", newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    stationary = {(row["channel"], row["series"])
+                  for row in rows}
+    assert ("stationary_current", "Iα") in stationary
+    assert ("stationary_current", "Iβ") in stationary
+    assert ("stationary_voltage", "Vα") in stationary
+    assert ("stationary_voltage", "Vβ") in stationary
     page.close()
 
 
