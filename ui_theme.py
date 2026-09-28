@@ -190,15 +190,7 @@ class ThemeManager(QObject):
 
         if is_plot:
             theme = THEMES[self.theme_id]
-            ancestor = widget
-            while ancestor is not None and not ancestor.property("artPage"):
-                ancestor = ancestor.parentWidget()
-            background = QColor(theme.field)
-            if ancestor is not None:
-                background.setAlpha(70)
-                widget.setAutoFillBackground(False)
-                widget.viewport().setAutoFillBackground(False)
-            widget.setBackground(background)
+            widget.setBackground(QColor(theme.field))
             # Axis chrome follows the theme; measured curve pens are untouched.
             for item in widget.scene().items():
                 if isinstance(item, pg.AxisItem):

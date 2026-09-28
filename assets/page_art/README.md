@@ -1,5 +1,17 @@
 # 页面插图
 
+## 当前使用：单色机械结构线稿
+
+2026-09-28：四个页面改用 `vector_structure.png`、`fourier_structure.png`、
+`identify_structure.png`、`twin_structure.png`。由内置 image_gen 生成，
+转子与整机素材再经 outline-only 编辑，原始生成文件未做离线加工。
+完整提示词保存在 [structure_prompts.json](structure_prompts.json)。
+Qt 在运行时统一为中性灰笔色，以 20% 不透明度绘制并做边缘渐隐。
+绘图区保持不透明，背景没有动画、定时器或零件图集加载。
+
+以下彩色插图和图集为先前版本留档，当前界面不再引用。
+
+
 2026-09-27 使用内置 image_gen 工具分别生成四张 1536×1024 PNG，生成模式 generate。
 原始图片直接复制到本目录；Qt 在运行时等比缩放、裁切并用主题背景渐隐，无离线改图。
 这些是装饰插图，不表示当前电机的真实结构或测量数据。
@@ -36,18 +48,18 @@ A complete compact industrial electric motor in three-quarter view, its front an
 ## 集成
 
 `widgets/page_artwork.py` 将插图叠放在整页底层，按尺寸、DPI、主题缓存绘制结果。
-结构面板和绘图区适度透明，输入框及按钮保持不透明；页面不为插图预留列或页眉。
+结构面板适度透明，绘图区、输入框和按钮保持不透明；页面不为插图预留列或页眉。
 `main_window.py` 保留原页面对象与页面索引，在滚动容器内包裹插图框架。
 `build_exe.bat` 的整个 assets 目录打包规则包含这些文件。
 导航图标在 `widgets/nav_icons.py` 中以 SVG 路径定义，不属于生成位图。
 
-## 零件重组动画（2026-09-28）
+## 已移除：零件重组动画（历史素材记录）
 
 `motor_parts.png`：内置 image_gen 的 generate + background-extraction edit 输出，保留原始 alpha 通道。
 2×2 图集顺序为前盖、转子轴、铜绕组定子、后壳。Qt 在运行时读取各零件区域，沿同一投影轴拆分和合拢。
 这是二维分层装饰动画，不是当前电机的三维 CAD 装配仿真。
 
-进入插图页播放约 1000 ms：展开 → 合拢 → 融入目标背景；参数辨识页停留在展开造型后融入拆解背景。
+旧版行为（现已移除）：进入插图页播放约 1000 ms：展开 → 合拢 → 融入目标背景；参数辨识页停留在展开造型后融入拆解背景。
 背景重绘最多约 30 Hz，动画结束、页面隐藏、连续切页或窗口关闭时立即停止。
 操作控件保持静止，动画层不接收鼠标事件。
 

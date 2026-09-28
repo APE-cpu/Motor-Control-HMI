@@ -11,6 +11,9 @@ native_core_runtime/
 
 # Logs（只忽略运行时日志输出，logs/ 下的 python 模块要进版本控制）
 logs/*.txt
+logs/*.log
+logs/*.jsonl
+artifacts/
 
 # Local config
 config/ai_config.json

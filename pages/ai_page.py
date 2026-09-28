@@ -190,6 +190,8 @@ class _IndexBuilder(QObject):
 
 
 class AIPage(QWidget):
+    requestStateChanged = Signal(bool)
+
     def __init__(self, comm: CommManager, monitor_page=None,
                  firmware_config_provider=None) -> None:
         super().__init__()
@@ -746,7 +748,21 @@ class AIPage(QWidget):
         else:
             self._attach_label.setText("")
 
+    @property
+    def request_busy(self) -> bool:
+        return not self._btn_send.isEnabled()
+
+    def send_question(self, question: str) -> bool:
+        """完整页和右侧栏共用一个请求入口，避免并发覆盖流式回复。"""
+        if self.request_busy or not question.strip():
+            return False
+        self._input.setText(question)
+        self._on_send()
+        return self.request_busy
+
     def _on_send(self) -> None:
+        if self.request_busy:
+            return
         question = self._input.text().strip()
         if not question:
             return
@@ -772,6 +788,7 @@ class AIPage(QWidget):
         self._input.clear()
         self._btn_send.setEnabled(False)
         self._btn_send.setText("等待回复…")
+        self.requestStateChanged.emit(True)
         logger.log("AI分析提问", (question + suffix)[:80])
 
         if attachments and decision_client is not None:
@@ -861,6 +878,7 @@ class AIPage(QWidget):
         self._btn_send.setText("发送")
         logger.log("AI分析回复", full[:80])
         self._worker = None
+        self.requestStateChanged.emit(False)
 
     def _on_stream_error(self, err: str) -> None:
         if self._stream_started:
@@ -871,6 +889,7 @@ class AIPage(QWidget):
         self._btn_send.setText("发送")
         logger.log("AI分析失败", err[:120])
         self._worker = None
+        self.requestStateChanged.emit(False)
 
     def _append_chat(self, role: str, text: str) -> None:
         self._chat_display.appendPlainText(f"【{role}】{text}\n")
