@@ -79,7 +79,8 @@ def stft_map(t, y, fs, window=512, fmax=None):
 
 def cwt_map(t, y, fs, fmin, fmax, cancel=lambda: False):
     if not 0 < fmin < fmax <= fs/2:
-        raise ValueError("小波频率范围应满足 0 < 下限 < 上限 ≤ 奈奎斯特频率")
+        raise ValueError(f"小波频率范围应满足 0 < 下限 < 上限 ≤ {fs/2:.9g} Hz；"
+                         f"当前为 {fmin:.9g}～{fmax:.9g} Hz")
     # FFT convolution one scale at a time; bounded input, no scales × raw-N array.
     if len(y) > 262144:
         raise ValueError("小波分析最多 262,144 点，请缩小时间区间")

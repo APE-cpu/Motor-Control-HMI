@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QThread, Signal, QRectF, Qt
+from PySide6.QtCore import QThread, Signal, QRectF, Qt, QSignalBlocker
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QDoubleSpinBox, QSpinBox, QToolButton,
     QFileDialog, QMessageBox)
@@ -107,8 +107,12 @@ class DynamicAnalysisDialog(QDialog):
         self.window = QSpinBox()
         self.window.setRange(32, 8192)
         self.window.setValue(512 if empty else min(512, len(y)))
-        self.fmin = double_spin(10. if empty else max(1., fs/len(y)*4), .001, fs/2)
-        self.fmax = double_spin(min(500., fs/2), .01, fs/2)
+        self.fmin = double_spin(10. if empty else max(1., fs/len(y)*4), .000001,
+                                max(.000002, fs/2), decimals=6)
+        self.fmax = double_spin(min(500., fs/2), .000002,
+                                max(.000002, fs/2), decimals=6)
+        self.fmax.valueChanged.connect(self._limit_min_frequency)
+        self._sync_frequency_bounds(fs)
         self.ref_kind = QComboBox()
         self.ref_kind.addItems(["机械阶次 · rpm", "电气阶次 · 电角度°"])
         self.reference = QComboBox()
@@ -193,6 +197,7 @@ class DynamicAnalysisDialog(QDialog):
             return
         try:
             label, snapshot, references, interval = self.source_provider()
+            source_changed = label != self.source_label or self._using_demo
             self.snapshot, self.references = snapshot, references
             self.source_label = label
             self._using_demo = False
@@ -221,8 +226,13 @@ class DynamicAnalysisDialog(QDialog):
                 self.end.setValue(interval[1] if interval else t[-1])
                 self.event.setValue(t[0]+.2*(t[-1]-t[0]))
                 self.target.setValue(float(np.median(y[-max(5,len(y)//10):])))
-                self.fmax.setMaximum(fs/2)
-                self.fmin.setMaximum(fs/2)
+                self._sync_frequency_bounds(fs)
+                if source_changed:
+                    # A torque channel's tiny band is unsuitable for a short
+                    # high-rate current capture. Reset only on source changes;
+                    # rereading the same signal retains user-selected bounds.
+                    self.fmax.setValue(min(500., self.fmax.maximum()))
+                    self.fmin.setValue(min(self.fmax.value()/2, 4*fs/len(y)))
                 self.status.setText(f"已读取 {len(y):,} 点；调整区间后开始分析")
                 if self.mode.currentIndex() == 3:
                     self._locate_step()
@@ -230,6 +240,29 @@ class DynamicAnalysisDialog(QDialog):
                 self.status.setText("所选信号暂无数据，可先查看演示")
         except Exception as exc:
             self.status.setText(str(exc))
+
+    def _limit_min_frequency(self, _value=None):
+        # The lower endpoint is always strictly below the upper endpoint.
+        quantum = 10.**-self.fmin.decimals()
+        previous = self.fmin.value()
+        self.fmin.setMaximum(max(quantum, self.fmax.value()-quantum))
+        if previous >= self.fmax.value():
+            self.fmin.setValue(max(quantum, self.fmax.value()/10))
+
+    def _sync_frequency_bounds(self, fs):
+        # QDoubleSpinBox rounds its maximum, which can otherwise round UP past
+        # Nyquist. Floor to the displayed precision before updating the widget.
+        quantum = 10.**-self.fmax.decimals()
+        nyquist = float(fs)/2
+        if not np.isfinite(nyquist) or nyquist < 2*quantum:
+            raise ValueError("采样率过低，无法设置有效的小波频率范围")
+        upper = np.floor(nyquist/quantum)*quantum
+        if upper > nyquist:
+            upper -= quantum
+        with QSignalBlocker(self.fmax):
+            self.fmax.setMaximum(upper)
+        self._limit_min_frequency()
+        self.fmax.setToolTip(f"按当前时间戳计算，最高允许频率为 {nyquist:.9g} Hz")
 
     def _change_palette(self):
         name = self.palette.currentData()
@@ -322,7 +355,7 @@ class DynamicAnalysisDialog(QDialog):
         self.sat_source.addItems(["无饱和分析", "按当前信号绝对限幅推断"])
         self.start.setValue(0)
         self.end.setValue(1.99975)
-        self.fmax.setMaximum(2000)
+        self._sync_frequency_bounds(4000)
         self.fmax.setValue(500)
         self.fmin.setValue(10)
         self.ref_kind.setCurrentIndex(0)
@@ -353,6 +386,8 @@ class DynamicAnalysisDialog(QDialog):
             interval = (self.start.value(), self.end.value())
             mode = self.mode.currentIndex()
             t, y, fs = series(self.snapshot, interval, timing="raw" if mode == 3 else "resample")
+            if mode in (0, 1):
+                self._sync_frequency_bounds(fs)
             ref = self.references[self.reference.currentText()]() if mode == 2 else None
             if ref is not None:
                 unit = str(ref.get("unit", "")).strip()
@@ -503,6 +538,9 @@ class DynamicAnalysisDialog(QDialog):
                                 + " ｜ 色标以本图峰值为 0 dB；跨实验定量比较请使用导出的原始功率")
             if result.get("message"):
                 self.status.setText(result["message"]+f" ｜ Δ阶次 = {result['resolution']:.4g}")
+            elif not finite.size:
+                self.status.setText("当前频率范围在所选时段内没有有效小波系数（全部处于边缘影响区）；"
+                                    "请扩大时间范围或提高分析频率")
         self.map_plot.enableAutoRange()
         self.export.setEnabled(True)
 

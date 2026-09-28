@@ -227,3 +227,51 @@ def test_category_switch_refreshes_existing_panel_and_locates_reference_step(app
     # Explicit call also catches exceptions otherwise swallowed by Qt signals.
     page._sync_analysis_source()
     page.close()
+
+
+@pytest.mark.parametrize("fs", [7.213456, 99.99999, 499.999999])
+def test_cwt_frequency_bounds_survive_low_rate_and_rounding(app, fs):
+    t = np.arange(1000)/fs
+    snapshot = dict(times=t, values=np.sin(2*np.pi*fs*.1*t), sample_rate_hz=fs)
+    dialog = DynamicAnalysisDialog("空缓冲", dict(times=[], values=[]), fixed_mode=1,
+        source_provider=lambda: ("低速信号", snapshot, {}, None))
+    assert 0 < dialog.fmin.value() < dialog.fmax.value() <= fs/2
+    dialog._run()
+    finish(app, dialog)
+    assert np.isfinite(dialog.result["power"]).any()
+    assert dialog.result["axis"][-1] <= dialog.metadata["fs"]/2
+    dialog.fmax.setValue(dialog.fmin.value()/2)
+    assert 0 < dialog.fmin.value() < dialog.fmax.value()
+    dialog.close()
+
+
+def test_cwt_rechecks_frequency_for_selected_interval(app):
+    t = np.r_[np.arange(500)/100, 5+np.arange(500)/90]
+    snapshot = dict(times=t, values=np.sin(2*np.pi*15*t), sample_rate_hz=100)
+    dialog = DynamicAnalysisDialog("变采样间隔", snapshot, fixed_mode=1)
+    assert dialog.fmax.value() > 45
+    dialog.start.setValue(5)
+    dialog._run()
+    finish(app, dialog)
+    assert dialog.fmax.value() <= dialog.metadata["fs"]/2
+    assert np.isfinite(dialog.result["power"]).any()
+    dialog.close()
+
+
+def test_cwt_switch_from_slow_channel_restores_useful_band(app):
+    slow_t = np.arange(120)/7.2
+    source = ["转矩", dict(times=slow_t, values=np.sin(slow_t)), {}, None]
+    dialog = DynamicAnalysisDialog("空缓冲", dict(times=[], values=[]), fixed_mode=1,
+                                   source_provider=lambda: tuple(source))
+    assert dialog.fmax.value() <= 3.6
+    t = np.arange(5000)/16000
+    source[:2] = ["Ia", dict(times=t, values=np.sin(2*np.pi*100*t))]
+    dialog.refresh_source()
+    assert dialog.fmax.value() == 500
+    dialog._run()
+    finish(app, dialog)
+    assert np.isfinite(dialog.result["power"]).any()
+    dialog.fmax.setValue(300)
+    dialog.refresh_source()
+    assert dialog.fmax.value() == 300
+    dialog.close()
