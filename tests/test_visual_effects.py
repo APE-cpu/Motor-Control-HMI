@@ -3,7 +3,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtCore import QCoreApplication, QEvent
-from PySide6.QtWidgets import QApplication, QGroupBox
+from PySide6.QtWidgets import QApplication, QGroupBox, QLabel
 
 from communications.comm_manager import CommManager
 from main_window import MainWindow
@@ -22,7 +22,9 @@ def test_monitor_uses_remote_three_state_motor_background():
 
     titles = [box.title() for box in page.findChildren(QGroupBox)]
     assert any(title.startswith("传感器状态") for title in titles)
-    assert "统计（最大/最小）" in titles
+    # 统计改为曲线上方的一行（转速/电流/转矩的最大、最小），不再是分组框
+    assert [item.findChild(QLabel).text() for item in
+            (page._stat_speed, page._stat_current, page._stat_torque)] == ["转速", "电流", "转矩"]
     assert isinstance(page._orb, _EnergyOrb)
     assert set(page._orb._pixmaps) == {"stopped", "running", "fault"}
     page.close()
