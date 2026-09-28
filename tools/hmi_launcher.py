@@ -40,12 +40,28 @@ def select_worktree(entries, selector, base):
     return Path(matches[0]["path"]).resolve()
 
 
+def _venv_has_torch(venv):
+    return any((venv / sub / "torch").is_dir()
+               for sub in ("Lib/site-packages", *(p.relative_to(venv) for p in venv.glob("lib/python*/site-packages"))))
+
+
 def python_for(project):
-    for candidate in (project / ".venv/Scripts/python.exe", project / ".venv/bin/python"):
-        if candidate.is_file():
-            return candidate
+    """HMI_PYTHON 指定的解释器 > 装有 torch 的项目 .venv > 启动器自身的 Python > 精简 .venv。
+
+    精简 .venv 缺 torch 时训练页会被自动隐藏，因此只在它功能完整时优先使用。
+    """
+    override = os.environ.get("HMI_PYTHON")
+    if override:
+        return Path(override)
+    venv_pythons = [c for c in (project / ".venv/Scripts/python.exe", project / ".venv/bin/python")
+                    if c.is_file()]
+    if venv_pythons and _venv_has_torch(project / ".venv"):
+        return venv_pythons[0]
     interpreter = Path(sys.executable)
-    return interpreter.with_name("python.exe") if interpreter.name.lower() == "pythonw.exe" else interpreter
+    interpreter = interpreter.with_name("python.exe") if interpreter.name.lower() == "pythonw.exe" else interpreter
+    if interpreter.is_file():
+        return interpreter
+    return venv_pythons[0] if venv_pythons else interpreter
 
 
 def show_message(message, error=False):

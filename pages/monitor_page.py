@@ -635,7 +635,7 @@ class _OfflineRlsDialog(QDialog):
         self._source_path = ""
         root = QVBoxLayout(self)
         self._status = QLabel(
-            "选择“RLS辨识数据.csv”后：ESO按真机采样率、"
+            "选择“高速数据.csv”（旧记录为“RLS辨识数据.csv”）后：ESO按真机采样率、"
             "Lnom=0.66mH、ωo=4000rad/s与1拍电压延迟运行；"
             "物理R/L仍只由独立F1/40闭环IV链路判定。")
         self._status.setWordWrap(True)
@@ -1251,7 +1251,7 @@ class MonitorPage(QWidget):
             self._show_rls_coefficients)
         self._btn_offline_rls = QPushButton("离线辨识 CSV…")
         self._btn_offline_rls.setToolTip(
-            "导入保存的 RLS辨识数据.csv，在后台按真机ESO配置重放；"
+            "导入保存的 高速数据.csv（旧记录为 RLS辨识数据.csv），在后台按真机ESO配置重放；"
             "新F1/40数据优先使用PWM占空比重构电压，并执行独立"
             "激励闭环IV物理验证；不需要连接电机")
         self._btn_offline_rls.clicked.connect(self._select_offline_rls_csv)
@@ -2392,8 +2392,9 @@ class MonitorPage(QWidget):
                 record_dir.rmdir()
                 return
         csv_path = os.path.join(os.path.dirname(path), "原始数据.csv")
+        # 16 kHz F1 全量记录（旧版本文件名为 RLS辨识数据.csv）
         rls_csv_path = os.path.join(
-            os.path.dirname(path), "RLS辨识数据.csv")
+            os.path.dirname(path), "高速数据.csv")
         rls_snapshot = self._rls_capture.snapshot()
         self._save_worker = _WaveformSaveWorker(
             path, png, csv_path, curve_snapshot, rls_csv_path,

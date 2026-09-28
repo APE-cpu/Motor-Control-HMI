@@ -152,7 +152,7 @@ def test_RLS原始同步帧可导出并重新读取(tmp_path):
         "vbus_v": [24.0, 24.1, 24.2],
     })
 
-    output = tmp_path / "RLS辨识数据.csv"
+    output = tmp_path / "高速数据.csv"
     page._write_rls_capture_csv(str(output))
     loaded = load_rls_capture_csv(str(output))
 

@@ -5,6 +5,7 @@
   k=1 偏心：静止坐标系中不转的矢量（采样零偏、直流电流）
   k=2 椭圆：负序（三相增益/相位不对称），椭圆长轴方向 = ψ_2 / 2
   k=3 三角：负序 2 次谐波（静止坐标系 −2fe）
+  k=6 六边形：5/7 次谐波（死区、反电势谐波）
 纯几何量，与轨迹来自 iq 重建还是相电流 Clarke 无关。
 """
 from __future__ import annotations
@@ -14,6 +15,7 @@ from dataclasses import dataclass
 import numpy as np
 
 _COVERAGE_BINS = 24
+_ORDERS = (1, 2, 3, 6)
 
 
 @dataclass(frozen=True)
@@ -24,6 +26,8 @@ class TrajectoryShape:
     triangle_pct: float
     ellipse_axis_deg: float   # 椭圆长轴方向，0~180°，αβ 坐标系
     points: int
+    hexagon_pct: float = 0.0
+    eccentric_angle_deg: float = 0.0   # 圆心偏移方向，αβ 坐标系
 
 
 def trajectory_shape(xs, ys, min_points: int = 200,
@@ -42,13 +46,13 @@ def trajectory_shape(xs, ys, min_points: int = 200,
         return None
 
     cols = [np.ones_like(phi)]
-    for k in (1, 2, 3):
+    for k in _ORDERS:
         cols += [np.cos(k * phi), np.sin(k * phi)]
     coef, *_ = np.linalg.lstsq(np.vstack(cols).T, r, rcond=None)
     r0 = float(coef[0])
     if r0 < min_radius:
         return None
-    amp = [float(np.hypot(coef[2 * k - 1], coef[2 * k])) for k in (1, 2, 3)]
+    amp = [float(np.hypot(coef[2 * i + 1], coef[2 * i + 2])) for i in range(len(_ORDERS))]
     axis = float(np.degrees(np.arctan2(coef[4], coef[3])) / 2.0) % 180.0
     return TrajectoryShape(
         mean_radius=r0,
@@ -57,6 +61,8 @@ def trajectory_shape(xs, ys, min_points: int = 200,
         triangle_pct=100.0 * amp[2] / r0,
         ellipse_axis_deg=axis,
         points=int(x.size),
+        hexagon_pct=100.0 * amp[3] / r0,
+        eccentric_angle_deg=float(np.degrees(np.arctan2(coef[2], coef[1]))) % 360.0,
     )
 
 

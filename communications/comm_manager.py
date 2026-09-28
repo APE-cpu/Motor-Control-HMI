@@ -64,9 +64,24 @@ _MOTOR_FAULT_NAMES = (
     (0x0020, "速度反馈故障(MC_SPEED_FDBK)"),
     (0x0040, "BREAK输入/硬件过流(MC_BREAK_IN)"),
     (0x0080, "MCSDK软件错误(MC_SW_ERROR)"),
+    (0x2000, "上次异常复位（HardFault/栈溢出，固件已关PWM并自动复位）"),
     (0x4000, "V2控制链路看门狗"),
     (0x8000, "V2超速/跑飞保护"),
 )
+
+
+FIRMWARE_STACK_BYTES = 4064        # 固件 4 KB 主栈减去 32 字节 MPU 护栏
+_FIRMWARE_FAULT_TYPES = {1: "HardFault", 2: "MemManage", 3: "BusFault", 4: "UsageFault"}
+
+
+def describe_firmware_fault(fault_type: int, pc: int) -> str:
+    """固件 v2_fault_guard 记录的上次 Fault：类型（0x10 位=判定为栈溢出）与 PC。"""
+    value = int(fault_type or 0)
+    if not value:
+        return "上次 Fault 详情未记录"
+    name = _FIRMWARE_FAULT_TYPES.get(value & 0x0F, f"类型{value & 0x0F}")
+    overflow = "，判定为栈溢出" if value & 0x10 else ""
+    return f"上次 Fault：{name}{overflow}，PC=0x{int(pc or 0):08X}"
 
 
 def decode_motor_fault_code(code: int) -> str:
@@ -128,6 +143,9 @@ class TelemetryFrame:
         "position_speed_target_rpm",  # 位置环输出的速度给定
         "position_speed_ff_rpm",      # 速度前馈分量
         "position_saturated",         # 位置环速度限幅是否动作
+        "stack_peak_bytes",  # 固件主栈开机以来峰值（字节，线上键 stk）
+        "last_fault_type",   # 上次自动复位的 Fault 类型（线上键 lft，0=无）
+        "last_fault_pc",     # 该次 Fault 的 PC（线上键 lpc）
         "data_source",     # "sim" / "real" / "real_partial"
     )
 
@@ -157,6 +175,9 @@ class TelemetryFrame:
         self.stop_command = 0
         self.stop_rx_age_ms = 0
         self.stop_run_ms = 0
+        self.stack_peak_bytes = 0
+        self.last_fault_type = 0
+        self.last_fault_pc = 0
         self.max_rpm = 0.0
         self.current_limit_a = 0.0
         self.runaway_limit_rpm = 0.0
@@ -1599,7 +1620,13 @@ class CommManager(QObject):
             "current_filter_alpha_q15", "speed_fifo_depth",
             "rls_probe_amplitude_digit", "rls_probe_chip_divider",
             "stop_reason", "stop_command", "stop_rx_age_ms", "stop_run_ms",
+            "stack_peak_bytes", "last_fault_type", "last_fault_pc",
         }
+        # 固件遥测 JSON 接近 1024 字节上限，这三项在线上用短键名
+        for short, long_name in (("stk", "stack_peak_bytes"), ("lft", "last_fault_type"),
+                                 ("lpc", "last_fault_pc")):
+            if short in values and long_name not in values:
+                values[long_name] = values[short]
         # F407 uses signed centidegrees on the wire to avoid float formatting
         # in the telemetry task; expose ordinary degrees to all UI pages.
         for raw_field, field in {
@@ -2230,8 +2257,23 @@ class CommManager(QObject):
                 self._reported_faults.add(key)
                 history_text = (getattr(frame, "fault_history_text", "") or
                                 decode_motor_fault_code(history_code))
+                if history_code & 0x2000:
+                    history_text += "；" + describe_firmware_fault(
+                        getattr(frame, "last_fault_type", 0), getattr(frame, "last_fault_pc", 0))
                 self.logMessage.emit(
                     f"[故障记录] 历史故障=0x{history_code:04X}：{history_text}")
+        self._report_stack_peak(int(getattr(frame, "stack_peak_bytes", 0) or 0))
+
+    def _report_stack_peak(self, peak: int) -> None:
+        """固件主栈峰值：首次收到、以及每再升高 256 字节时记一次日志，超过 75% 提示。"""
+        logged = getattr(self, "_stack_peak_logged", 0)
+        if peak <= 0 or peak < logged + 256 and logged:
+            return
+        self._stack_peak_logged = peak
+        usage = peak / FIRMWARE_STACK_BYTES
+        level = "[警告]" if usage >= 0.75 else "[诊断]"
+        self.logMessage.emit(
+            f"{level} 下位机主栈峰值 {peak}/{FIRMWARE_STACK_BYTES} 字节（{usage:.0%}）")
 
     def _report_fault_once(self, key: str, message: str) -> None:
         if key in self._reported_faults:

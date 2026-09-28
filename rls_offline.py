@@ -375,7 +375,7 @@ class RlsCaptureBuffer:
 
 
 def load_rls_capture_csv(path: str | Path) -> dict[str, object]:
-    """读取 ``RLS辨识数据.csv`` 并验证采样率与行对齐。"""
+    """读取 ``高速数据.csv``（旧名 ``RLS辨识数据.csv``）并验证采样率与行对齐。"""
     columns: dict[str, array] = {
         "sample_index": array("I"),
         "tick_ms": array("I"),

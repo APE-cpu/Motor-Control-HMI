@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+from datetime import datetime
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
@@ -30,6 +31,7 @@ from logs.operation_logger import logger
 from runtime_paths import writable_path
 from widgets.historical_telemetry_dialog import HistoricalTelemetryDialog
 from widgets.experiment_conclusion_dialog import ExperimentConclusionDialog
+from widgets.media_recorder import MediaPanel
 
 
 _STATUS_TEXT = {
@@ -47,6 +49,11 @@ _RUNTIME_TEXT = {
     RuntimeState.STOPPING: "停机中",
     RuntimeState.FAULT_LOCKED: "故障锁定",
 }
+
+
+def _default_experiment_name() -> str:
+    """实验名称默认用日期时间，同一天多次实验也能区分。"""
+    return datetime.now().strftime("%Y-%m-%d %H:%M")
 
 
 class ExperimentPage(QWidget):
@@ -111,6 +118,10 @@ class ExperimentPage(QWidget):
         record_layout.addWidget(self._build_history_box(), 1)
         tabs.addTab(records, "记录与数据")
         tabs.addTab(setup, "设备与方案")
+        self.media_panel = MediaPanel()
+        tabs.addTab(self.media_panel, "音视频")
+        self.media_panel.recordingChanged.connect(
+            lambda on: tabs.setTabText(2, "音视频 ● 录制中" if on else "音视频"))
         root.addWidget(tabs, 1)
         self._workspace_tabs = tabs
 
@@ -125,6 +136,8 @@ class ExperimentPage(QWidget):
         self._apply_selected_template()
         self._apply_snapshot_preview()
         self._load_draft()
+        if not self._name.text().strip():
+            self._name.setText(_default_experiment_name())
         self._refresh_device_identity(self._comm.protocol_status())
         for edit in (self._name, self._operator, self._device_name):
             edit.textChanged.connect(lambda _text: self._draft_timer.start())
@@ -141,7 +154,7 @@ class ExperimentPage(QWidget):
         box = QGroupBox("实验信息")
         form = QFormLayout(box)
         self._name = QLineEdit()
-        self._name.setPlaceholderText("例如：1500 rpm 转速阶跃")
+        self._name.setPlaceholderText("默认按日期时间命名，可改成如“1500 rpm 转速阶跃”")
         self._purpose = QPlainTextEdit()
         self._purpose.setPlaceholderText("本次实验要验证的问题")
         self._purpose.setMaximumHeight(70)
@@ -438,8 +451,8 @@ class ExperimentPage(QWidget):
     def _on_start(self) -> None:
         name = self._name.text().strip()
         if not name:
-            self._set_message("请填写实验名称。", error=True)
-            return
+            name = _default_experiment_name()
+            self._name.setText(name)
         try:
             template = self._load_selected_template()
             equipment = self._load_selected_equipment()
@@ -500,6 +513,7 @@ class ExperimentPage(QWidget):
             self._last_session = session
             logger.log("开始实验", f"{session.experiment_id} {session.name}")
             self._set_message(f"实验 {session.experiment_id} 正在记录。")
+            self._start_media(session)
         except Exception as exc:
             self._set_message(f"实验启动失败：{exc}", error=True)
         self._refresh_status()
@@ -516,9 +530,11 @@ class ExperimentPage(QWidget):
             return
         logger.log("结束实验", f"{session.experiment_id} 正常结束")
         try:
+            self._stop_media()
             self._capture_runtime_context("end")
             self._last_session = self.manager.complete()
             self._set_message(f"实验 {session.experiment_id} 已保存。")
+            self._name.setText(_default_experiment_name())   # 下一次实验默认用新的日期时间
         except Exception as exc:
             self._set_message(f"实验结束失败：{exc}", error=True)
         self._refresh_status()
@@ -539,10 +555,12 @@ class ExperimentPage(QWidget):
             return
         logger.log("中止实验", f"{session.experiment_id} 用户中止")
         try:
+            self._stop_media()
             self._capture_runtime_context("end")
             self._last_session = self.manager.abort("用户从实验管理页中止")
             self._set_message(f"实验 {session.experiment_id} 已中止，已有数据已保留。",
                               error=True)
+            self._name.setText(_default_experiment_name())
         except Exception as exc:
             self._set_message(f"实验中止失败：{exc}", error=True)
         self._refresh_status()
@@ -557,13 +575,43 @@ class ExperimentPage(QWidget):
         if session is not None and session.status is SessionStatus.RUNNING:
             try:
                 logger.log("中止实验", f"{session.experiment_id} 软件关闭")
+                self._stop_media()
                 self._capture_runtime_context("end")
                 self._last_session = self.manager.abort("上位机软件关闭")
             except Exception as exc:
                 self._set_message(f"关闭时保存实验失败：{exc}", error=True)
+        self.media_panel.stop()
         self.recorder.close()
         self._refresh_status()
         self._refresh_workflow()
+
+    def _start_media(self, session) -> None:
+        """录像/录音失败只提示，不影响实验本身（实验此时已经开始记录）。"""
+        try:
+            media = self.media_panel.start_for_session(
+                self.manager.repository.session_dir(session.experiment_id),
+                session.started_at)
+        except Exception as exc:  # noqa: BLE001
+            self.media_panel.stop()
+            self._set_message(f"实验 {session.experiment_id} 正在记录；录像启动失败：{exc}",
+                              error=True)
+            return
+        if media is not None:
+            self.manager.record_event("media_recording_started", "开始录像/录音",
+                                      {"file": media.name})
+        elif self.media_panel.auto_requested:
+            self._set_message(f"实验 {session.experiment_id} 正在记录；录像未启动："
+                              f"{self.media_panel.status.text()}", error=True)
+
+    def _stop_media(self) -> None:
+        """实验结束前停止录制，并把录制起止写进实验事件（结束后就不能再写事件）。"""
+        entry = self.media_panel.stop()
+        if entry is not None:
+            self.manager.record_event(
+                "media_recording_stopped", "停止录像/录音",
+                {key: entry.get(key) for key in ("file", "kind", "duration_s",
+                                                 "start_offset_s", "end_offset_s")})
+        self.media_panel.set_session(None, None)
 
     def _refresh_status(self) -> None:
         session = self.manager.active_session or self._last_session

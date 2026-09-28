@@ -16,7 +16,7 @@ from collections import deque
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QGroupBox, QHBoxLayout, QLabel, QPushButton,
-    QVBoxLayout, QWidget,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
@@ -156,6 +156,7 @@ class VectorPage(QWidget):
         self._native_draw_generation = -1
         self._last_shape_analysis_at = 0.0
         self._shape_pending = False
+        self._last_trajectory = ([], [])   # 最近一次做圆度分析的电流圆轨迹
 
         root = QVBoxLayout(self)
         title_row = QHBoxLayout()
@@ -201,21 +202,34 @@ class VectorPage(QWidget):
             root.addWidget(QLabel("未安装 pyqtgraph，无法显示矢量图"))
             return
 
+        self._tabs = QTabWidget()
+        live = QWidget()
+        live_layout = QVBoxLayout(live)
+        live_layout.setContentsMargins(0, 4, 0, 0)
         box = QGroupBox("轨迹")
         h = QHBoxLayout(box)
         self._i_plot = _CirclePlot("电流圆 iα-iβ", "A", "#4fc3f7")
         self._psi_plot = _CirclePlot("磁链圆 ψα-ψβ", "Wb", "#ffb74d")
         h.addWidget(self._i_plot, 1)
         h.addWidget(self._psi_plot, 1)
-        root.addWidget(box, 1)
+        live_layout.addWidget(box, 1)
+        self._tabs.addTab(live, "实时轨迹")
+        from pages.vector_distortion_lab import VectorDistortionLab
+        self._distortion_lab = VectorDistortionLab(self._measured_trajectory)
+        self._tabs.addTab(self._distortion_lab, "畸变图谱")
+        from pages.phasor_playback import PhasorPlayback
+        self._phasor_playback = PhasorPlayback(lambda: self._distortion_lab.params)
+        self._tabs.addTab(self._phasor_playback, "分量合成（离线回放）")
+        root.addWidget(self._tabs, 1)
         self._shape_label = QLabel()
         self._shape_label.setWordWrap(True)
         self._shape_label.setToolTip(
             "对电流圆轨迹按极角做谐波拟合，形变幅值相对平均半径：\n"
             "偏心（1 次）：不转的矢量，如采样零偏；\n"
             "椭圆（2 次）：负序，即三相增益/相位不对称，括号内为长轴方向；\n"
-            "三角（3 次）：负序 2 次谐波。")
-        root.addWidget(self._shape_label)
+            "三角（3 次）：负序 2 次谐波；\n"
+            "六边形（6 次）：5/7 次谐波，多来自死区。")
+        live_layout.addWidget(self._shape_label)
         self._update_shape_label()
 
         btn_clear.clicked.connect(self._on_clear)
@@ -294,6 +308,7 @@ class VectorPage(QWidget):
             xs, ys = list(self._i_plot._xs), list(self._i_plot._ys)
             if not self._chk_persist.isChecked():
                 xs, ys = xs[-_TRAIL:], ys[-_TRAIL:]
+        self._last_trajectory = (xs, ys)
         shape = trajectory_shape(xs, ys)
         if shape is None:
             self._shape_label.setText("圆度：等待电流圆轨迹覆盖至少约 3/4 圈…")
@@ -302,7 +317,13 @@ class VectorPage(QWidget):
             f"圆度（平均半径 {shape.mean_radius:.3f} A，{shape.points} 点）："
             f"偏心 {shape.eccentric_pct:.1f}%  ·  "
             f"椭圆 {shape.ellipse_pct:.1f}%（长轴 {shape.ellipse_axis_deg:.0f}°）  ·  "
-            f"三角 {shape.triangle_pct:.1f}%")
+            f"三角 {shape.triangle_pct:.1f}%  ·  "
+            f"六边形 {shape.hexagon_pct:.1f}%")
+
+    def _measured_trajectory(self) -> tuple:
+        """供畸变图谱对照：最近一次圆度分析用的电流圆轨迹与数据源名称。"""
+        xs, ys = self._last_trajectory
+        return list(xs), list(ys), self._cmb_source.currentText()
 
     def _append_point(self, theta_e: float, i_d: float, i_q: float,
                       include_current: bool = True) -> None:

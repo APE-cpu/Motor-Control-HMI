@@ -19,8 +19,21 @@ def test_tree_alias_resolves_checked_out_branch_and_detects_ambiguity(tmp_path):
     assert select_worktree(entries, "codex/ui-refinement", tmp_path) == tmp_path / "codex"
 
 
-def test_project_python_preferred_without_changing_global_environment(tmp_path):
+def test_project_python_preferred_without_changing_global_environment(tmp_path, monkeypatch):
+    monkeypatch.delenv("HMI_PYTHON", raising=False)
     interpreter = tmp_path / ".venv/Scripts/python.exe"
     interpreter.parent.mkdir(parents=True)
     interpreter.touch()
+    (tmp_path / ".venv/Lib/site-packages/torch").mkdir(parents=True)
     assert python_for(tmp_path) == interpreter
+
+
+def test_lite_venv_without_torch_falls_back_to_launcher_python(tmp_path, monkeypatch):
+    # 精简 .venv 没有 torch 会隐藏训练页，此时用启动器自身的完整 Python
+    monkeypatch.delenv("HMI_PYTHON", raising=False)
+    venv_python = tmp_path / ".venv/Scripts/python.exe"
+    venv_python.parent.mkdir(parents=True)
+    venv_python.touch()
+    assert python_for(tmp_path) != venv_python
+    monkeypatch.setenv("HMI_PYTHON", str(venv_python))
+    assert python_for(tmp_path) == venv_python

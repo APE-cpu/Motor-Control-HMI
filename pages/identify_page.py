@@ -151,7 +151,7 @@ class IdentifyPage(QWidget):
         self._electrical_report.setStyleSheet(
             "font-family: Consolas, 'Microsoft YaHei UI', monospace;")
         self._electrical_report.setPlainText(
-            "导入“RLS辨识数据.csv”后将显示：\n"
+            "导入“高速数据.csv”（旧记录为“RLS辨识数据.csv”）后将显示：\n"
             "  · dq电压方程拟合的 R、共享 L、永磁磁链 ψf\n"
             "  · d/q轴各7个ARX系数的低频等效 R/L 投影\n"
             "  · 两种方法的一致性误差和不可辨识项\n\n"
@@ -167,7 +167,7 @@ class IdentifyPage(QWidget):
     def _select_electrical_csv(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
             self, "加载电气参数辨识数据", "",
-            "RLS 辨识数据 (*.csv);;所有文件 (*)")
+            "高速数据 (*.csv);;所有文件 (*)")
         if path:
             self._start_electrical_csv(path)
 

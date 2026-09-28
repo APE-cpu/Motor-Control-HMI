@@ -27,7 +27,7 @@ experiment_records/
       export.json                 # 保存状态、文件索引、保存时的配置/身份快照
       波形.png
       原始数据.csv
-      RLS辨识数据.csv             # 有同步 RLS 数据时
+      高速数据.csv                # 16 kHz F1 全程记录（旧版本名为 RLS辨识数据.csv）
     waveforms/<另一次保存>/
       export.json
       采样诊断.csv

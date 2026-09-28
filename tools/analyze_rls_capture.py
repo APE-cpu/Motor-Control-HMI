@@ -1,4 +1,4 @@
-"""Headless audit for a saved ``RLS辨识数据.csv`` capture.
+"""Headless audit for a saved ``高速数据.csv`` capture (older recordings: ``RLS辨识数据.csv``).
 
 The command is intentionally read-only.  It reports the exact R2024b
 ESO/ARX replay separately from the closed-loop physical IV result so a finite
@@ -97,7 +97,7 @@ def main() -> int:
         sys.stderr.reconfigure(encoding="utf-8")
     parser = argparse.ArgumentParser(
         description="只读审计真机RLS CSV，不修改或投影辨识结果")
-    parser.add_argument("csv", type=Path, help="RLS辨识数据.csv 路径")
+    parser.add_argument("csv", type=Path, help="高速数据.csv（旧记录为 RLS辨识数据.csv）路径")
     parser.add_argument(
         "--compact", action="store_true", help="输出单行 JSON")
     parser.add_argument(

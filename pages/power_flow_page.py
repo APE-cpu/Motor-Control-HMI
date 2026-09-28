@@ -11,23 +11,19 @@ Iq、Vq、Vbus、转速和转矩做主机侧估算。
 import math
 import time
 
-from PySide6.QtCore import Qt, QTimer, QPointF
-from PySide6.QtGui import QColor, QPainter, QPen, QPolygonF
+import numpy as np
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
-    QVBoxLayout, QWidget,
+    QScrollArea, QVBoxLayout, QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
+from core.power_estimate import inverter_power, voltage_from_raw
 from widgets.formula_view import Eq, FormulaImage
+from widgets.power_playback import PowerPlayback
+from widgets.power_sankey import PowerSankey
 from widgets.trend_curve import TrendCurve
-
-_BOX_FILL = QColor("#37474f")
-_BOX_EDGE = QColor("#546e7a")
-_TEXT = QColor("#eceff1")
-_FWD = QColor("#ffb74d")     # 正向功率（电→机械）
-_REV = QColor("#4fc3f7")     # 回馈功率（机械→电）
-_LOSS = QColor("#ef9a9a")    # 损耗支路
 
 
 class _CalculationPanel(QGroupBox):
@@ -142,167 +138,6 @@ class _CalculationPanel(QGroupBox):
             f"电机储能/未建模项 ≈ {motor_storage:+.2f} W")
 
 
-class _FlowDiagram(QWidget):
-    """自绘功率流图。set_data 后 update() 重绘。"""
-
-    _NODES = ["电源", "直流母线", "逆变器", "电机", "转轴/负载"]
-
-    def __init__(self) -> None:
-        super().__init__()
-        self.setMinimumHeight(220)
-        self._powers: dict = {}
-        self._vdc = 24.0
-        self._bus_state = "normal"
-        # 能量脉冲动画：虚线相位随时间推进，流速 ∝ 功率
-        self._t = 0.0
-        self._anim = QTimer(self)
-        self._anim.timeout.connect(self._tick)
-        self._anim.setInterval(40)
-
-    def set_active(self, active: bool) -> None:
-        if active:
-            self._anim.start()
-        else:
-            self._anim.stop()
-
-    def _tick(self) -> None:
-        self._t += 0.04
-        if self._powers and self.isVisible():
-            self.update()
-
-    def set_data(self, powers: dict, vdc: float, bus_state: str) -> None:
-        self._powers = powers or {}
-        self._vdc = vdc
-        self._bus_state = bus_state
-        self.update()
-
-    # ---------- 绘制 ----------
-    def paintEvent(self, event) -> None:  # noqa: N802 - Qt signature
-        qp = QPainter(self)
-        qp.setRenderHint(QPainter.Antialiasing)
-        w, h = self.width(), self.height()
-        if not self._powers:
-            qp.setPen(QPen(QColor("#90a4ae")))
-            qp.drawText(self.rect(), Qt.AlignCenter,
-                        "暂无功率数据（等待仿真或真机F0/F1遥测）")
-            return
-
-        p = self._powers
-        n = len(self._NODES)
-        box_w = min(120, int(w / n * 0.62))
-        box_h = 44
-        y_mid = int(h * 0.38)
-        gap = (w - n * box_w) / (n + 1)
-        centers = [gap + box_w / 2 + i * (box_w + gap) for i in range(n)]
-
-        # 节点框（母线框附带电压值）
-        for i, name in enumerate(self._NODES):
-            x = centers[i] - box_w / 2
-            qp.setPen(QPen(_BOX_EDGE, 1.5))
-            qp.setBrush(_BOX_FILL)
-            qp.drawRoundedRect(int(x), y_mid - box_h // 2, box_w, box_h, 6, 6)
-            qp.setPen(QPen(_TEXT))
-            label = name
-            if name == "直流母线":
-                label = f"{name}\n{self._vdc:.1f} V"
-            qp.drawText(int(x), y_mid - box_h // 2, box_w, box_h,
-                        Qt.AlignCenter, label)
-
-        # 主链功率：电源→母线、母线→逆变器（=逆变器→电机）、电机→轴
-        chain = [p.get("supply", 0.0), p.get("inv", 0.0),
-                 p.get("inv", 0.0), p.get("em", 0.0)]
-        for i, val in enumerate(chain):
-            x1 = centers[i] + box_w / 2
-            x2 = centers[i + 1] - box_w / 2
-            self._arrow(qp, x1, x2, y_mid, val)
-
-        # 损耗支路（向下）：位置 = 支路所挂的节点
-        losses = [
-            (0.5, "内阻损耗", p.get("loss_src", 0.0)),   # 电源→母线之间
-            (1.0, "制动电阻", p.get("brake", 0.0)),
-            (3.0, "铜损", p.get("cu", 0.0)),
-            (4.0, "摩擦/负载", p.get("fric", 0.0)),
-        ]
-        y_tail = y_mid + box_h // 2 + 8
-        y_head = int(h * 0.72)
-        for pos, name, val in losses:
-            if pos == int(pos):     # 挂在节点正下方
-                x = centers[int(pos)]
-                y0 = y_tail
-            else:                   # 挂在两节点之间的箭头下方
-                x = (centers[int(pos)] + centers[int(pos) + 1]) / 2.0
-                y0 = y_mid + 10
-            color = QColor(_LOSS)
-            if name == "制动电阻" and val > 1.0:   # 泄放中：红色呼吸脉动
-                color = QColor("#ff5252")
-                color.setAlphaF(0.55 + 0.45 * math.sin(self._t * 6.0))
-            self._flow_line(qp, QPointF(x, y0), QPointF(x, y_head),
-                            color, val, 90.0)
-            qp.setPen(QPen(_LOSS))
-            qp.drawText(int(x - 60), y_head + 4, 120, 34,
-                        Qt.AlignHCenter | Qt.AlignTop,
-                        f"{name}\n{val:.1f} W")
-
-        # 动能变化率：标在转轴节点上方
-        pk = p.get("kinetic", 0.0)
-        tag = "动能储存" if pk >= 0 else "动能释放"
-        qp.setPen(QPen(_FWD if pk >= 0 else _REV))
-        qp.drawText(int(centers[-1] - 70), y_mid - box_h // 2 - 36, 140, 32,
-                    Qt.AlignHCenter | Qt.AlignBottom, f"{tag}\n{abs(pk):.1f} W")
-
-    def _pen_width(self, power: float) -> float:
-        return 1.5 + 3.0 * min(1.0, abs(power) / 200.0)
-
-    def _arrow(self, qp: QPainter, x1: float, x2: float, y: float,
-               power: float) -> None:
-        """主链水平箭头：正功率向右（橙），回馈向左（蓝）。"""
-        color = _FWD if power >= 0 else _REV
-        if power >= 0:
-            a, b, ang = QPointF(x1, y), QPointF(x2, y), 0.0
-        else:   # 回馈：流向反转，脉冲向左流
-            a, b, ang = QPointF(x2, y), QPointF(x1, y), 180.0
-        self._flow_line(qp, a, b, color, power, ang)
-        qp.setPen(QPen(color))
-        qp.drawText(int((x1 + x2) / 2 - 50), int(y) - 26, 100, 20,
-                    Qt.AlignCenter, f"{abs(power):.1f} W")
-
-    def _flow_line(self, qp: QPainter, a: QPointF, b: QPointF,
-                   color: QColor, power: float, head_angle: float) -> None:
-        """能量流线：暗色底线 + 沿流向移动的虚线脉冲，流速 ∝ 功率。"""
-        pen_w = self._pen_width(power)
-        dim = QColor(color)
-        dim.setAlpha(60)
-        qp.setPen(QPen(dim, pen_w))
-        qp.drawLine(a, b)
-        mag = abs(power)
-        if mag > 0.5:
-            pen = QPen(color, pen_w)
-            pen.setCapStyle(Qt.RoundCap)
-            dash, gap = 1.8, 2.6                     # 单位：线宽倍数
-            pen.setDashPattern([dash, gap])
-            px_per_s = 30.0 + 0.4 * min(mag, 400.0)  # 功率越大流得越快
-            offset = (self._t * px_per_s / max(pen_w, 0.5)) % (dash + gap)
-            pen.setDashOffset(-offset)               # 负向偏移 = 沿画线方向流动
-            qp.setPen(pen)
-            qp.drawLine(a, b)
-        self._arrow_head(qp, b, head_angle, color, pen_w)
-
-    @staticmethod
-    def _arrow_head(qp: QPainter, tip: QPointF, angle_deg: float,
-                    color: QColor, pen_w: float) -> None:
-        """在 tip 处画箭头头部；angle 0=向右，90=向下，180=向左。"""
-        size = 5.0 + pen_w
-        qp.save()
-        qp.translate(tip)
-        qp.rotate(angle_deg)
-        qp.setPen(Qt.NoPen)
-        qp.setBrush(color)
-        qp.drawPolygon(QPolygonF([QPointF(0, 0),
-                                  QPointF(-size, -size * 0.55),
-                                  QPointF(-size, size * 0.55)]))
-        qp.restore()
-
-
 class PowerFlowPage(QWidget):
     def __init__(self, comm: CommManager) -> None:
         super().__init__()
@@ -328,6 +163,9 @@ class PowerFlowPage(QWidget):
         self._chk_enabled.setToolTip(
             "默认关闭以避免在后台持续计算和绘制功率流。")
         title_row.addWidget(self._chk_enabled)
+        self._chk_offline = QCheckBox("离线回放")
+        self._chk_offline.setToolTip("回放实验目录里保存的 高速数据.csv；回放期间暂停实时数据")
+        title_row.addWidget(self._chk_offline)
         self._eff_label = QLabel("效率 η = --")
         self._eff_label.setStyleSheet("color: #69f0ae; font-weight: bold;")
         title_row.addWidget(self._eff_label)
@@ -337,19 +175,25 @@ class PowerFlowPage(QWidget):
         root.addLayout(title_row)
 
         hint = QLabel(
-            "电源 → 直流母线 → 逆变器 → 电机 → 转轴 的实时能量链路。"
-            "箭头粗细 ∝ 功率大小；回馈制动时主链箭头反向变蓝，"
-            "能量经母线泵升由制动电阻泄放。逆变器开关损耗暂忽略。")
+            "电源 → 直流母线 → 逆变器 → 电机 → 转轴 的实时能量桑基图："
+            "能量带宽度 ∝ 功率，红色支路为损耗，紫色为转子动能储存/释放；"
+            "回馈制动时主链变蓝、粒子反向，能量经母线泵升由制动电阻泄放。逆变器开关损耗暂忽略。")
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #90a4ae;")
         root.addWidget(hint)
 
         diag_box = QGroupBox("能量链路与功率守恒")
         dv = QHBoxLayout(diag_box)
-        self._diagram = _FlowDiagram()
+        self._diagram = PowerSankey()
         self._calculation = _CalculationPanel()
+        # 计算面板很高：单独滚动，窗口不够高时不把下方的趋势/回放区挤出屏幕
+        calc_scroll = QScrollArea()
+        calc_scroll.setWidgetResizable(True)
+        calc_scroll.setFrameShape(QScrollArea.NoFrame)
+        calc_scroll.setWidget(self._calculation)
+        calc_scroll.setMinimumWidth(self._calculation.minimumWidth() + 16)
         dv.addWidget(self._diagram, 3)
-        dv.addWidget(self._calculation, 2)
+        dv.addWidget(calc_scroll, 2)
         root.addWidget(diag_box, 3)
 
         curve_box = QGroupBox("功率趋势")
@@ -363,6 +207,12 @@ class PowerFlowPage(QWidget):
             "仿真功率快照，或真机F0/F1主机侧估算")
         cv.addWidget(self._curve)
         root.addWidget(curve_box, 2)
+        self._curve_box = curve_box
+        self._playback = PowerPlayback(comm.motor_sim_params)
+        self._playback.frameChanged.connect(self._on_playback_frame)
+        self._playback.hide()
+        root.addWidget(self._playback, 2)
+        self._chk_offline.toggled.connect(self._set_offline)
 
         comm.telemetryReceived.connect(self._on_telemetry)
         comm.highRateTelemetryReceived.connect(self._on_high_rate)
@@ -372,6 +222,34 @@ class PowerFlowPage(QWidget):
         self._timer.timeout.connect(self._refresh)
         self._timer.setInterval(200)
         self._chk_enabled.toggled.connect(self._set_analysis_enabled)
+
+    def _set_offline(self, offline: bool) -> None:
+        """离线回放与实时功率流互斥：回放时停掉实时估算，结束后恢复空白待机。"""
+        if offline:
+            self._chk_enabled.setChecked(False)
+        self._chk_enabled.setEnabled(not offline)
+        self._curve_box.setVisible(not offline)
+        self._playback.setVisible(offline)
+        self._diagram.set_active(offline)
+        if offline:
+            if self._playback.loaded:
+                self._playback.seek(self._playback._t)
+            else:
+                self._source_label.setText("数据源：离线回放，请打开高速数据")
+        else:
+            self._playback.stop()
+            self._diagram.set_data({}, 0.0, "normal")
+            self._calculation.set_data({})
+            self._source_label.setText("数据源：等待")
+            self._eff_label.setText("效率 η = --")
+
+    def _on_playback_frame(self, powers: dict, vbus: float, t: float) -> None:
+        if not self._chk_offline.isChecked():
+            return
+        self._diagram.set_data(powers, vbus, "normal")
+        self._calculation.set_data(powers)
+        self._source_label.setText(f"数据源：离线回放 t = {t:.2f} s")
+        self._update_efficiency(powers)
 
     def _set_analysis_enabled(self, enabled: bool) -> None:
         """按需启用功率估算与动画；关闭时不再消费高速F1数据。"""
@@ -418,19 +296,11 @@ class PowerFlowPage(QWidget):
         # 功率页只需要每批的短时平均，取最新256点避免隐藏页
         # 也在Python中扫描整个16 kHz队列。
         start = max(0, count - 256)
-        pairs = []
-        iq_sq = 0.0
-        for iq, vq_raw, vbus in zip(
-                iq_values[start:count], vq_values[start:count],
-                vbus_values[start:count]):
-            iq = float(iq)
-            vq_v = float(vq_raw) / 32767.0 * float(vbus) / math.sqrt(3.0)
-            pairs.append(1.5 * vq_v * iq)  # id未上报，按id≈0估算
-            iq_sq += iq * iq
-        if not pairs:
-            return
-        self._real_inv_w = sum(pairs) / len(pairs)
-        self._real_iq_rms_a = math.sqrt(iq_sq / len(pairs))
+        iq = np.asarray(iq_values[start:count], float)
+        vq = voltage_from_raw(vq_values[start:count], vbus_values[start:count])
+        # 与离线回放同一公式（core/power_estimate）；实时流不带 id，按 id≈0 估算
+        self._real_inv_w = float(np.mean(inverter_power(0.0, 0.0, vq, iq)))
+        self._real_iq_rms_a = float(np.sqrt(np.mean(iq * iq)))
         self._last_f1_at = time.monotonic()
 
     def _on_high_rate(self, sample: dict) -> None:
@@ -482,6 +352,18 @@ class PowerFlowPage(QWidget):
                   "真机降级估算：F0电磁功率+铜损（等待F1电压）")
         return powers, source
 
+    def _update_efficiency(self, p: dict) -> None:
+        supply, em = p.get("supply", 0.0), p.get("em", 0.0)
+        if em < -1.0:
+            self._eff_label.setText("回馈制动中")
+            self._eff_label.setStyleSheet("color: #4fc3f7; font-weight: bold;")
+        elif supply > 5.0 and em > 0.0:
+            self._eff_label.setText(f"效率 η = {min(em / supply, 1.0):.1%}")
+            self._eff_label.setStyleSheet("color: #69f0ae; font-weight: bold;")
+        else:
+            self._eff_label.setText("效率 η = --（轻载）")
+            self._eff_label.setStyleSheet("color: #90a4ae;")
+
     def _refresh(self) -> None:
         if not self._analysis_enabled:
             return
@@ -500,16 +382,8 @@ class PowerFlowPage(QWidget):
         if not p:
             self._eff_label.setText("效率 η = --")
             return
+        self._update_efficiency(p)
         supply, em = p.get("supply", 0.0), p.get("em", 0.0)
-        if em < -1.0:
-            self._eff_label.setText("回馈制动中")
-            self._eff_label.setStyleSheet("color: #4fc3f7; font-weight: bold;")
-        elif supply > 5.0 and em > 0.0:
-            self._eff_label.setText(f"效率 η = {min(em / supply, 1.0):.1%}")
-            self._eff_label.setStyleSheet("color: #69f0ae; font-weight: bold;")
-        else:
-            self._eff_label.setText("效率 η = --（轻载）")
-            self._eff_label.setStyleSheet("color: #90a4ae;")
         loss = (p.get("loss_src", 0.0) + p.get("brake", 0.0)
                 + p.get("cu", 0.0) + p.get("fric", 0.0))
         self._curve.append({"电源输入": supply, "电磁功率": em,

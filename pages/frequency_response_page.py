@@ -7,7 +7,7 @@ from typing import Callable
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
-    QHeaderView, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox,
+    QHeaderView, QHBoxLayout, QLabel, QMessageBox, QPushButton, QScrollArea, QSpinBox,
     QTableWidget, QTableWidgetItem, QTabWidget, QVBoxLayout, QWidget,
 )
 
@@ -709,7 +709,12 @@ class FrequencyResponsePage(QWidget):
         if _PLOT_OK:
             plot_tabs = QTabWidget()
             self._theory_plot_tabs = plot_tabs
-            plot_tabs.addTab(settings_tab, "参数与公式")
+            # 参数与公式内容很高：单独滚动，避免把所有标签页（波特图等）撑出窗口
+            settings_scroll = QScrollArea()
+            settings_scroll.setWidgetResizable(True)
+            settings_scroll.setFrameShape(QScrollArea.NoFrame)
+            settings_scroll.setWidget(settings_tab)
+            plot_tabs.addTab(settings_scroll, "参数与公式")
             bode_tab = QWidget()
             plots = QHBoxLayout(bode_tab)
             self._theory_mag = pg.PlotWidget(title="幅频特性")
@@ -1333,16 +1338,22 @@ class FrequencyResponsePage(QWidget):
                 pen=pg.mkPen("#69f0ae", width=1.4), name="PI所见滤波电流")
         self._theory_mag.addItem(pg.InfiniteLine(
             pos=0.0, angle=0, pen=pg.mkPen("#546e7a", style=Qt.DashLine)))
-        if math.isfinite(result["gain_cross_hz"]):
+        # 对数频率轴上，竖线位置必须用 log10(f)，否则视图被拉到 f 处、曲线挤成一条竖线
+        label_opts = {"position": 0.92, "color": "#dfe6ee", "movable": False,
+                      "fill": (16, 19, 26, 200)}
+        gain_cross = result["gain_cross_hz"]
+        if math.isfinite(gain_cross) and gain_cross > 0:
             self._theory_mag.addItem(pg.InfiniteLine(
-                pos=result["gain_cross_hz"], angle=90,
+                pos=math.log10(gain_cross), angle=90,
                 pen=pg.mkPen("#ffb74d", style=Qt.DashLine),
-                label=f"开环0 dB {result['gain_cross_hz']:.1f} Hz"))
-        if math.isfinite(result["closed_bandwidth_hz"]):
+                label=f"开环0 dB {gain_cross:.1f} Hz", labelOpts=label_opts))
+        bandwidth = result["closed_bandwidth_hz"]
+        if math.isfinite(bandwidth) and bandwidth > 0:
             self._theory_mag.addItem(pg.InfiniteLine(
-                pos=result["closed_bandwidth_hz"], angle=90,
+                pos=math.log10(bandwidth), angle=90,
                 pen=pg.mkPen("#4fc3f7", style=Qt.DashLine),
-                label=f"闭环BW {result['closed_bandwidth_hz']:.1f} Hz"))
+                label=f"闭环BW {bandwidth:.1f} Hz",
+                labelOpts={**label_opts, "position": 0.8}))
         self._theory_phase.clear()
         self._theory_phase.addLegend()
         self._theory_phase.plot(
@@ -1354,6 +1365,18 @@ class FrequencyResponsePage(QWidget):
         self._theory_phase.addItem(pg.InfiniteLine(
             pos=-180.0, angle=0,
             pen=pg.mkPen("#ef5350", style=Qt.DashLine)))
+        # 相频图在同一穿越频率处标出相位裕度，两张图对照读
+        margin = result["phase_margin_deg"]
+        if math.isfinite(gain_cross) and gain_cross > 0:
+            self._theory_phase.addItem(pg.InfiniteLine(
+                pos=math.log10(gain_cross), angle=90,
+                pen=pg.mkPen("#ffb74d", style=Qt.DashLine),
+                label=(f"PM {margin:.1f}°" if math.isfinite(margin) else "穿越频率"),
+                labelOpts={**label_opts, "position": 0.08}))
+        for plot in (self._theory_mag, self._theory_phase):
+            plot.enableAutoRange()
+            plot.setXRange(math.log10(float(frequency[0])),
+                           math.log10(float(frequency[-1])), padding=0.02)
 
         loop_complex = result["loop_complex"]
         self._nyquist.clear()
