@@ -12,12 +12,12 @@ from scipy.integrate import cumulative_trapezoid
 MAX_SAMPLES = 2_000_000
 
 
-def series(snapshot, interval=None):
+def series(snapshot, interval=None, *, timing="strict", min_samples=32):
     y = np.asarray(snapshot.get("values", ()), dtype=float)
     fs = float(snapshot.get("sample_rate_hz", 0))
     t = np.asarray(snapshot.get("times", ()), dtype=float)
-    if y.ndim != 1 or not 32 <= y.size <= MAX_SAMPLES:
-        raise ValueError("分析需要 32～2,000,000 个样本，请缩小采集范围")
+    if y.ndim != 1 or not min_samples <= y.size <= MAX_SAMPLES:
+        raise ValueError(f"分析需要 {min_samples}～2,000,000 个样本，请缩小采集范围")
     if t.size != y.size:
         if t.size or not np.isfinite(fs) or fs <= 0:
             raise ValueError("时间列与数据不匹配，且不能安全重建时间轴")
@@ -25,12 +25,19 @@ def series(snapshot, interval=None):
     if interval is not None:
         keep = (t >= interval[0]) & (t <= interval[1])
         t, y = t[keep], y[keep]
-    if y.size < 32 or not np.all(np.isfinite(y)) or not np.all(np.isfinite(t)):
+    if y.size < min_samples or not np.all(np.isfinite(y)) or not np.all(np.isfinite(t)):
         raise ValueError("区间过短或含无效值；请选取连续有效片段")
     dt = np.diff(t)
     step = float(np.median(dt))
-    if step <= 0 or np.any(dt <= 0) or np.max(np.abs(dt-step)) > step * .1:
+    if step <= 0 or np.any(dt <= 0):
+        raise ValueError("时间戳重复或倒退，请选取时间递增的片段")
+    if timing == "strict" and np.max(np.abs(dt-step)) > step * .1:
         raise ValueError("时间戳不均匀或存在丢点，请先选择连续采集片段")
+    if timing != "strict" and np.max(dt) > step*8:
+        i = int(np.argmax(dt))
+        raise ValueError(f"采集在 {t[i]:.6g}～{t[i+1]:.6g} s 中断，请将开始/结束时间设在同一连续段内")
+    if timing == "raw":
+        return t, y, (len(t)-1)/(t[-1]-t[0])
     # Timestamps are authoritative: declared wire rate may differ from curve rate.
     # Small timestamp jitter is resampled explicitly, never treated as perfectly
     # uniform points. The endpoints and number of samples are preserved.
@@ -44,7 +51,7 @@ def align_reference(snapshot, t, *, angle=False):
     if angle:
         snapshot = dict(snapshot, values=np.rad2deg(np.unwrap(
             np.deg2rad(np.asarray(snapshot.get("values", ()), dtype=float)))))
-    rt, ry, _ = series(snapshot)
+    rt, ry, _ = series(snapshot, timing="raw", min_samples=2)
     if rt[0] > t[0] + 1e-8 or rt[-1] < t[-1] - 1e-8:
         raise ValueError("参考信号没有覆盖所选时间区间，请缩小区间")
     if angle:
@@ -153,11 +160,14 @@ def response_metrics(t, y, event, target=None, band=.02, dwell=.05,
     amplitude = target-baseline
     if abs(amplitude) < max(1e-12, np.std(before)*3):
         raise ValueError("阶跃幅度过小或小于前段噪声，请检查目标值及阶跃时刻")
-    step = float(np.median(np.diff(t)))
+    step = float((t[-1]-t[0])/(len(t)-1))
     width = max(5, int(round(smooth_s/step)) | 1)
     width = min(width, (len(y)-1) | 1)
-    filtered = signal.savgol_filter(y, width, 2)
-    derivative = signal.savgol_filter(y, width, 2, deriv=1, delta=step)
+    uniform = np.linspace(t[0], t[-1], len(t))
+    regular_y = np.interp(uniform, t, y)
+    filtered = np.interp(t, uniform, signal.savgol_filter(regular_y, width, 2))
+    derivative = np.interp(t, uniform, signal.savgol_filter(
+        regular_y, width, 2, deriv=1, delta=step))
     ta, ya = t[after], y[after]
     normalized = (ya-baseline)/amplitude
     def crossing(level):
@@ -191,6 +201,10 @@ def response_metrics(t, y, event, target=None, band=.02, dwell=.05,
         if limit <= 0:
             raise ValueError("限幅值必须为正")
         sat = np.abs(y) >= limit
+    # Time-weighted occupation on irregular timestamps; the unobserved interval
+    # after the final sample is never included in saturation duration.
+    durations = np.maximum(0., t[1:]-np.maximum(t[:-1], event))
+    sat_time = None if sat is None else float(np.sum(durations*sat[:-1]))
     metrics = dict(baseline=baseline, target=target,
                    rise_s=None if t10 is None or t90 is None else t90-t10,
                    overshoot_pct=max(0., float(normalized.max()-1))*100,
@@ -198,8 +212,8 @@ def response_metrics(t, y, event, target=None, band=.02, dwell=.05,
                    steady_error=float(np.mean(ya[-max(5, len(ya)//10):])-target),
                    peak_slope=float(np.max(abs(derivative[after]))),
                    ringing_hz=ring_hz,
-                   saturation_fraction=None if sat is None else float(np.mean(sat[after])),
-                   saturation_s=None if sat is None else float(np.sum(sat[after])*step))
+                   saturation_fraction=None if sat is None else sat_time/np.sum(durations),
+                   saturation_s=sat_time)
     return dict(metrics=metrics, time=t, values=y, filtered=filtered,
                 derivative=derivative, saturation=sat, event=event, band=band,
                 t10=t10, t90=t90, dwell_s=dwell, smooth_s=width*step)

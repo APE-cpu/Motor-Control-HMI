@@ -5,9 +5,10 @@ import json
 from pathlib import Path
 import numpy as np
 import pyqtgraph as pg
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QGridLayout,
     QLabel, QPushButton, QComboBox, QFileDialog, QTableWidget, QTableWidgetItem,
-    QHeaderView, QMessageBox)
+    QHeaderView, QMessageBox, QCheckBox, QToolButton)
 
 from pages.dynamic_analysis_dialog import AnalysisWorker, double_spin
 
@@ -30,6 +31,14 @@ class AlgorithmValidationPage(QWidget):
         row.addWidget(load)
         self.source_label = QLabel("只读重放实测反馈 · 每次运行从零状态开始")
         row.addWidget(self.source_label, 1)
+        help_button = QToolButton()
+        help_button.setText("?")
+        help_button.setToolTip("这页怎么用？")
+        help_button.clicked.connect(self._help)
+        row.addWidget(help_button)
+        demo_button = QPushButton("先看一次演示")
+        demo_button.clicked.connect(self._demo)
+        row.addWidget(demo_button)
         root.addLayout(row)
         grid = QGridLayout()
         for c, name in enumerate(["参数组", "模块", "ESO 带宽 rad/s", "标称电感 mH", "RLS 遗忘因子 λ"]):
@@ -71,7 +80,7 @@ class AlgorithmValidationPage(QWidget):
         self.save.clicked.connect(self._save)
         row.addWidget(self.save)
         root.addLayout(row)
-        self.status = QLabel("RLS 在后段冻结系数并评价预测误差；ESO 仍按记录反馈运行。")
+        self.status = QLabel("① 选择记录或演示 → ② 调整 A/B 参数 → ③ 开始验证；“?” 查看用法")
         self.status.setWordWrap(True)
         self.status.setToolTip("ESO 校正后误差小不代表抗噪更好；请同时检查先验预测误差。"
                                "RLS 预测目标是 ESO 电流，ARX 系数不直接等同于物理 R/L。"
@@ -84,6 +93,25 @@ class AlgorithmValidationPage(QWidget):
         self.table.setMaximumHeight(160)
         self.table.setEditTriggers(QTableWidget.NoEditTriggers)
         root.addWidget(self.table)
+        display = QHBoxLayout()
+        self.trace_toggles = {}
+        for key, title in (("measured", "实测 · 灰色"), ("A", "A · 青色实线"), ("B", "B · 橙色虚线")):
+            check = QCheckBox(title)
+            check.setChecked(True)
+            check.toggled.connect(self._render)
+            self.trace_toggles[key] = check
+            display.addWidget(check)
+        self.current_view = QComboBox()
+        self.current_view.addItems(["叠加对照", "相对实测的差值"])
+        self.current_view.currentIndexChanged.connect(self._render)
+        display.addWidget(self.current_view)
+        display.addStretch()
+        zoom = QToolButton()
+        zoom.setText("↗")
+        zoom.setToolTip("弹出大图，可缩放并分别查看三个图表")
+        zoom.clicked.connect(self._popout)
+        display.addWidget(zoom)
+        root.addLayout(display)
         self.graph = pg.GraphicsLayoutWidget()
         self.graph.setBackground("#10151c")
         self.graph.setMinimumHeight(400)
@@ -99,6 +127,28 @@ class AlgorithmValidationPage(QWidget):
         self.error.setLabel("left", "预测误差", units="A")
         self.error.setXLink(self.current)
         self.coefficients.setXLink(self.current)
+
+    def _help(self):
+        QMessageBox.information(self, "算法验证怎么用",
+            "这页让两套算法参数读取同一段已记录的数据，比较它们的估计结果。\n\n"
+            "1. 没有数据：点击“先看一次演示”。有数据：选择当前 F1 缓冲，或导入同步 CSV。\n"
+            "2. A/B 分别设置带宽、电感和遗忘因子。例如只改 B 的带宽，其他参数保持相同。\n"
+            "3. 点击“开始 A/B 验证”，先看表格里的 ESO 先验 RMSE，再看误差曲线。\n\n"
+            "灰线是实测，青色实线是 A，橙色虚线是 B。曲线重合通常表示结果接近；"
+            "可取消勾选某条线，或选择“相对实测的差值”。右上角 ↗ 可放大查看。\n\n"
+            "后段 RLS 冻结系数用于评价；误差小不必然意味着抗噪更好。"
+            "这里验证已接入的 ESO/RLS，不会向电机下发控制命令。")
+
+    def _demo(self):
+        if self.busy():
+            return
+        self.source.setCurrentIndex(2)
+        self._run()
+
+    def _popout(self):
+        from widgets.analysis_plot_dialog import show_plot_dialog
+        show_plot_dialog([("电流对照 / 差值", self.current), ("先验预测误差", self.error),
+                          ("RLS 系数", self.coefficients)], self)
 
     def busy(self):
         return self.worker is not None and self.worker.isRunning()
@@ -187,7 +237,11 @@ class AlgorithmValidationPage(QWidget):
             plot.clear()
         measured = result["i"+axis]
         time = result["results"][0]["time"]
-        self.current.plot(time, measured, pen="#738394", name="记录反馈")
+        difference = self.current_view.currentIndex() == 1
+        self.current.setTitle("ESO 校正值 − 实测值" if difference else "实测电流与 ESO 校正值")
+        if self.trace_toggles["measured"].isChecked():
+            self.current.plot(time, np.zeros_like(measured) if difference else measured,
+                              pen=pg.mkPen("#b8b8b8", width=3), name="实测基线" if difference else "实测 · 灰色")
         rows = [("ESO 先验 RMSE / A", "prior_rmse_"+axis),
                 ("ESO 校正后 RMSE / A", "corrected_rmse_"+axis),
                 ("冻结 RLS → ESO 目标 RMSE / A", "rls_holdout_rmse_"+axis)]
@@ -201,10 +255,13 @@ class AlgorithmValidationPage(QWidget):
             name = "A" if i == 0 else "B"
             self.table.setItem(3, i+1, QTableWidgetItem(
                 f"{replay['sample_count']-replay['evaluated_count']:,} / {replay['evaluated_count']:,}"))
-            self.current.plot(time, replay["i"+axis+"_hat"], pen=pg.mkPen(color, width=1.3), name=name)
-            self.error.plot(time, measured-replay["i"+axis+"_prior"], pen=color, name=name)
+            if not self.trace_toggles[name].isChecked():
+                continue
+            pen = pg.mkPen(color, width=1.8, style=Qt.SolidLine if i == 0 else Qt.DashLine)
+            self.current.plot(time, replay["i"+axis+"_hat"]-(measured if difference else 0), pen=pen, name=name)
+            self.error.plot(time, measured-replay["i"+axis+"_prior"], pen=pen, name=name)
             if result["profiles"][i]["rls"]:
-                self.coefficients.plot(time, replay["theta_"+axis][:, 5 if axis == "q" else 3], pen=color, name=name)
+                self.coefficients.plot(time, replay["theta_"+axis][:, 5 if axis == "q" else 3], pen=pen, name=name)
         for plot in (self.current, self.error, self.coefficients):
             plot.addItem(pg.InfiniteLine(result["results"][0]["split_s"], pen="#a69470"))
 

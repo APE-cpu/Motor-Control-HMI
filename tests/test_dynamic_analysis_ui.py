@@ -6,6 +6,7 @@ import numpy as np
 import pytest
 from PySide6.QtWidgets import QApplication
 from PySide6.QtTest import QTest
+from PySide6.QtCore import QSettings
 
 from analysis_dynamic import demo_snapshot
 from pages.dynamic_analysis_dialog import DynamicAnalysisDialog
@@ -16,6 +17,16 @@ from pages.fourier_page import FourierAnalysisPage
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def isolated_palette_settings(app, tmp_path):
+    from ui_theme import appearance_manager
+    manager = appearance_manager()
+    original = manager.settings
+    manager.settings = QSettings(str(tmp_path / "appearance.ini"), QSettings.IniFormat)
+    yield
+    manager.settings = original
 
 
 def finish(app, widget):
@@ -96,3 +107,59 @@ def test_no_capture_still_allows_demo(app):
     finish(app, dialog)
     assert dialog.result["resolution"] == pytest.approx(4000/512)
     dialog.close()
+
+
+def test_fourier_subtabs_can_analyze_irregular_response(app):
+    t = np.r_[0., np.cumsum(np.tile([.006, .013, .011], 150))]
+    snapshot = dict(times=t, values=np.where(t < .2, 0, 1-np.exp(-np.maximum(t-.2,0)/.15)), unit="rpm")
+    page = FourierAnalysisPage(lambda _: snapshot, [("实际转速", "speed")])
+    page.show()
+    assert page.analysis_tabs.count() == 5
+    page.analysis_tabs.setCurrentIndex(4)
+    app.processEvents()
+    panel = page._dynamic_panels[4]
+    assert panel.embedded and not panel.isWindow()
+    assert panel.mode.currentIndex() == 3
+    panel.event.setValue(.2)
+    panel.target.setValue(1)
+    panel._run()
+    finish(app, panel)
+    assert panel.result["metrics"]["rise_s"] > 0
+    page.analysis_tabs.setCurrentIndex(1)
+    other = page._dynamic_panels[1]
+    other._demo()
+    finish(app, other)
+    for i in range(other.palette.count()):
+        other.palette.setCurrentIndex(i)
+        assert other.colorbar is not None
+    from widgets.analysis_plot_dialog import AnalysisPlotDialog
+    popup = AnalysisPlotDialog([("STFT", other.map_plot)], page)
+    popup.show()
+    app.processEvents()
+    assert len(popup.bars) == 1
+    popup.accept()
+    page.close()
+    app.processEvents()
+
+
+def test_plot_popout_and_replay_visibility(app):
+    from algorithm_replay import native_module
+    try:
+        native_module()
+    except RuntimeError as exc:
+        pytest.skip(str(exc))
+    from widgets.analysis_plot_dialog import AnalysisPlotDialog
+    page = AlgorithmValidationPage()
+    page._demo()
+    finish(app, page)
+    assert len(page.current.listDataItems()) == 3
+    page.trace_toggles["B"].setChecked(False)
+    assert len(page.current.listDataItems()) == 2
+    page.current_view.setCurrentIndex(1)
+    np.testing.assert_allclose(page.current.listDataItems()[0].getData()[1], 0)
+    popup = AnalysisPlotDialog([("电流", page.current), ("误差", page.error)], page)
+    popup.show()
+    app.processEvents()
+    assert len(popup.views[0].listDataItems()) == 2
+    popup.accept()
+    page.close()

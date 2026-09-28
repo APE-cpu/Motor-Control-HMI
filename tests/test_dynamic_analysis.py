@@ -68,7 +68,8 @@ def test_unsettled_response_and_explicit_saturation():
     result = response_metrics(t, y, .2, 1, saturation=t>.6)
     assert result["metrics"]["settling_s"] is None
     assert result["metrics"]["rise_s"] is None
-    assert result["metrics"]["saturation_fraction"] == pytest.approx(399/800)
+    assert result["metrics"]["saturation_s"] == pytest.approx(.999-.601)
+    assert result["metrics"]["saturation_fraction"] == pytest.approx((.999-.601)/(.999-.2))
 
 
 def test_time_gap_and_nan_are_not_silently_removed():
@@ -87,6 +88,34 @@ def test_small_timestamp_jitter_is_resampled():
     uniform, y, fs = series(dict(times=jittered, values=jittered*3))
     np.testing.assert_allclose(np.diff(uniform), 1/fs, atol=1e-12)
     np.testing.assert_allclose(y, uniform*3, atol=1e-12)
+
+
+def test_irregular_slow_speed_reference_does_not_require_uniform_timestamps():
+    t = np.arange(4000)/2000
+    ref_time = np.r_[0, np.cumsum(np.tile([.06, .13, .11, .08, .12], 4))]
+    ref = dict(times=ref_time, values=np.full(len(ref_time), 1200.))
+    y = np.cos(2*np.pi*40*t)
+    result = order_map(t, y, 2000, ref, max_order=5)
+    assert result["axis"][result["power"].mean(axis=1).argmax()] == pytest.approx(2)
+
+
+def test_irregular_response_keeps_event_timing_and_time_weighted_saturation():
+    t = np.r_[0., np.cumsum(np.tile([.006, .013, .011], 150))]
+    y = np.where(t < .2, 0., 1-np.exp(-np.maximum(t-.2,0)/.15))
+    raw_t, raw_y, _ = series(dict(times=t, values=y), timing="raw")
+    np.testing.assert_array_equal(raw_t, t)
+    result = response_metrics(raw_t, raw_y, .2, 1)
+    assert result["metrics"]["rise_s"] == pytest.approx(.15*np.log(9), abs=.003)
+    assert result["metrics"]["settling_s"] == pytest.approx(-.15*np.log(.02), abs=.02)
+    regular_t, _, _ = series(dict(times=t, values=y), timing="resample")
+    assert np.ptp(np.diff(regular_t)) < 1e-12
+
+
+def test_real_interruption_still_reports_gap_location():
+    t = np.arange(100)/100
+    t[50:] += 1
+    with pytest.raises(ValueError, match="中断"):
+        series(dict(times=t, values=np.sin(t)), timing="resample")
 
 
 def test_reversal_and_unsafe_order_range_rejected():

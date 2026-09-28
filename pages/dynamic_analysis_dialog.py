@@ -1,4 +1,4 @@
-"""Shared offline analysis window launched from the Fourier source selector."""
+"""Offline analysis panel, embedded in Fourier subtabs or used in a dialog."""
 from __future__ import annotations
 
 import json
@@ -6,9 +6,9 @@ from pathlib import Path
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QThread, Signal, QRectF
+from PySide6.QtCore import QThread, Signal, QRectF, Qt
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
-    QLabel, QPushButton, QComboBox, QDoubleSpinBox, QSpinBox,
+    QLabel, QPushButton, QComboBox, QDoubleSpinBox, QSpinBox, QToolButton,
     QFileDialog, QMessageBox)
 
 from analysis_dynamic import (series, stft_map, cwt_map, order_map,
@@ -41,8 +41,15 @@ def double_spin(value, low=-1e9, high=1e9, decimals=4):
 
 
 class DynamicAnalysisDialog(QDialog):
-    def __init__(self, label, snapshot, references=None, interval=None, parent=None):
+    def __init__(self, label, snapshot, references=None, interval=None, parent=None,
+                 *, embedded=False, fixed_mode=None, source_provider=None):
         super().__init__(parent)
+        self.embedded = embedded
+        self.fixed_mode = fixed_mode
+        self.source_provider = source_provider
+        self._using_demo = False
+        if embedded:
+            self.setWindowFlags(Qt.Widget)
         self.setWindowTitle("驭衡智控 · 时频与动态分析")
         self.resize(1240, 860)
         self.snapshot = snapshot
@@ -55,14 +62,34 @@ class DynamicAnalysisDialog(QDialog):
         if empty:
             t, y, fs = np.array([0., 1.]), np.array([0., 0.]), 2000.
         else:
-            t, y, fs = series(snapshot)
+            t, y, fs = self._preview(snapshot)
         root = QVBoxLayout(self)
         top = QHBoxLayout()
         self.source = QLabel(label)
         top.addWidget(self.source, 1)
+        if source_provider is not None:
+            refresh = QPushButton("读取所选数据")
+            refresh.clicked.connect(self.refresh_source)
+            top.addWidget(refresh)
         demo = QPushButton("演示数据")
         demo.clicked.connect(self._demo)
         top.addWidget(demo)
+        self.palette = QComboBox()
+        for title, name in (("紫绿黄 · 参考图", "viridis"), ("熔金 · 原配色", "inferno"),
+                            ("紫红黄", "plasma"), ("深紫暖白", "magma"),
+                            ("蓝黄", "cividis"), ("灰阶", "CET-L1")):
+            self.palette.addItem(title, name)
+        from ui_theme import appearance_manager
+        self._settings = appearance_manager().settings
+        self.palette.setCurrentIndex(max(0, self.palette.findData(
+            self._settings.value("analysis/colormap", "viridis"))))
+        self.palette.currentIndexChanged.connect(self._change_palette)
+        top.addWidget(self.palette)
+        zoom = QToolButton()
+        zoom.setText("↗")
+        zoom.setToolTip("弹窗放大图像")
+        zoom.clicked.connect(self._popout)
+        top.addWidget(zoom)
         self.export = QPushButton("导出结果…")
         self.export.clicked.connect(self._export)
         self.export.setEnabled(False)
@@ -141,6 +168,75 @@ class DynamicAnalysisDialog(QDialog):
         if empty:
             self.status.setText("当前信号暂无数据；可先点击“演示数据”查看效果")
         self._mode_changed()
+        if fixed_mode is not None:
+            self.mode.setCurrentIndex(fixed_mode)
+        if source_provider is not None:
+            self.refresh_source()
+
+    @staticmethod
+    def _preview(snapshot):
+        y = np.asarray(snapshot.get("values", ()), dtype=float)
+        t = np.asarray(snapshot.get("times", ()), dtype=float)
+        fs = float(snapshot.get("sample_rate_hz", 0) or 2000.)
+        if len(t) != len(y):
+            t = np.arange(len(y))/fs
+        if len(t) > 1 and t[-1] > t[0]:
+            fs = (len(t)-1)/(t[-1]-t[0])
+        return t, y, fs
+
+    def refresh_source(self, _checked=False):
+        if self.busy() or self.source_provider is None:
+            return
+        try:
+            label, snapshot, references, interval = self.source_provider()
+            self.snapshot, self.references = snapshot, references
+            self.source_label = label
+            self._using_demo = False
+            self.source.setText(label)
+            previous = self.reference.currentText()
+            self.reference.clear()
+            self.reference.addItems(list(references))
+            if previous in references:
+                self.reference.setCurrentText(previous)
+            else:
+                self._suggest_reference()
+            self.sat_source.clear()
+            self.sat_source.addItems(["无饱和分析", "按当前信号绝对限幅推断", *references])
+            t, y, fs = self._preview(snapshot)
+            self.result = None
+            self.export.setEnabled(False)
+            if self.colorbar is not None:
+                self.map_plot.layout.removeItem(self.colorbar)
+                self.colorbar.close()
+                self.graph.scene().removeItem(self.colorbar)
+                self.colorbar = None
+            self.map_plot.clear()
+            self._show_wave(t, y)
+            if len(t) > 1:
+                self.start.setValue(interval[0] if interval else t[0])
+                self.end.setValue(interval[1] if interval else t[-1])
+                self.event.setValue(t[0]+.2*(t[-1]-t[0]))
+                self.target.setValue(float(np.median(y[-max(5,len(y)//10):])))
+                self.fmax.setMaximum(fs/2)
+                self.fmin.setMaximum(fs/2)
+                self.status.setText(f"已读取 {len(y):,} 点；调整区间后开始分析")
+            else:
+                self.status.setText("所选信号暂无数据，可先查看演示")
+        except Exception as exc:
+            self.status.setText(str(exc))
+
+    def _change_palette(self):
+        name = self.palette.currentData()
+        self._settings.setValue("analysis/colormap", name)
+        if self.colorbar is not None:
+            self.colorbar.setColorMap(pg.colormap.get(name))
+        if self.metadata:
+            self.metadata["colormap"] = name
+
+    def _popout(self):
+        from widgets.analysis_plot_dialog import show_plot_dialog
+        show_plot_dialog([("原始波形", self.wave_plot),
+                          (self.mode.currentText(), self.map_plot)], self)
 
     def _suggest_reference(self):
         for i in range(self.reference.count()):
@@ -153,7 +249,10 @@ class DynamicAnalysisDialog(QDialog):
 
     def _mode_changed(self):
         mode = self.mode.currentIndex()
+        self.palette.setVisible(mode != 3)
         enabled = set(range(3))
+        if self.fixed_mode is not None:
+            enabled.discard(0)
         enabled |= ({3, 5} if mode == 0 else {4, 5} if mode == 1 else
                     {6, 7, 8, 9} if mode == 2 else set(range(10, 17)))
         position = 0
@@ -180,6 +279,7 @@ class DynamicAnalysisDialog(QDialog):
         if self.busy():
             return
         self.snapshot, speed = demo_snapshot()
+        self._using_demo = True
         self.source_label = "演示信号 · 扫频＋250 Hz 衰减振铃（非实机）"
         self.source.setText(self.source_label)
         self.references = {"演示机械转速": lambda: speed}
@@ -193,7 +293,16 @@ class DynamicAnalysisDialog(QDialog):
         self.fmax.setValue(500)
         self.fmin.setValue(10)
         self.ref_kind.setCurrentIndex(0)
-        self.mode.setCurrentIndex(0)
+        self.mode.setCurrentIndex(self.fixed_mode if self.fixed_mode is not None else 0)
+        if self.mode.currentIndex() == 3:
+            t = self.snapshot["times"]
+            elapsed = np.maximum(t-.3, 0)
+            y = np.where(t < .3, 0, 1000*(1-np.exp(-elapsed*12)*np.cos(24*elapsed)))
+            self.snapshot = dict(self.snapshot, values=y, unit="rpm")
+            self.source_label = "演示响应 · 转速阶跃（非实机）"
+            self.source.setText(self.source_label)
+            self.event.setValue(.3)
+            self.target.setValue(1000)
         self._run()
 
     def busy(self):
@@ -209,12 +318,19 @@ class DynamicAnalysisDialog(QDialog):
             return
         try:
             interval = (self.start.value(), self.end.value())
-            t, y, fs = series(self.snapshot, interval)
             mode = self.mode.currentIndex()
+            t, y, fs = series(self.snapshot, interval, timing="raw" if mode == 3 else "resample")
             ref = self.references[self.reference.currentText()]() if mode == 2 else None
+            if ref is not None:
+                rt = np.asarray(ref.get("times", ()), dtype=float)
+                if len(rt):
+                    common = (t >= rt[0]) & (t <= rt[-1])
+                    t, y = t[common], y[common]
+                    if len(t) < 32:
+                        raise ValueError("信号和参考没有足够的共同时间范围，请重新读取同一记录")
             sat = None
             if mode == 3 and self.sat_source.currentIndex() > 1:
-                st, sy, _ = series(self.references[self.sat_source.currentText()]())
+                st, sy, _ = series(self.references[self.sat_source.currentText()](), timing="raw", min_samples=2)
                 if st[0] > t[0] or st[-1] < t[-1]:
                     raise ValueError("饱和标志未覆盖所选区间")
                 sat = sy[np.clip(np.searchsorted(st, t, side="right")-1, 0, len(st)-1)] != 0
@@ -231,6 +347,9 @@ class DynamicAnalysisDialog(QDialog):
                                  reference=self.reference.currentText(),
                                  saturation_basis=self.sat_source.currentText(),
                                  source_processing=self.snapshot.get("source_processing", ""))
+            self.metadata.update(colormap=self.palette.currentData(),
+                                 effective_interval=[float(t[0]), float(t[-1])],
+                                 time_processing="动态指标使用原始时间；导数重采样" if mode == 3 else "按实际时间线性重采样；参考按实际时间插值")
         except Exception as exc:
             self.status.setText(str(exc))
             return
@@ -321,7 +440,7 @@ class DynamicAnalysisDialog(QDialog):
             dy = (axis[-1]-axis[0])/max(1, len(axis)-1) if len(axis)>1 else 1
             img.setRect(QRectF(uniform[0]-dx/2, axis[0]-dy/2,
                                uniform[-1]-uniform[0]+dx, axis[-1]-axis[0]+dy))
-            self.colorbar = pg.ColorBarItem(values=(-70, 0), colorMap=pg.colormap.get("inferno"),
+            self.colorbar = pg.ColorBarItem(values=(-70, 0), colorMap=pg.colormap.get(self.palette.currentData()),
                                              label="相对功率 dB", interactive=False)
             self.colorbar.setImageItem(img, insert_in=self.map_plot)
             is_order = result["kind"] == "阶次"
@@ -357,6 +476,8 @@ class DynamicAnalysisDialog(QDialog):
             QMessageBox.warning(self, "保存失败", str(exc))
 
     def reject(self):
+        if self.embedded:
+            return
         if self.busy():
             self._cancel()
             return
