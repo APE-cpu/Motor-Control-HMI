@@ -568,6 +568,10 @@ class FourierAnalysisPage(QWidget):
             "在独立窗口中离线学习机械阶次，不增加当前页面高度")
         self._order_lms_btn.clicked.connect(self._open_order_lms)
         buttons.addWidget(self._order_lms_btn)
+        self._dynamic_btn = QPushButton("时频与动态分析…")
+        self._dynamic_btn.clicked.connect(self._open_dynamic_analysis)
+        buttons.addWidget(self._dynamic_btn)
+        self._dynamic_dialogs = []
         buttons.addStretch(1)
         grid.addLayout(buttons, 5, 0, 1, 4)
         root.addWidget(controls)
@@ -725,6 +729,41 @@ class FourierAnalysisPage(QWidget):
         if self._snapshot_provider is None:
             raise ValueError("当前监控缓冲不可用")
         return self._signal_combo.currentText(), self._snapshot_provider(key)
+
+    def analysis_busy(self) -> bool:
+        return any(dialog.busy() for dialog in self._dynamic_dialogs)
+
+    def _open_dynamic_analysis(self) -> None:
+        from pages.dynamic_analysis_dialog import DynamicAnalysisDialog
+        try:
+            label, snapshot = self._selected_snapshot()
+            references = {}
+            source = self._source_combo.currentData()
+            path = self._file_combo.currentData()
+            for item in self._signal_entries:
+                if item["source"] != source:
+                    continue
+                kind, key = item["token"]
+                if kind == "loaded":
+                    if item["file"] != path:
+                        continue
+                    references[item["label"]] = lambda k=key: self._loaded_sources[k]
+                elif self._snapshot_provider is not None:
+                    references[item["label"]] = lambda k=key: self._snapshot_provider(k)
+            interval = None
+            if self._use_plot_interval.isChecked() and self._selection_region.isVisible():
+                interval = sorted(self._selection_region.getRegion())
+            dialog = DynamicAnalysisDialog(label, snapshot, references, interval, self)
+            self._dynamic_dialogs.append(dialog)
+            dialog.finished.connect(lambda _: self._release_dynamic_dialog(dialog))
+            dialog.show()
+        except Exception as exc:
+            QMessageBox.warning(self, "动态分析无法打开", str(exc))
+
+    def _release_dynamic_dialog(self, dialog):
+        if dialog in self._dynamic_dialogs:
+            self._dynamic_dialogs.remove(dialog)
+        dialog.deleteLater()
 
     def _analyze_selected(self) -> None:
         try:

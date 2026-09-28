@@ -172,6 +172,8 @@ class MainWindow(QMainWindow):
         self._startup_step("监控页面")
         self.monitor_page = MonitorPage(
             self.comm_manager, self.control_page, self.runtime_state)
+        self.digital_twin_page.validation_page.snapshot_provider = (
+            self.monitor_page.algorithm_capture_snapshot)
         self._startup_step("离线傅里叶页")
         self.fourier_page = FourierAnalysisPage(
             self.monitor_page.fourier_snapshot,
@@ -570,6 +572,10 @@ class MainWindow(QMainWindow):
             logger.log("运行状态应答处理失败", str(exc))
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        if self.fourier_page.analysis_busy() or self.digital_twin_page.validation_busy():
+            self.statusBar().showMessage("离线分析正在运行，请取消或等待完成后退出。", 10000)
+            event.ignore()
+            return
         if (self.monitor_page._export_ticket is not None or
                 (self.monitor_page._save_worker is not None and
                  self.monitor_page._save_worker.isRunning())):
