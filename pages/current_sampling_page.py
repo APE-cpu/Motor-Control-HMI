@@ -6,7 +6,7 @@ from datetime import datetime
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
-    QLabel, QPushButton, QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout,
+    QLabel, QPushButton, QSizePolicy, QSpinBox, QTabWidget, QVBoxLayout, QMessageBox,
     QWidget,
 )
 
@@ -18,6 +18,7 @@ class CurrentSamplingPage(QWidget):
     def __init__(self, comm) -> None:
         super().__init__()
         self._comm = comm
+        self.export_archive = None
         self._pending = deque(maxlen=1000)
         self._history = deque(maxlen=3000)  # 约一分钟 50 Hz 原始诊断
         root = QVBoxLayout(self)
@@ -191,21 +192,45 @@ class CurrentSamplingPage(QWidget):
             curve.clear()
 
     def _save_csv(self) -> None:
-        record_dir = create_waveform_record_dir("电流采样诊断", datetime.now())
-        default = str(record_dir / "原始数据.csv")
-        path, _ = QFileDialog.getSaveFileName(self, "保存电流采样诊断", default,
-                                               "CSV (*.csv)")
-        if not path:
-            record_dir.rmdir()
+        if not self._history:
+            QMessageBox.information(self, "暂无数据", "收到采样诊断数据后再保存。")
             return
+        ticket = None
+        if self.export_archive is not None:
+            try:
+                ticket = self.export_archive.prepare_data_export("电流采样诊断")
+            except Exception as exc:
+                QMessageBox.warning(self, "归档失败", str(exc))
+                return
+            path = str(ticket.directory / "采样诊断.csv")
+        else:
+            record_dir = create_waveform_record_dir("电流采样诊断", datetime.now())
+            path, _ = QFileDialog.getSaveFileName(self, "保存电流采样诊断",
+                str(record_dir / "原始数据.csv"), "CSV (*.csv)")
+            if not path:
+                record_dir.rmdir()
+                return
         fields = ("tick_ms", "adc1_raw", "adc2_raw", "offset_a", "offset_b",
                   "sector", "duty_a", "duty_b", "duty_c", "sample_point",
                   "cal_adc1_min", "cal_adc1_max", "cal_adc1_pp",
                   "cal_adc2_min", "cal_adc2_max", "cal_adc2_pp",
                   "adc1_v", "adc2_v", "zero_a_v", "zero_b_v",
                   "adc1_delta_a", "adc2_delta_a", "vdda_v")
-        with open(path, "w", newline="", encoding="utf-8-sig") as stream:
-            writer = csv.DictWriter(stream, fieldnames=fields)
-            writer.writeheader()
-            writer.writerows({key: row.get(key, "") for key in fields}
-                             for row in self._history)
+        error = ""
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as stream:
+                writer = csv.DictWriter(stream, fieldnames=fields)
+                writer.writeheader()
+                writer.writerows({key: row.get(key, "") for key in fields}
+                                 for row in self._history)
+        except OSError as exc:
+            error = str(exc)
+        if ticket is not None:
+            try:
+                self.export_archive.finish_data_export(ticket, {"error": error})
+            except Exception as exc:
+                error = f"{error}\n归档索引更新失败：{exc}".strip()
+        if error:
+            QMessageBox.warning(self, "保存失败", f"{path}\n{error}")
+        else:
+            QMessageBox.information(self, "数据已保存", path)

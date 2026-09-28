@@ -6,7 +6,8 @@ QMainWindow, QWidget {
     background-color: #14171e;
     color: #dfe6ee;
     font-family: "Microsoft YaHei", "Segoe UI", sans-serif;
-    font-size: 13px;
+    font-size: 14px;
+    font-style: normal;
 }
 
 /* ---------- 文本 ---------- */

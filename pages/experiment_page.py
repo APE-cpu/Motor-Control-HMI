@@ -7,11 +7,12 @@ from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QTimer, Qt
+from PySide6.QtCore import QTimer, Qt, QUrl
+from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
     QLineEdit, QMessageBox, QPlainTextEdit, QPushButton, QVBoxLayout, QWidget,
-    QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem,
+    QAbstractItemView, QHeaderView, QTableWidget, QTableWidgetItem, QCheckBox, QTabWidget,
 )
 
 from communications.comm_manager import CommManager
@@ -24,6 +25,7 @@ from experiments import (
     ExperimentReportGenerator, ExperimentTemplate, ExperimentTemplateRepository,
     SessionStatus, WorkflowStep,
 )
+from experiments.exports import ExperimentExports, ExportTicket
 from logs.operation_logger import logger
 from runtime_paths import writable_path
 from widgets.historical_telemetry_dialog import HistoricalTelemetryDialog
@@ -57,6 +59,12 @@ class ExperimentPage(QWidget):
         root_path = (Path(storage_root) if storage_root is not None else
                      writable_path("experiment_records", ".keep").parent)
         self.manager = ExperimentSessionManager(root_path)
+        self.exports = ExperimentExports(self.manager)
+        self._draft_path = root_path / "_experiment_draft.json"
+        self._draft_timer = QTimer(self)
+        self._draft_timer.setSingleShot(True)
+        self._draft_timer.setInterval(400)
+        self._draft_timer.timeout.connect(self._save_draft)
         self.template_repository = ExperimentTemplateRepository(
             root_path / "_templates")
         self.equipment_repository = EquipmentProfileRepository(
@@ -74,19 +82,37 @@ class ExperimentPage(QWidget):
         root.addWidget(title)
 
         intro = QLabel(
-            "一次实验会自动归档设备与参数快照、遥测、操作事件和结束原因。"
-            "实验模板会冻结方案和安全边界，并逐步引导、记录每一次确认。"
+            "预检 · 记录 · 归档。监控页保存的波形、参数快照和实验记录放在同一实验目录。"
+            "只保存一次波形也会自动建立快照记录。"
         )
         intro.setWordWrap(True)
         intro.setStyleSheet("color: #8fa3b8;")
         root.addWidget(intro)
 
         root.addWidget(self._build_runtime_box())
-        root.addWidget(self._build_config_box())
-        root.addWidget(self._build_equipment_box())
-        root.addWidget(self._build_template_box())
-        root.addWidget(self._build_status_box())
-        root.addWidget(self._build_history_box(), 1)
+        tabs = QTabWidget()
+        records = QWidget()
+        record_layout = QVBoxLayout(records)
+        config_box = self._build_config_box()
+        setup = QWidget()
+        setup_layout = QVBoxLayout(setup)
+        setup_layout.addWidget(self._build_equipment_box())
+        self._show_templates = QCheckBox("展开实验方案（可选）")
+        self._template_box = self._build_template_box()
+        self._template_box.setVisible(False)
+        self._show_templates.toggled.connect(self._template_box.setVisible)
+        setup_layout.addWidget(self._show_templates)
+        setup_layout.addWidget(self._template_box)
+        setup_layout.addStretch(1)
+        overview = QHBoxLayout()
+        overview.addWidget(config_box, 2)
+        overview.addWidget(self._build_status_box(), 3)
+        record_layout.addLayout(overview)
+        record_layout.addWidget(self._build_history_box(), 1)
+        tabs.addTab(records, "记录与数据")
+        tabs.addTab(setup, "设备与方案")
+        root.addWidget(tabs, 1)
+        self._workspace_tabs = tabs
 
         self.recorder.countersChanged.connect(self._refresh_status)
         self.recorder.recordingError.connect(self._on_recording_error)
@@ -98,6 +124,14 @@ class ExperimentPage(QWidget):
         self._apply_selected_equipment()
         self._apply_selected_template()
         self._apply_snapshot_preview()
+        self._load_draft()
+        self._refresh_device_identity(self._comm.protocol_status())
+        for edit in (self._name, self._operator, self._device_name):
+            edit.textChanged.connect(lambda _text: self._draft_timer.start())
+        self._purpose.textChanged.connect(self._draft_timer.start)
+        for spin in (self._rated_power, self._bus_voltage):
+            spin.valueChanged.connect(lambda _value: self._draft_timer.start())
+        self._source.currentIndexChanged.connect(lambda _index: self._draft_timer.start())
         self._refresh_runtime_state()
         self._refresh_heartbeat()
         self._refresh_status()
@@ -112,6 +146,7 @@ class ExperimentPage(QWidget):
         self._purpose.setPlaceholderText("本次实验要验证的问题")
         self._purpose.setMaximumHeight(70)
         self._operator = QLineEdit()
+        self._operator.setPlaceholderText("自动记住，下次启动继续使用")
         self._device_name = QLineEdit("78W PMSM")
         self._rated_power = QDoubleSpinBox()
         self._rated_power.setRange(0, 1_000_000)
@@ -126,14 +161,13 @@ class ExperimentPage(QWidget):
         form.addRow("实验名称", self._name)
         form.addRow("实验目的", self._purpose)
         form.addRow("操作者", self._operator)
-        form.addRow("设备名称", self._device_name)
-        form.addRow("额定功率", self._rated_power)
-        form.addRow("直流母线", self._bus_voltage)
         form.addRow("数据来源", self._source)
+        self._draft_status = QLabel("实验信息自动保存")
+        form.addRow("", self._draft_status)
         return box
 
     def _build_equipment_box(self) -> QGroupBox:
-        box = QGroupBox("设备组合档案（不可变修订）")
+        box = QGroupBox("设备档案与安全上限")
         layout = QVBoxLayout(box)
         row = QHBoxLayout()
         self._equipment_combo = QComboBox()
@@ -153,11 +187,21 @@ class ExperimentPage(QWidget):
         layout.addLayout(row)
 
         form = QFormLayout()
+        motor_row = QHBoxLayout()
+        motor_row.setContentsMargins(0, 0, 0, 0)
+        motor_row.addWidget(self._device_name, 2)
+        motor_row.addWidget(QLabel("额定功率"))
+        motor_row.addWidget(self._rated_power, 1)
+        motor_row.addWidget(QLabel("直流母线"))
+        motor_row.addWidget(self._bus_voltage, 1)
+        motor_widget = QWidget(); motor_widget.setLayout(motor_row)
+        form.addRow("实验设备", motor_widget)
         self._equipment_inverter = QLineEdit()
         self._equipment_controller = QLineEdit()
         self._equipment_sensors = QLineEdit()
         self._equipment_sensors.setPlaceholderText("多个传感器用逗号分隔")
         hardware_row = QHBoxLayout()
+        hardware_row.setContentsMargins(0, 0, 0, 0)
         hardware_row.addWidget(QLabel("逆变器"))
         hardware_row.addWidget(self._equipment_inverter, 1)
         hardware_row.addWidget(QLabel("控制器"))
@@ -171,14 +215,23 @@ class ExperimentPage(QWidget):
         self._expected_hardware = QLineEdit()
         self._expected_firmware_prefix = QLineEdit()
         identity_row = QHBoxLayout()
+        identity_row.setContentsMargins(0, 0, 0, 0)
         identity_row.addWidget(QLabel("设备ID")); identity_row.addWidget(self._expected_device_id, 1)
         identity_row.addWidget(QLabel("硬件版本")); identity_row.addWidget(self._expected_hardware, 1)
         identity_row.addWidget(QLabel("固件前缀")); identity_row.addWidget(self._expected_firmware_prefix, 1)
         identity_widget = QWidget(); identity_widget.setLayout(identity_row)
-        form.addRow("真实v2白名单", identity_widget)
+        form.addRow("连接校验条件", identity_widget)
+        self._expected_hardware.setPlaceholderText("留空：不限制硬件版本")
+        self._expected_firmware_prefix.setPlaceholderText("留空：不限制固件版本")
+        self._actual_identity = QLabel("未连接 · 等待设备上报硬件与固件版本")
+        self._actual_identity.setWordWrap(True)
+        self._actual_identity.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        form.addRow("设备实际版本", self._actual_identity)
 
         self._equipment_limits: dict[str, QDoubleSpinBox] = {}
         limits_row = QHBoxLayout()
+        limits_row.setContentsMargins(0, 0, 0, 0)
+        limits_row.setSpacing(8)
         for key, title, suffix, maximum in (
             ("max_rpm", "转速", " rpm", 100_000),
             ("max_bus_voltage_v", "母线", " V", 10_000),
@@ -187,14 +240,14 @@ class ExperimentPage(QWidget):
         ):
             spin = QDoubleSpinBox(); spin.setRange(0, maximum); spin.setSuffix(suffix)
             self._equipment_limits[key] = spin
-            limits_row.addWidget(QLabel(title)); limits_row.addWidget(spin)
+            limits_row.addWidget(QLabel(title)); limits_row.addWidget(spin, 1)
         limits_widget = QWidget(); limits_widget.setLayout(limits_row)
         form.addRow("档案安全上限", limits_widget)
         layout.addLayout(form)
         return box
 
     def _build_runtime_box(self) -> QGroupBox:
-        box = QGroupBox("设备运行状态机")
+        box = QGroupBox("运行预检")
         layout = QVBoxLayout(box)
         row = QHBoxLayout()
         self._runtime_value = QLabel("未启用")
@@ -286,7 +339,8 @@ class ExperimentPage(QWidget):
         layout.addLayout(form)
 
         buttons = QHBoxLayout()
-        self._btn_start = QPushButton("新建并开始实验")
+        self._btn_start = QPushButton("开始记录实验")
+        self._btn_start.setToolTip("记录遥测与操作事件；不会启动电机")
         self._btn_start.setObjectName("PrimaryButton")
         self._btn_complete = QPushButton("正常结束")
         self._btn_abort = QPushButton("异常中止")
@@ -297,6 +351,9 @@ class ExperimentPage(QWidget):
         buttons.addWidget(self._btn_start)
         buttons.addWidget(self._btn_complete)
         buttons.addWidget(self._btn_abort)
+        self._btn_open_folder = QPushButton("打开数据目录")
+        self._btn_open_folder.clicked.connect(self._open_current_folder)
+        buttons.addWidget(self._btn_open_folder)
         buttons.addStretch(1)
         layout.addLayout(buttons)
 
@@ -326,11 +383,13 @@ class ExperimentPage(QWidget):
         return box
 
     def _build_history_box(self) -> QGroupBox:
-        box = QGroupBox("历史实验（只读）")
+        box = QGroupBox("实验与波形记录")
         layout = QVBoxLayout(box)
         bar = QHBoxLayout()
-        hint = QLabel("选择记录可查看完整元数据；历史实验不会恢复为运行状态。")
+        hint = QLabel("选择记录查看参数、操作者和波形文件。")
         hint.setStyleSheet("color: #8fa3b8;")
+        hint.setWordWrap(True)
+        layout.addWidget(hint)
         self._btn_refresh_history = QPushButton("刷新")
         self._btn_refresh_history.clicked.connect(self._refresh_history)
         self._btn_curves = QPushButton("查看遥测曲线")
@@ -342,7 +401,11 @@ class ExperimentPage(QWidget):
         self._btn_conclusion = QPushButton("编辑实验结论")
         self._btn_conclusion.setEnabled(False)
         self._btn_conclusion.clicked.connect(self._edit_selected_conclusion)
-        bar.addWidget(hint, 1)
+        bar.addStretch(1)
+        self._btn_history_folder = QPushButton("打开数据目录")
+        self._btn_history_folder.setEnabled(False)
+        self._btn_history_folder.clicked.connect(self._open_history_folder)
+        bar.addWidget(self._btn_history_folder)
         bar.addWidget(self._btn_conclusion)
         bar.addWidget(self._btn_report)
         bar.addWidget(self._btn_curves)
@@ -350,9 +413,9 @@ class ExperimentPage(QWidget):
         layout.addLayout(bar)
 
         body = QHBoxLayout()
-        self._history = QTableWidget(0, 6)
+        self._history = QTableWidget(0, 7)
         self._history.setHorizontalHeaderLabels(
-            ["实验编号", "名称", "状态", "数据源", "遥测", "开始时间"])
+            ["实验编号", "名称", "状态", "数据源", "遥测", "操作者", "波形"])
         self._history.setSelectionBehavior(QAbstractItemView.SelectRows)
         self._history.setSelectionMode(QAbstractItemView.SingleSelection)
         self._history.setEditTriggers(QAbstractItemView.NoEditTriggers)
@@ -360,7 +423,7 @@ class ExperimentPage(QWidget):
         header = self._history.horizontalHeader()
         header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        for column in range(2, 6):
+        for column in range(2, 7):
             header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
         self._history.itemSelectionChanged.connect(self._show_selected_history)
         body.addWidget(self._history, 3)
@@ -398,6 +461,8 @@ class ExperimentPage(QWidget):
                 }
             extra = dict(device_data.get("extra", {}))
             extra.update(equipment_extra)
+            extra["hardware_version"] = protocol.get("hardware_version", "")
+            extra["device_id"] = protocol.get("device_id", "")
             device = DeviceProfile(
                 name=device_data.get("name") or self._device_name.text().strip()
                 or "未命名设备",
@@ -486,6 +551,8 @@ class ExperimentPage(QWidget):
 
     def shutdown(self) -> None:
         """主窗口关闭时保存现场并解除信号连接。"""
+        self._draft_timer.stop()
+        self._save_draft()
         session = self.manager.active_session
         if session is not None and session.status is SessionStatus.RUNNING:
             try:
@@ -538,6 +605,7 @@ class ExperimentPage(QWidget):
         self._status_value.setText(_STATUS_TEXT[session.status])
         self._counts_value.setText(
             f"遥测 {session.telemetry_count} 条　｜　事件 {session.event_count} 条")
+        self._path_value.setText(str(self.manager.repository.session_dir(session.experiment_id)))
         self._refresh_workflow()
 
     def _on_recording_error(self, message: str) -> None:
@@ -687,6 +755,110 @@ class ExperimentPage(QWidget):
 
     def _on_protocol_session(self, status: dict) -> None:
         self._refresh_heartbeat(status)
+        self._refresh_device_identity(status)
+
+    def _refresh_device_identity(self, status: dict) -> None:
+        if status.get("session_state") != "ready":
+            self._actual_identity.setText("未就绪 · 等待设备上报硬件与固件版本")
+            return
+        self._actual_identity.setText(
+            f"硬件：{status.get('hardware_version') or '设备未上报'}　｜　"
+            f"固件：{status.get('firmware_version') or '设备未上报'}　｜　"
+            f"设备：{status.get('device_id') or '设备未上报'}")
+
+    def _load_draft(self) -> None:
+        if not self._draft_path.exists():
+            return
+        try:
+            data = json.loads(self._draft_path.read_text(encoding="utf-8"))
+            for key, edit in (("name", self._name), ("operator", self._operator),
+                              ("device_name", self._device_name)):
+                if key in data:
+                    edit.setText(str(data[key]))
+            self._purpose.setPlainText(str(data.get("purpose", "")))
+            for key, spin in (("rated_power", self._rated_power),
+                              ("bus_voltage", self._bus_voltage)):
+                if key in data:
+                    spin.setValue(float(data[key]))
+            index = self._source.findData(data.get("source", "real"))
+            if index >= 0:
+                self._source.setCurrentIndex(index)
+        except (OSError, ValueError, TypeError, AttributeError) as exc:
+            self._draft_status.setText(f"草稿读取失败：{exc}")
+
+    def _save_draft(self) -> None:
+        try:
+            self.manager.repository._write_json(self._draft_path, {
+                "name": self._name.text(), "purpose": self._purpose.toPlainText(),
+                "operator": self._operator.text(), "device_name": self._device_name.text(),
+                "rated_power": self._rated_power.value(),
+                "bus_voltage": self._bus_voltage.value(), "source": self._source.currentData(),
+            })
+            self._draft_status.setText("实验信息已保存 · 操作者下次自动恢复")
+        except OSError as exc:
+            self._draft_status.setText(f"实验信息保存失败：{exc}")
+
+    def prepare_data_export(self, category: str) -> ExportTicket:
+        snapshot = self._snapshot_provider() if self._snapshot_provider else {}
+        protocol = self._comm.protocol_status()
+        device_data = dict(snapshot.get("device", {}))
+        data_source = self._source.currentData()
+        if self._comm.is_sim_running():
+            data_source = "sim"
+        elif self._comm.is_connected():
+            data_source = ("sim" if self._comm.latest_frame().data_source == "sim"
+                           else "real")
+        device = DeviceProfile(
+            name=device_data.get("name") or self._device_name.text().strip() or "未命名设备",
+            motor_type=device_data.get("motor_type", "PMSM"),
+            rated_power_w=device_data.get("rated_power_w") or self._rated_power.value(),
+            dc_bus_voltage_v=device_data.get("dc_bus_voltage_v") or self._bus_voltage.value(),
+            inverter=self._equipment_inverter.text(),
+            controller=self._equipment_controller.text(),
+            sensors=list(device_data.get("sensors") or [
+                item.strip() for item in self._equipment_sensors.text().replace("，", ",").split(",")
+                if item.strip()]),
+            firmware_version=protocol.get("firmware_version", ""),
+            protocol_version=str(protocol.get("protocol_version") or ""),
+            extra={**device_data.get("extra", {}),
+                   "hardware_version": protocol.get("hardware_version", ""),
+                   "device_id": protocol.get("device_id", "")},
+        )
+        metadata = {
+            "name": (self._name.text().strip() or category) + " · 波形快照",
+            "purpose": self._purpose.toPlainText().strip(),
+            "operator": self._operator.text().strip(),
+            "data_source": data_source,
+            "software_version": self._software_version, "device": device,
+            "controller_params": dict(snapshot.get("controller_params", {})),
+            "protection_params": dict(snapshot.get("protection_params", {})),
+        }
+        self._save_draft()
+        return self.exports.prepare(category, metadata, self._json_safe({
+            **snapshot, "device": device.to_dict(),
+            "protocol": protocol, "operator": self._operator.text().strip(),
+            "data_source": data_source,
+        }))
+
+    def finish_data_export(self, ticket: ExportTicket, result: dict) -> None:
+        self.exports.finish(ticket, result)
+        if self.manager.active_session is None:
+            self._last_session = self.manager.load(ticket.experiment_id)
+        self._refresh_status()
+        self._refresh_history(select_id=ticket.experiment_id)
+
+    def _open_current_folder(self) -> None:
+        session = self.manager.active_session or self._last_session
+        path = (self.manager.repository.session_dir(session.experiment_id)
+                if session else self.manager.repository.root)
+        QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
+
+    def _open_history_folder(self) -> None:
+        row = self._history.currentRow()
+        item = self._history.item(row, 0) if row >= 0 else None
+        if item is not None:
+            path = self.manager.repository.session_dir(item.text())
+            QDesktopServices.openUrl(QUrl.fromLocalFile(str(path.resolve())))
 
     def _refresh_heartbeat(self, status: dict | None = None) -> None:
         if not hasattr(self, "_heartbeat_value"):
@@ -847,6 +1019,7 @@ class ExperimentPage(QWidget):
 
     def _refresh_templates(self, select_id: str = "") -> None:
         self._template_combo.clear()
+        self._template_combo.addItem("自由记录（无引导步骤）", "")
         for template in self.template_repository.list_templates():
             label = template.name + ("（内置）" if template.built_in else "")
             self._template_combo.addItem(label, template.template_id)
@@ -1024,7 +1197,12 @@ class ExperimentPage(QWidget):
             return {}
 
     def _refresh_history(self, select_id: str | None = None) -> None:
+        previous_row = self._history.currentRow()
+        previous_item = self._history.item(previous_row, 0) if previous_row >= 0 else None
+        if select_id is None and previous_item is not None:
+            select_id = previous_item.text()
         sessions = self.manager.repository.list_sessions()
+        self._btn_history_folder.setEnabled(False)
         self._btn_curves.setEnabled(False)
         self._btn_report.setEnabled(False)
         self._btn_conclusion.setEnabled(False)
@@ -1037,7 +1215,9 @@ class ExperimentPage(QWidget):
                 _STATUS_TEXT[session.status],
                 "数字孪生" if session.data_source == "sim" else "真实设备",
                 str(session.telemetry_count),
-                session.started_at or "—",
+                session.operator or "—",
+                str(sum(1 for _ in self.manager.repository.session_dir(
+                    session.experiment_id).glob("waveforms/*/export.json"))),
             )
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
@@ -1048,6 +1228,8 @@ class ExperimentPage(QWidget):
                 selected_row = row
         if selected_row >= 0:
             self._history.selectRow(selected_row)
+            # Selecting the same row again does not emit itemSelectionChanged.
+            self._show_selected_history()
         elif not sessions:
             self._history_detail.clear()
 
@@ -1058,10 +1240,22 @@ class ExperimentPage(QWidget):
         experiment_id = self._history.item(row, 0).text()
         try:
             session = self.manager.load(experiment_id)
+            self._btn_history_folder.setEnabled(True)
             self._btn_curves.setEnabled(session.telemetry_count > 0)
             self._btn_report.setEnabled(True)
             self._btn_conclusion.setEnabled(True)
             device = session.device.to_dict() if session.device else {}
+            directory = self.manager.repository.session_dir(experiment_id)
+            exports = sorted(directory.glob("waveforms/*/export.json"))
+            export_lines = []
+            for path in exports:
+                try:
+                    entry = json.loads(path.read_text(encoding="utf-8"))
+                    state = {"saved": "已保存", "failed": "失败", "saving": "保存中 / 待核对"}.get(entry.get("status"), "未知")
+                    export_lines.append(f"{entry.get('category', '波形')} · {state} · "
+                                        + "、".join(entry.get("files", [])))
+                except (OSError, ValueError, AttributeError):
+                    export_lines.append("导出索引读取失败：" + path.parent.name)
             detail = (
                 f"实验编号：{session.experiment_id}\n"
                 f"实验名称：{session.name}\n"
@@ -1079,6 +1273,7 @@ class ExperimentPage(QWidget):
                 f"结论状态：{session.conclusion.get('result_status', 'pending')}\n"
                 f"软件版本：{session.software_version or '—'}\n"
                 f"保存目录：{self.manager.repository.session_dir(experiment_id)}\n\n"
+                + "数据文件：\n" + ("\n".join(export_lines) or "尚无手动保存的波形") + "\n\n" +
                 "设备快照：\n" + json.dumps(device, ensure_ascii=False, indent=2) +
                 "\n\n控制参数：\n" +
                 json.dumps(session.controller_params, ensure_ascii=False, indent=2) +
@@ -1087,6 +1282,7 @@ class ExperimentPage(QWidget):
             )
             self._history_detail.setPlainText(detail)
         except Exception as exc:
+            self._btn_history_folder.setEnabled(False)
             self._btn_curves.setEnabled(False)
             self._btn_report.setEnabled(False)
             self._btn_conclusion.setEnabled(False)

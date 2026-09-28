@@ -91,6 +91,8 @@ class DigitalTwinPage(QWidget):
             "border: 1px solid rgba(64, 180, 255, 0.28); border-radius: 8px; "
             "padding: 10px 12px; }")
         root.addWidget(boundary)
+        from ui_theme import appearance_manager
+        appearance_manager().register_hint(boundary)
 
         top = QHBoxLayout()
         top.addWidget(self._build_runtime_box(), 3)

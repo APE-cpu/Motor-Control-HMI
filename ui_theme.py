@@ -93,6 +93,22 @@ def brand_font(pixels: int) -> QFont:
 
 class ThemeManager(QObject):
     themeChanged = Signal(str)
+    hintsChanged = Signal(bool)
+
+    @property
+    def hints_visible(self) -> bool:
+        return self.settings.value("appearance/show_hints", True, type=bool)
+
+    def set_hints_visible(self, visible: bool) -> None:
+        if self.hints_visible == bool(visible):
+            return
+        self.settings.setValue("appearance/show_hints", bool(visible))
+        self.settings.sync()
+        self.hintsChanged.emit(bool(visible))
+
+    def register_hint(self, widget: QWidget) -> None:
+        widget.setVisible(self.hints_visible)
+        self.hintsChanged.connect(widget.setVisible)
 
     def __init__(self, app: QApplication, settings: QSettings | None = None):
         super().__init__(app)

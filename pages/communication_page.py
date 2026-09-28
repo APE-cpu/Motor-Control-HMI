@@ -713,6 +713,8 @@ class CommunicationPage(QWidget):
         v.addWidget(note)
 
         v.addStretch(1)
+        from ui_theme import appearance_manager
+        appearance_manager().register_hint(w)
         return w
 
     def _send_telemetry(self) -> None:

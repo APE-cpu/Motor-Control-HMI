@@ -17,17 +17,18 @@ def _app():
     return QApplication.instance() or QApplication([])
 
 
-def test_实验管理默认使用真机档案和真机方案(tmp_path):
+def test_实验管理默认使用真机档案和自由记录(tmp_path):
     _app()
     page = ExperimentPage(CommManager(), storage_root=tmp_path / "records")
 
     assert page._source.currentData() == "real"
     assert page._equipment_combo.currentData() == "DEV-BUILTIN-78W-R001"
-    assert page._template_combo.currentData() == "TPL-BUILTIN-78W-BASELINE"
+    assert page._template_combo.currentData() == ""
+    assert page._template_box.isHidden()
     assert page._bus_voltage.value() == 24.0
     assert page._expected_device_id.text() == "EBF-F407-JIAOYANG-PMSM-001"
     assert page._equipment_controller.text() == "野火 STM32F407 骄阳开发板"
-    assert "真机" in page._purpose.toPlainText()
+    assert page._purpose.toPlainText() == ""
     page.shutdown()
 
 

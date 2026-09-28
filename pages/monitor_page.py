@@ -5,8 +5,8 @@ import math
 import os
 import time
 from collections import deque
-from PySide6.QtCore import Qt, QThread, QTimer, QPointF, QRectF, Signal
-from PySide6.QtGui import QColor, QPainter, QPen
+from PySide6.QtCore import Qt, QThread, QTimer, QPointF, QRectF, QSize, Signal
+from PySide6.QtGui import QColor, QPainter, QPen, QFont
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
     QDoubleSpinBox, QLabel, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSizePolicy,
@@ -27,6 +27,8 @@ from waveform_storage import category_for_control_mode, create_waveform_record_d
 from widgets.temperature_label import TemperatureLabel
 from config.config import TEMP_HIGH_THRESHOLD, TEMP_NORMAL_THRESHOLD
 from core.torque_estimate import F1TorqueEstimator, torque_from_iq
+from ui_theme import appearance_manager, current_theme
+from widgets.nav_icons import navigation_icon
 
 try:
     import numpy as np
@@ -346,7 +348,8 @@ class _AngleDial(QWidget):
 
     def __init__(self) -> None:
         super().__init__()
-        self.setMinimumSize(120, 118)
+        self.setMinimumSize(160, 136)
+        appearance_manager().themeChanged.connect(lambda _key: self.update())
         self._disp = 0.0          # 一圈内的指针角 °
         self._true = 0.0          # 兼容既有内部字段：一圈内机械角 °
         self._position_deg = 0.0  # 相对启动零点的连续机械角 °
@@ -373,37 +376,49 @@ class _AngleDial(QWidget):
         qp = QPainter(self)
         qp.setRenderHint(QPainter.Antialiasing)
         w, h = self.width(), self.height()
-        r = min(w, h - 30) / 2.0 - 6
-        cx, cy = w / 2.0, r + 8
-        # 表盘环 + 刻度（每 30°，0° 在正上方，顺时针）
-        qp.setPen(QPen(QColor("#2c3442"), 2))
+        theme = current_theme()
+        r = min(w - 48, h - 62) / 2.0
+        cx, cy = w / 2.0, r + 17
+        # 编码器刻度环：0°在上，正向顺时针；中央留给清晰数字。
+        qp.setPen(QPen(QColor(theme.border), 1))
+        qp.setBrush(Qt.NoBrush)
         qp.drawEllipse(QPointF(cx, cy), r, r)
-        for k in range(12):
-            a = math.radians(k * 30.0 - 90.0)
-            major = (k % 3 == 0)
-            r0 = r - (7 if major else 4)
-            qp.setPen(QPen(QColor("#55627a"), 2 if major else 1))
+        for k in range(36):
+            a = math.radians(k * 10.0 - 90.0)
+            major = (k % 9 == 0)
+            r0 = r - (7 if major else 3)
+            qp.setPen(QPen(QColor(theme.muted if major else theme.border), 1))
             qp.drawLine(QPointF(cx + r0 * math.cos(a), cy + r0 * math.sin(a)),
                         QPointF(cx + r * math.cos(a), cy + r * math.sin(a)))
-        # 指针：只表示一圈内机械位置；数字区保留连续多圈角度。
-        color = QColor("#4fc3f7") if self._valid else QColor("#55627a")
+        small = QFont("Microsoft YaHei"); small.setPixelSize(10)
+        qp.setFont(small)
+        qp.setPen(QColor(theme.muted))
+        qp.drawText(QRectF(cx - 20, 0, 40, 14), Qt.AlignCenter, "0°")
+        qp.drawText(QRectF(cx + r + 3, cy - 7, 26, 14), Qt.AlignLeft, "90°")
+        qp.drawText(QRectF(cx - r - 30, cy - 7, 28, 14), Qt.AlignRight, "270°")
+        color = QColor(theme.accent if self._valid else theme.border)
         a = math.radians(self._disp - 90.0)
-        qp.setPen(QPen(color, 2.5))
-        qp.drawLine(QPointF(cx, cy),
-                    QPointF(cx + (r - 9) * math.cos(a),
-                            cy + (r - 9) * math.sin(a)))
+        qp.setPen(QPen(color, 3, Qt.SolidLine, Qt.RoundCap))
+        if self._valid:
+            qp.drawArc(QRectF(cx - r, cy - r, 2*r, 2*r), 90*16, -int(self._disp*16))
         qp.setBrush(color)
         qp.setPen(Qt.NoPen)
-        qp.drawEllipse(QPointF(cx, cy), 3, 3)
-        # 数字区：连续机械角与机械圈数都直接来自位置反馈，不做转速积分。
-        qp.setPen(QPen(QColor("#dfe6ee") if self._valid else QColor("#8fa3b8")))
-        top = (f"θm = {self._position_deg:+.1f}°"
-               if self._valid else "θm = 0.0°")
-        qp.drawText(0, int(cy + r + 2), w, 14, Qt.AlignHCenter, top)
-        qp.setPen(QPen(QColor("#8fa3b8")))
-        bottom = (f"零点=启动点 · {self._revs:+.2f}圈"
-                  if self._valid else "绝对零点：未标定")
-        qp.drawText(0, int(cy + r + 16), w, 14, Qt.AlignHCenter, bottom)
+        if self._valid:
+            qp.drawEllipse(QPointF(cx + r * math.cos(a), cy + r * math.sin(a)), 4, 4)
+        value_font = QFont("Bahnschrift"); value_font.setPixelSize(20)
+        qp.setFont(value_font)
+        qp.setPen(QColor(theme.text))
+        qp.drawText(QRectF(cx-r+8, cy-16, 2*r-16, 30), Qt.AlignCenter,
+                    f"{self._disp:.1f}°" if self._valid else "—")
+        qp.setFont(small)
+        qp.setPen(QColor(theme.muted))
+        qp.drawText(QRectF(cx-r, cy+13, 2*r, 16), Qt.AlignCenter, "圈内机械角")
+        small.setPixelSize(12); qp.setFont(small)
+        qp.drawText(QRectF(0, cy+r+7, w, 17), Qt.AlignCenter,
+                    f"累计 {self._position_deg:+.1f}°  /  {self._revs:+.2f} 圈"
+                    if self._valid else "等待位置反馈")
+        small.setPixelSize(10); qp.setFont(small)
+        qp.drawText(QRectF(0, cy+r+25, w, 14), Qt.AlignCenter, "相对启动零点 · 非绝对位置")
 
 
 class _EnergyOrb(QWidget):
@@ -901,7 +916,7 @@ class _OfflineRlsDialog(QDialog):
 class _StatItem(QWidget):
     def __init__(self, title: str) -> None:
         super().__init__()
-        v = QVBoxLayout(self)
+        v = QHBoxLayout(self)
         v.setContentsMargins(2, 2, 2, 2)
         v.addWidget(QLabel(title, alignment=Qt.AlignCenter))
         self._max = QLabel("最大：--", alignment=Qt.AlignCenter)
@@ -995,6 +1010,8 @@ class MonitorPage(QWidget):
         self._btn_save_all.clicked.connect(self._save_all_curves)
         title_row.addWidget(self._btn_save_all)
         self._save_worker = None
+        self.export_archive = None
+        self._export_ticket = None
         root.addLayout(title_row)
 
         # 窄屏下将运行控制拆成独立一行，避免与标题/报告按钮互相挤压。
@@ -1047,6 +1064,7 @@ class MonitorPage(QWidget):
         def _category_box(title: str, *widgets: QWidget) -> QGroupBox:
             box = QGroupBox(title)
             h = QHBoxLayout(box)
+            h.setContentsMargins(8, 5, 8, 5)
             for w in widgets:
                 h.addWidget(w, 1)
             return box
@@ -1064,7 +1082,8 @@ class MonitorPage(QWidget):
                                         self._electrical_frequency), 1, 1)
 
         # ---------- 传感器状态 ----------
-        sensor_box = QGroupBox("传感器状态（悬停指标看说明）")
+        sensor_box = QGroupBox("传感器状态")
+        sensor_box.setToolTip("悬停各指标查看说明")
         sensor_grid = QGridLayout(sensor_box)
         self._sensor_source = QLabel("来源：--")
         self._sensor_source.setToolTip("当前提供转子位置的传感器/估算方法")
@@ -1089,15 +1108,18 @@ class MonitorPage(QWidget):
             "进入该转速区时此处报警（HFI 例外，可工作到零速）。")
         sensor_grid.addWidget(self._sensor_source, 0, 0)
         sensor_grid.addWidget(self._sensor_quality, 0, 1)
-        sensor_grid.addWidget(self._sensor_convergence, 1, 0)
-        sensor_grid.addWidget(self._sensor_warn, 1, 1)
+        sensor_grid.addWidget(self._sensor_convergence, 0, 2)
+        sensor_grid.addWidget(self._sensor_warn, 0, 3)
+        sensor_grid.setColumnStretch(1, 1)
         rt_grid.addWidget(_category_box("电机实际温度", self._temperature), 1, 2)
         rt_grid.addWidget(sensor_box, 2, 0, 1, 3)
         root.addLayout(rt_grid)
 
         # ---------- 统计 ----------
-        stat_box = QGroupBox("统计（最大/最小）")
+        stat_box = QWidget()
+        stat_box.setToolTip("本次数据的最大值与最小值；清空波形时同步清零")
         stat_h = QHBoxLayout(stat_box)
+        stat_h.setContentsMargins(6, 0, 6, 0)
         self._stat_speed = _StatItem("转速")
         self._stat_current = _StatItem("电流")
         self._stat_torque = _StatItem("转矩")
@@ -1267,21 +1289,21 @@ class MonitorPage(QWidget):
             self._c_rls_R, "本轴延迟输入系数 b1 (A/V)"))
         rls_v.addLayout(rls_curve_h, 1)
 
-        burst_tab = self._build_burst_tab()
-
         tabs = QTabWidget()
         tabs.setObjectName("CurveTabs")
         # 曲线页占用监控页剩余高度，不把内部 pyqtgraph 的
         # 默认高度传递给主窗口。
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
         tabs.setMinimumHeight(0)
-        tabs.addTab(trend_tab, "📈 趋势曲线（最近 1000 点）")
-        tabs.addTab(sensor_tab, "🧭 传感器波形")
-        tabs.addTab(power_tab, "⚡ 转矩与电压")
-        tabs.addTab(position_tab, "🎯 位置三环")
-        tabs.addTab(rls_tab, "🔬 在线辨识 (RLS)")
-        tabs.addTab(burst_tab, "📸 抓取波形 (16kHz)")
+        tabs.setIconSize(QSize(18, 18))
+        tabs.addTab(trend_tab, "转速与电流")
+        tabs.addTab(sensor_tab, "传感器")
+        tabs.addTab(power_tab, "转矩与电压")
+        tabs.addTab(position_tab, "位置控制")
+        tabs.addTab(rls_tab, "在线辨识")
         self._curve_tabs = tabs
+        self._refresh_tab_icons()
+        appearance_manager().themeChanged.connect(self._refresh_tab_icons)
         self._tab_curves = {
             0: (self._c_speed, self._c_current, self._c_phase_current),
             1: (self._c_angle, self._c_sensor_q),
@@ -1305,7 +1327,6 @@ class MonitorPage(QWidget):
         comm.highRateTelemetryColumnsReceived.connect(
             self._on_high_rate_telemetry_columns)
         comm.rlsCoeffReceived.connect(self._on_rls_coeff)
-        comm.burstReceived.connect(self._on_burst)
         comm.statusChanged.connect(self._on_connection_status_changed)
 
         # ---------- 刷新定时器 ----------
@@ -1694,81 +1715,9 @@ class MonitorPage(QWidget):
         self._offline_rls_dialog.start_snapshot(snapshot, label)
 
     # ------- 突发抓取波形 (16kHz) -------
-    def _build_burst_tab(self) -> QWidget:
-        tab = QWidget()
-        v = QVBoxLayout(tab)
-        bar = QHBoxLayout()
-        self._btn_burst = QPushButton("📸 抓取一帧波形（16kHz 真实）")
-        self._btn_burst.setObjectName("PrimaryButton")
-        self._btn_burst.clicked.connect(self._on_burst_click)
-        self._burst_status = QLabel("电机运行中点“抓取”，下位机录 128ms 原始 16kHz "
-                                    "电流再慢速回传（不占心跳）。")
-        self._burst_status.setStyleSheet("color:#90a4ae;")
-        bar.addWidget(self._btn_burst)
-        bar.addWidget(self._burst_status, 1)
-        v.addLayout(bar)
-        if _MP_PG_OK:
-            self._burst_raw = pg.PlotWidget(title="真实波形（16kHz 原始）")
-            self._burst_avg = pg.PlotWidget(title="同步平均单周期（按电角度折叠去噪）")
-            for plot, xlab in ((self._burst_raw, "时间 (ms)"),
-                               (self._burst_avg, "电角度 (°)")):
-                plot.setBackground("#10131a")
-                plot.showGrid(x=True, y=True, alpha=0.3)
-                plot.addLegend()
-                plot.setLabel("left", "相电流 (A)")
-                plot.setLabel("bottom", xlab)
-            self._burst_raw_ia = self._burst_raw.plot([], [], pen=pg.mkPen("#4fc3f7", width=1), name="Ia")
-            self._burst_raw_ib = self._burst_raw.plot([], [], pen=pg.mkPen("#f48fb1", width=1), name="Ib")
-            self._burst_avg_ia = self._burst_avg.plot([], [], pen=pg.mkPen("#4fc3f7", width=2), name="Ia")
-            self._burst_avg_ib = self._burst_avg.plot([], [], pen=pg.mkPen("#f48fb1", width=2), name="Ib")
-            plots = QHBoxLayout()
-            plots.addWidget(self._burst_raw)
-            plots.addWidget(self._burst_avg)
-            v.addLayout(plots, 1)
-        else:
-            v.addWidget(QLabel("[未安装 pyqtgraph，无法绘制抓取波形]"))
-        return tab
-
-    def _on_burst_click(self) -> None:
-        if not self._comm.is_connected():
-            self._burst_status.setText("未连接，无法抓取。")
-            return
-        ok = self._comm.send_burst_trigger()
-        self._burst_status.setText(
-            "已请求抓取，等待回传…（需电机运行中；约 0.3s 完成）" if ok
-            else "抓取请求发送失败。")
-
-    def _on_burst(self, data: dict) -> None:
-        if not _MP_PG_OK:
-            return
-        n = int(data.get("n", 0))
-        ia = (np.asarray(data.get("ia", []), dtype=float) *
-              F1_CURRENT_A_PER_DIGIT)   # 码值→A
-        ib = (np.asarray(data.get("ib", []), dtype=float) *
-              F1_CURRENT_A_PER_DIGIT)
-        ang = np.asarray(data.get("ang", []), dtype=float)            # 0..65535 = 0..360°
-        if n == 0 or ia.size == 0:
-            self._burst_status.setText("抓取回传为空。")
-            return
-        t_ms = np.arange(ia.size) / 16.0        # 16kHz → 1/16 ms 每点
-        self._burst_raw_ia.setData(t_ms, ia)
-        self._burst_raw_ib.setData(t_ms, ib)
-        # 同步平均：按电角度折叠到 360 个格子，信号叠加、噪声相消
-        bins = 360
-        idx = np.clip((ang * bins / 65536.0).astype(int), 0, bins - 1)
-        deg = np.arange(bins) + 0.5
-        sum_ia = np.bincount(idx, weights=ia, minlength=bins)
-        sum_ib = np.bincount(idx, weights=ib, minlength=bins)
-        cnt = np.bincount(idx, minlength=bins).astype(float)
-        valid = cnt > 0
-        avg_ia = np.where(valid, sum_ia / np.maximum(cnt, 1), np.nan)
-        avg_ib = np.where(valid, sum_ib / np.maximum(cnt, 1), np.nan)
-        self._burst_avg_ia.setData(deg[valid], avg_ia[valid])
-        self._burst_avg_ib.setData(deg[valid], avg_ib[valid])
-        periods = int(np.sum(np.abs(np.diff(ang)) > 40000))   # 角度回卷次数≈电周期数
-        self._burst_status.setText(
-            f"已抓取 {n} 点（128ms），约 {periods} 个电周期；"
-            f"左=真实波形，右=同步平均去噪单周期。")
+    def _refresh_tab_icons(self, _theme_id=None) -> None:
+        for index, key in enumerate(("监控页面", "矢量可视化", "功率流", "电机控制", "参数辨识")):
+            self._curve_tabs.setTabIcon(index, navigation_icon(key, current_theme()))
 
     def _on_smooth_toggled(self, checked: bool) -> None:
         """显示平滑开关：每条曲线用合适窗口。仅平滑显示，不动缓冲/导出/统计。
@@ -1986,15 +1935,6 @@ class MonitorPage(QWidget):
         self._torque_curve_source = "none"
         self._f0_torque_pending = False
         self._curves_were_active = False
-        if _MP_PG_OK:
-            for item_name in (
-                    "_burst_raw_ia", "_burst_raw_ib",
-                    "_burst_avg_ia", "_burst_avg_ib"):
-                item = getattr(self, item_name, None)
-                if item is not None:
-                    item.setData([], [])
-            self._burst_status.setText(
-                "波形已清空；电机运行中可重新抓取 16kHz 波形。")
         self._datasrc_label.setText("[ 波形已清空 ]")
         self._datasrc_label.setStyleSheet(
             "color: #90a4ae; font-weight: bold;")
@@ -2413,41 +2353,48 @@ class MonitorPage(QWidget):
         return bytes(buf.data())
 
     def _save_all_curves(self) -> None:
-        if self._save_worker is not None and self._save_worker.isRunning():
+        if self._export_ticket is not None or (
+                self._save_worker is not None and self._save_worker.isRunning()):
             QMessageBox.information(self, "正在保存", "上一份波形数据仍在后台写盘。")
             return
-        if not any(len(item["times"])
-                   for item in self._curve_csv_snapshot()):
+        curve_snapshot = self._curve_csv_snapshot()
+        if not any(len(item["times"]) for item in curve_snapshot):
             QMessageBox.warning(self, "提示", "暂无波形数据")
             return
         mode = (self._ctrl._current_mode()
                 if self._ctrl is not None and hasattr(self._ctrl, "_current_mode")
                 else None)
-        record_dir = create_waveform_record_dir(
-            category_for_control_mode(mode), datetime.datetime.now())
-        path, _ = QFileDialog.getSaveFileName(
-            self, "保存所有波形",
-            str(record_dir / "波形.png"),
-            "PNG (*.png)"
-        )
-        if not path:
-            record_dir.rmdir()
-            return
         # Qt/pyqtgraph 的离屏渲染必须在 GUI 线程完成；其余大文件
         # 写盘全部移交工作线程。
         png = self.render_waveforms_png()
         if not png:
             QMessageBox.warning(self, "提示", "无法渲染波形图（或未安装 pyqtgraph）")
             return
+        if self.export_archive is not None:
+            try:
+                self._export_ticket = self.export_archive.prepare_data_export(
+                    category_for_control_mode(mode))
+                path = str(self._export_ticket.directory / "波形.png")
+            except Exception as exc:
+                QMessageBox.warning(self, "归档失败", str(exc))
+                return
+        else:
+            record_dir = create_waveform_record_dir(
+                category_for_control_mode(mode), datetime.datetime.now())
+            path, _ = QFileDialog.getSaveFileName(
+                self, "保存所有波形", str(record_dir / "波形.png"), "PNG (*.png)")
+            if not path:
+                record_dir.rmdir()
+                return
         csv_path = os.path.join(os.path.dirname(path), "原始数据.csv")
         rls_csv_path = os.path.join(
             os.path.dirname(path), "RLS辨识数据.csv")
-        curve_snapshot = self._curve_csv_snapshot()
         rls_snapshot = self._rls_capture.snapshot()
         self._save_worker = _WaveformSaveWorker(
             path, png, csv_path, curve_snapshot, rls_csv_path,
             rls_snapshot, self)
         self._save_worker.completed.connect(self._on_waveform_save_complete)
+        self._save_worker.finished.connect(self._on_save_worker_finished)
         self._btn_save_all.setEnabled(False)
         self._btn_save_all.setText("后台保存中…")
         self._datasrc_label.setText("[ 波形正在后台写盘 ]")
@@ -2455,7 +2402,19 @@ class MonitorPage(QWidget):
             "color:#ffcc80; font-weight:bold;")
         self._save_worker.start()
 
+    def _on_save_worker_finished(self) -> None:
+        worker = self.sender()
+        if self._save_worker is worker:
+            self._save_worker = None
+        worker.deleteLater()
+
     def _on_waveform_save_complete(self, result: dict) -> None:
+        if self._export_ticket is not None:
+            ticket, self._export_ticket = self._export_ticket, None
+            try:
+                self.export_archive.finish_data_export(ticket, result)
+            except Exception as exc:
+                result = dict(result, error=f"数据目录：{ticket.directory}\n归档索引更新失败：{exc}")
         self._btn_save_all.setEnabled(True)
         self._btn_save_all.setText("保存所有波形")
         error = str(result.get("error", ""))
