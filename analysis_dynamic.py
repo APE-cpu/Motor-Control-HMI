@@ -105,61 +105,112 @@ def cwt_map(t, y, fs, fmin, fmax, cancel=lambda: False):
 
 
 def order_map(t, y, fs, reference, reference_kind="speed", max_order=10,
-              turns_per_window=4):
+              turns_per_window=4, minimum_rpm=1.):
+    """Window within each rotation segment; never span stops or reversals.
+
+    Angular sampling density is chosen per window. Slow startup samples no
+    longer inflate the allocation for an entire acceleration record.
+    """
+    if max_order <= 0 or turns_per_window <= 0 or max_order*turns_per_window > 4096:
+        raise ValueError("最高阶次 × 每窗转数需在 0～4096 内")
+    if minimum_rpm <= 0:
+        raise ValueError("最低有效转速必须为正")
     if reference_kind == "speed":
         rpm = align_reference(reference, t)
         cycles = cumulative_trapezoid(rpm/60, t, initial=0)
     else:
         cycles = align_reference(reference, t, angle=True)
     delta = np.diff(cycles)
-    direction = np.sign(np.median(delta))
-    if direction == 0 or np.any(delta*direction <= 1e-12):
-        raise ValueError("阶次分析需要持续单向旋转，请排除停转、反转或角度分辨率不足的区间")
-    cycles = (cycles-cycles[0])*direction
-    rev_s = delta*direction*fs
-    max_allowed = .45*fs/np.max(rev_s)
-    if not 0 < max_order <= max_allowed:
-        raise ValueError(f"当前采样率/最高转速允许最大阶次 {max_allowed:.2f}")
-    # Angular rate >= the highest original samples/rev: no angular downsampling
-    # and therefore no aliasing of high temporal frequencies into low orders.
-    spr = int(np.ceil(max(32, fs/np.min(rev_s))))
-    count = int(np.floor(cycles[-1]*spr)) + 1
-    nwin = int(round(turns_per_window*spr))
-    if count > MAX_SAMPLES or nwin > 131072:
-        raise ValueError("转速跨度过大或低速段过长，请按转速分段分析")
-    if nwin < 32 or count < nwin:
-        raise ValueError(f"所选区间不足 {turns_per_window:g} 转，请扩大区间或减小窗长")
-    angle = np.arange(count)/spr
-    vals = np.interp(angle, cycles, y)
-    hop = max(nwin//8, int(np.ceil((count-nwin)/600)), 1)
-    starts = np.arange(0, count-nwin+1, hop)
-    win = signal.windows.hann(nwin, sym=False)
-    # Bound memory even for high samples/revolution: process windows separately.
-    orders = np.fft.rfftfreq(nwin, 1/spr)
-    keep = orders <= max_order
-    rows = []
-    for start in starts:
-        frame = vals[start:start+nwin]
-        z = np.fft.rfft((frame-frame.mean())*win)
-        rows.append((2*abs(z[keep])/win.sum()/np.sqrt(2))**2)
-    centers = (starts+nwin/2)/spr
-    return dict(time=np.interp(centers, cycles, t), axis=orders[keep],
-                power=np.asarray(rows).T, unit="阶次 RMS²", kind="阶次",
-                resolution=spr/nwin, reference=reference_kind,
-                rpm=np.interp(centers, cycles[1:], rev_s*60))
+    velocity = delta/np.diff(t)
+    signs = np.where(abs(velocity)*60 >= minimum_rpm, np.sign(velocity), 0).astype(int)
+    if reference_kind == "angle":
+        # Bridge only short equal-code plateaus caused by encoder quantization.
+        # No opposite-sign increment is bridged; long stationary periods stay 0.
+        edges = np.r_[0, np.flatnonzero(np.diff(signs != 0))+1, len(signs)]
+        for start, end in zip(edges[:-1], edges[1:]):
+            if (signs[start] == 0 and start > 0 and end < len(signs)
+                    and signs[start-1] == signs[end] and t[end]-t[start] <= .02):
+                signs[start:end] = signs[start-1]
+    edges = np.r_[0, np.flatnonzero(np.diff(signs))+1, len(signs)]
+    segments, skipped = [], []
+    for start, end in zip(edges[:-1], edges[1:]):
+        direction = int(signs[start])
+        turns = float(abs(cycles[end]-cycles[start]))
+        if direction == 0 or turns < turns_per_window or end-start < 31:
+            skipped.append(dict(start=float(t[start]), end=float(t[end]),
+                                reason="停转/低速" if direction == 0 else "旋转段不足窗长", turns=turns))
+        else:
+            segments.append((start, end, direction, turns))
+    if not segments:
+        return dict(time=np.array([t[0], t[-1]]), axis=np.array([0., max_order]),
+                    power=np.full((2,2), np.nan), unit="阶次 RMS²", kind="阶次",
+                    resolution=1/turns_per_window, reference=reference_kind,
+                    segments=[], skipped=skipped, valid_time_ranges=[],
+                    message=f"暂无可计算阶次的旋转段；每段至少需要 {turns_per_window:g} 转。原始波形仍可查看。")
+    orders = np.arange(int(np.floor(max_order*turns_per_window))+1)/turns_per_window
+    count = sum(max(1, int((s[3]-turns_per_window)/(turns_per_window/8))+1) for s in segments)
+    window_skip = max(1, int(np.ceil(count/600)))
+    rows, centers, speeds, descriptions, ranges = [], [], [], [], []
+    window_number = 0
+    for first, last, direction, turns in segments:
+        angular = (cycles[first:last+1]-cycles[first])*direction
+        # Same angle codes add no angular information; keep the last timestamp.
+        keep = np.r_[np.diff(angular)>1e-12, True]
+        phase, ts, values = angular[keep], t[first:last+1][keep], y[first:last+1][keep]
+        rates = np.diff(phase)/np.diff(ts)
+        group_times = []
+        hop = turns_per_window/8
+        frame_count = int(np.floor(max(0, turns-turns_per_window)/hop+1e-9))+1
+        offset = (-window_number) % window_skip
+        window_number += frame_count
+        for index in range(offset, frame_count, window_skip):
+            start = index*hop
+            left = max(0, np.searchsorted(phase, start, side="right")-1)
+            right = min(len(rates), np.searchsorted(phase, start+turns_per_window)+1)
+            local = rates[left:right]
+            if not len(local) or np.min(local) <= 0:
+                continue
+            nwin = max(32, int(np.ceil(fs/np.min(local)*turns_per_window)))
+            center = float(np.interp(start+turns_per_window/2, phase, ts))
+            power = np.full(len(orders), np.nan)
+            if nwin <= 131072:
+                grid = start + np.arange(nwin)*turns_per_window/nwin
+                frame = np.interp(grid, phase, values)
+                win = signal.windows.hann(nwin, sym=False)
+                z = np.fft.rfft((frame-frame.mean())*win)
+                valid = (orders <= .45*fs/np.max(local)) & (np.arange(len(orders)) < len(z))
+                power[valid] = (np.sqrt(2)*abs(z[np.flatnonzero(valid)])/win.sum())**2
+                power[0] /= 2
+            rows.append(power)
+            centers.append(center)
+            speeds.append(direction*float(np.mean(local))*60)
+            group_times.append(center)
+        if group_times:
+            ranges.append([group_times[0], group_times[-1]])
+            descriptions.append(dict(start=float(ts[0]), end=float(ts[-1]), direction=direction,
+                                     turns=turns, frames=len(group_times)))
+    if not rows:
+        raise ValueError("可用旋转段过短，请减小每窗转数")
+    return dict(time=np.asarray(centers), axis=orders, power=np.asarray(rows).T,
+                unit="阶次 RMS²", kind="阶次", resolution=1/turns_per_window,
+                reference=reference_kind, rpm=np.asarray(speeds), segments=descriptions,
+                skipped=skipped, valid_time_ranges=ranges,
+                message=f"已分段计算 {len(descriptions)} 段旋转；停转/短段及超出采样能力的阶次留空")
 
 
 def response_metrics(t, y, event, target=None, band=.02, dwell=.05,
                      smooth_s=.01, saturation=None, limit=None):
     before = y[t < event]
     after = t >= event
-    if len(before) < 5 or np.count_nonzero(after) < 20:
-        raise ValueError("阶跃时刻前至少需要 5 点，之后至少需要 20 点")
-    baseline = float(np.median(before[-max(5, len(before)//5):]))
+    enough = len(before) >= 5 and np.count_nonzero(after) >= 20
+    base_samples = before[-max(5, len(before)//5):] if len(before) else y[:max(5,len(y)//10)]
+    baseline = float(np.median(base_samples))
     target = float(np.median(y[-max(5, len(y)//10):])) if target is None else float(target)
     amplitude = target-baseline
-    if abs(amplitude) < max(1e-12, np.std(before)*3):
-        raise ValueError("阶跃幅度过小或小于前段噪声，请检查目标值及阶跃时刻")
+    noise = float(1.4826*np.median(abs(base_samples-np.median(base_samples))))
+    step_valid = enough and abs(amplitude) > max(1e-12, noise*3)
+    reason = ("" if step_valid else "阶跃前后样本不足，已显示常规动态分析" if not enough else
+              "未确认有效阶跃：目标与基线接近或噪声较大；已显示波形和变化率，阶跃指标不适用")
     step = float((t[-1]-t[0])/(len(t)-1))
     width = max(5, int(round(smooth_s/step)) | 1)
     width = min(width, (len(y)-1) | 1)
@@ -168,8 +219,9 @@ def response_metrics(t, y, event, target=None, band=.02, dwell=.05,
     filtered = np.interp(t, uniform, signal.savgol_filter(regular_y, width, 2))
     derivative = np.interp(t, uniform, signal.savgol_filter(
         regular_y, width, 2, deriv=1, delta=step))
-    ta, ya = t[after], y[after]
-    normalized = (ya-baseline)/amplitude
+    evaluate = after if np.any(after) else np.ones(len(t), dtype=bool)
+    ta, ya = t[evaluate], y[evaluate]
+    normalized = (ya-baseline)/amplitude if step_valid else np.zeros_like(ya)
     def crossing(level):
         hits = np.flatnonzero(normalized >= level)
         if not len(hits):
@@ -178,12 +230,12 @@ def response_metrics(t, y, event, target=None, band=.02, dwell=.05,
         if not i:
             return float(ta[0])
         return float(np.interp(level, normalized[i-1:i+1], ta[i-1:i+1]))
-    t10, t90 = crossing(.1), crossing(.9)
+    t10, t90 = (crossing(.1), crossing(.9)) if step_valid else (None, None)
     outside = np.flatnonzero(abs(ya-target) > abs(amplitude)*band)
     first = int(outside[-1]+1) if len(outside) else 0
-    settling = (float(ta[first]-event) if first < len(ta) and
+    settling = (float(ta[first]-event) if step_valid and first < len(ta) and
                 ta[-1]-ta[first] >= dwell else None)
-    residual = (filtered[after]-target)/amplitude
+    residual = (filtered[evaluate]-target)/amplitude if step_valid else np.zeros(len(ta))
     peaks, _ = signal.find_peaks(residual, prominence=.02)
     troughs, _ = signal.find_peaks(-residual, prominence=.02)
     # Count alternating lobes across the target, not arbitrary noisy extrema.
@@ -203,20 +255,46 @@ def response_metrics(t, y, event, target=None, band=.02, dwell=.05,
         sat = np.abs(y) >= limit
     # Time-weighted occupation on irregular timestamps; the unobserved interval
     # after the final sample is never included in saturation duration.
-    durations = np.maximum(0., t[1:]-np.maximum(t[:-1], event))
+    durations = np.maximum(0., t[1:]-np.maximum(t[:-1], event if step_valid else t[0]))
     sat_time = None if sat is None else float(np.sum(durations*sat[:-1]))
     metrics = dict(baseline=baseline, target=target,
                    rise_s=None if t10 is None or t90 is None else t90-t10,
-                   overshoot_pct=max(0., float(normalized.max()-1))*100,
+                   overshoot_pct=max(0., float(normalized.max()-1))*100 if step_valid else None,
                    settling_s=settling,
-                   steady_error=float(np.mean(ya[-max(5, len(ya)//10):])-target),
-                   peak_slope=float(np.max(abs(derivative[after]))),
+                   steady_error=float(np.mean(ya[-max(5, len(ya)//10):])-target) if step_valid else None,
+                   peak_slope=float(np.max(abs(derivative[evaluate if step_valid else np.ones(len(t),dtype=bool)]))),
+                   ac_rms=float(np.sqrt(np.mean((y-y.mean())**2))),
+                   peak_to_peak=float(np.ptp(y)),
                    ringing_hz=ring_hz,
                    saturation_fraction=None if sat is None else sat_time/np.sum(durations),
                    saturation_s=sat_time)
     return dict(metrics=metrics, time=t, values=y, filtered=filtered,
                 derivative=derivative, saturation=sat, event=event, band=band,
-                t10=t10, t90=t90, dwell_s=dwell, smooth_s=width*step)
+                t10=t10, t90=t90, dwell_s=dwell, smooth_s=width*step,
+                step_valid=step_valid, message=reason)
+
+
+def suggest_step(t, y, reference=None):
+    """Suggest a reference jump, or estimate response onset; never invent one."""
+    if reference is not None:
+        rt, ry, _ = series(reference, timing="raw", min_samples=2)
+        change = abs(np.diff(ry))
+        eligible = (rt[1:] >= t[min(5,len(t)-1)]) & (rt[1:] <= t[max(0,len(t)-20)])
+        if np.any(eligible):
+            index = int(np.argmax(np.where(eligible, change, -1)))
+            if change[index] > max(1e-12, np.ptp(ry)*.05):
+                return dict(event=float(rt[index+1]), target=float(ry[index+1]), basis="给定信号跳变")
+    count = max(5, len(y)//20)
+    initial, final = y[:count], y[-count:]
+    baseline, target = float(np.median(initial)), float(np.median(final))
+    amplitude = target-baseline
+    noise = max(float(np.std(initial)),float(np.std(final)))
+    if abs(amplitude) <= max(1e-12, 6*noise):
+        return None
+    hits = np.flatnonzero((y-baseline)/amplitude > max(.02, 3*noise/abs(amplitude)))
+    if not len(hits) or hits[0] < 5 or hits[0] > len(t)-20:
+        return None
+    return dict(event=float(t[max(5,hits[0]-1)]), target=target, basis="响应起点估计（可手动修正）")
 
 
 def demo_snapshot():

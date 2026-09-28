@@ -2,7 +2,7 @@ import numpy as np
 import pytest
 
 from analysis_dynamic import (series, stft_map, cwt_map, order_map,
-                              response_metrics, demo_snapshot)
+                              response_metrics, demo_snapshot, suggest_step)
 
 
 def test_stft_chirp_ridge_and_psd_integral():
@@ -118,11 +118,57 @@ def test_real_interruption_still_reports_gap_location():
         series(dict(times=t, values=np.sin(t)), timing="resample")
 
 
-def test_reversal_and_unsafe_order_range_rejected():
+def test_unsafe_orders_are_masked_without_losing_supported_orders():
     snapshot, speed = demo_snapshot()
     t, y, fs = series(snapshot)
-    with pytest.raises(ValueError, match="最大阶次"):
-        order_map(t, y, fs, speed, max_order=100)
-    speed["values"][3000:] *= -1
-    with pytest.raises(ValueError, match="单向"):
-        order_map(t, y, fs, speed)
+    result = order_map(t, y, fs, speed, max_order=100)
+    assert np.isnan(result["power"][-1]).all()
+    assert np.isfinite(result["power"][4]).all()
+    assert result["axis"][np.nanmean(result["power"][:40], axis=1).argmax()] == 1
+
+
+def test_order_segments_stops_and_reversals_without_crossing_them():
+    from scipy.integrate import cumulative_trapezoid
+    t = np.arange(5000)/1000
+    rpm = np.where((t >= 1) & (t < 2), 1200., np.where((t >= 3) & (t < 4), -1200., 0.))
+    cycles = cumulative_trapezoid(rpm/60, t, initial=0)
+    y = np.cos(2*np.pi*3*cycles)
+    result = order_map(t, y, 1000, dict(times=t, values=rpm))
+    assert [s["direction"] for s in result["segments"]] == [1, -1]
+    assert len(result["skipped"]) == 3
+    assert not np.any((result["time"] > 2) & (result["time"] < 3))
+    assert result["axis"][result["power"].mean(axis=1).argmax()] == 3
+    assert result["valid_time_ranges"][0][1] < result["valid_time_ranges"][1][0]
+
+
+def test_stationary_order_is_blank_and_explained():
+    t = np.arange(1000)/1000
+    result = order_map(t, np.sin(t), 1000, dict(times=t, values=t*0))
+    assert np.isnan(result["power"]).all()
+    assert not result["segments"]
+    assert "暂无" in result["message"]
+
+
+def test_no_step_keeps_wave_and_derivative_without_fabricated_metrics():
+    t = np.arange(3000)/1000
+    for y in (np.full(len(t), 800.), 800+2*np.sin(2*np.pi*20*t)):
+        result = response_metrics(t, y, .5, 800)
+        assert not result["step_valid"]
+        np.testing.assert_array_equal(result["values"], y)
+        assert np.isfinite(result["derivative"]).all()
+        for metric in ("rise_s", "overshoot_pct", "settling_s", "ringing_hz", "steady_error"):
+            assert result["metrics"][metric] is None
+        assert result["metrics"]["peak_to_peak"] == pytest.approx(np.ptp(y))
+    assert response_metrics(t, y, t[-1]+1, 800)["metrics"]["rise_s"] is None
+
+
+def test_step_locator_uses_reference_and_does_not_invent_constant_step():
+    t = np.arange(3000)/1000
+    y = np.where(t < .15, 0., 800*(1-np.exp(-np.maximum(t-.15,0)/.02)))
+    ref = dict(times=t, values=np.where(t < .15, 0., 800.))
+    found = suggest_step(t, y, ref)
+    assert found["event"] == pytest.approx(.15)
+    assert found["target"] == 800
+    assert response_metrics(t, y, found["event"], found["target"])["step_valid"]
+    assert not response_metrics(t, y, .6, 800)["step_valid"]
+    assert suggest_step(t, np.full(len(t), 800.)) is None

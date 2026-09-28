@@ -163,3 +163,67 @@ def test_plot_popout_and_replay_visibility(app):
     assert len(popup.views[0].listDataItems()) == 2
     popup.accept()
     page.close()
+
+
+def test_stationary_reference_and_no_step_still_render(app):
+    t = np.arange(2000)/1000
+    snapshot = dict(times=t, values=np.full(len(t), 800.), unit="rpm")
+    references = {"Ia": lambda: dict(snapshot, unit="A"),
+                  "speed / 实际": lambda: dict(snapshot, values=t*0)}
+    dialog = DynamicAnalysisDialog("speed / 实际", snapshot, references, fixed_mode=2)
+    assert dialog.reference.currentText() == "speed / 实际"
+    dialog._run()
+    finish(app, dialog)
+    assert np.isnan(dialog.result["power"]).all()
+    assert len(dialog.wave_plot.listDataItems()) == 1
+    assert "暂无" in dialog.status.text()
+    dialog.mode.setCurrentIndex(3)
+    dialog._run()
+    finish(app, dialog)
+    assert not dialog.result["step_valid"]
+    assert len(dialog.map_plot.listDataItems()) == 1
+    assert "阶跃指标不适用" in dialog.status.text()
+    assert dialog.export.isEnabled()
+    dialog.close()
+
+
+def test_order_heatmap_keeps_stop_gap_blank(app):
+    import pyqtgraph as pg
+    from scipy.integrate import cumulative_trapezoid
+    t = np.arange(5000)/1000
+    rpm = np.where((t >= 1) & (t < 2), 1200., np.where((t >= 3) & (t < 4), -1200., 0.))
+    cycles = cumulative_trapezoid(rpm/60, t, initial=0)
+    snapshot = dict(times=t, values=np.cos(2*np.pi*cycles), unit="A")
+    reference = dict(times=t, values=rpm, unit="rpm")
+    dialog = DynamicAnalysisDialog("Ia", snapshot, {"speed / 实际": lambda: reference}, fixed_mode=2)
+    dialog._run()
+    finish(app, dialog)
+    img = next(i for i in dialog.map_plot.items if isinstance(i, pg.ImageItem))
+    assert np.isnan(img.image[:, img.image.shape[1]//2]).all()
+    assert np.isfinite(img.image[:, 1]).any()
+    dialog.close()
+
+
+def test_category_switch_refreshes_existing_panel_and_locates_reference_step(app, tmp_path):
+    file = tmp_path / "step.csv"
+    t = np.arange(2000)/1000
+    lines = ["channel,series,time_s,value,sampling_rate_hz,unit"]
+    for channel, label, values, unit in (
+            ("speed", "实际", np.where(t < .15, 0., 800*(1-np.exp(-np.maximum(t-.15,0)/.02))), "rpm"),
+            ("speed", "给定", np.where(t < .15, 0., 800.), "rpm"),
+            ("phase_current", "Ia", np.sin(2*np.pi*50*t), "A")):
+        lines += [f"{channel},{label},{time},{value},1000,{unit}" for time, value in zip(t, values)]
+    file.write_text("\n".join(lines), encoding="utf-8")
+    page = FourierAnalysisPage()
+    page.load_csv(str(file))
+    page.analysis_tabs.setCurrentIndex(4)
+    panel = page._dynamic_panels[4]
+    assert panel.source_label == "speed / 实际"
+    assert panel.event.value() == pytest.approx(.15)
+    assert panel.target.value() == 800
+    page._category_combo.setCurrentIndex(page._category_combo.findData("电流"))
+    assert panel.source_label == "phase_current / Ia"
+    assert panel.snapshot["unit"] == "A"
+    # Explicit call also catches exceptions otherwise swallowed by Qt signals.
+    page._sync_analysis_source()
+    page.close()

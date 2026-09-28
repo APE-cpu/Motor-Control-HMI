@@ -12,7 +12,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QGridLayout,
     QFileDialog, QMessageBox)
 
 from analysis_dynamic import (series, stft_map, cwt_map, order_map,
-                              response_metrics, demo_snapshot)
+                              response_metrics, demo_snapshot, suggest_step)
 
 
 class AnalysisWorker(QThread):
@@ -85,6 +85,10 @@ class DynamicAnalysisDialog(QDialog):
             self._settings.value("analysis/colormap", "viridis"))))
         self.palette.currentIndexChanged.connect(self._change_palette)
         top.addWidget(self.palette)
+        self.locate_button = QPushButton("定位阶跃")
+        self.locate_button.setToolTip("优先按给定跳变定位；没有给定时尝试估计响应起点，仍可手动修改")
+        self.locate_button.clicked.connect(self._locate_step)
+        top.addWidget(self.locate_button)
         zoom = QToolButton()
         zoom.setText("↗")
         zoom.setToolTip("弹窗放大图像")
@@ -220,6 +224,8 @@ class DynamicAnalysisDialog(QDialog):
                 self.fmax.setMaximum(fs/2)
                 self.fmin.setMaximum(fs/2)
                 self.status.setText(f"已读取 {len(y):,} 点；调整区间后开始分析")
+                if self.mode.currentIndex() == 3:
+                    self._locate_step()
             else:
                 self.status.setText("所选信号暂无数据，可先查看演示")
         except Exception as exc:
@@ -241,15 +247,42 @@ class DynamicAnalysisDialog(QDialog):
     def _suggest_reference(self):
         for i in range(self.reference.count()):
             name = self.reference.itemText(i)
-            match = (("转速" in name or "rpm" in name.lower()) and "给定" not in name
+            match = (("转速" in name or "rpm" in name.lower() or name.lower().startswith("speed /")) and "给定" not in name
                      if self.ref_kind.currentIndex() == 0 else "电角度" in name)
             if match:
                 self.reference.setCurrentIndex(i)
                 break
 
+    def _locate_step(self, _checked=False):
+        if self.busy():
+            return
+        try:
+            t, y, _ = series(self.snapshot, (self.start.value(), self.end.value()), timing="raw")
+            reference = None
+            source = self.source_label.lower()
+            is_speed = self.snapshot.get("unit") == "rpm" or "speed" in source or "转速" in source
+            for name, provider in self.references.items():
+                lower = name.lower()
+                given = any(token in lower for token in ("给定", "ref", "target", "目标"))
+                same = (any(token in lower for token in ("转速", "speed", "rpm")) if is_speed
+                        else "iq" in source and "iq" in lower)
+                if given and same:
+                    reference = provider()
+                    break
+            found = suggest_step(t, y, reference)
+            if found:
+                self.event.setValue(found["event"])
+                self.target.setValue(found["target"])
+                self.status.setText(f"{found['basis']}：{found['event']:.6g} s，目标 {found['target']:.6g}")
+            else:
+                self.status.setText("未找到清晰阶跃；可直接分析波形和变化率，或手动设置阶跃时刻与目标")
+        except Exception as exc:
+            self.status.setText(str(exc))
+
     def _mode_changed(self):
         mode = self.mode.currentIndex()
         self.palette.setVisible(mode != 3)
+        self.locate_button.setVisible(mode == 3)
         enabled = set(range(3))
         if self.fixed_mode is not None:
             enabled.discard(0)
@@ -322,6 +355,10 @@ class DynamicAnalysisDialog(QDialog):
             t, y, fs = series(self.snapshot, interval, timing="raw" if mode == 3 else "resample")
             ref = self.references[self.reference.currentText()]() if mode == 2 else None
             if ref is not None:
+                unit = str(ref.get("unit", "")).strip()
+                if unit and ((self.ref_kind.currentIndex() == 0 and unit != "rpm") or
+                             (self.ref_kind.currentIndex() == 1 and unit not in ("°", "deg", "度"))):
+                    raise ValueError("阶次参考应选择实际转速(rpm)或电角度(°)，当前参考单位为 "+unit)
                 rt = np.asarray(ref.get("times", ()), dtype=float)
                 if len(rt):
                     common = (t >= rt[0]) & (t <= rt[-1])
@@ -399,10 +436,12 @@ class DynamicAnalysisDialog(QDialog):
             unit = self.snapshot.get("unit", "")
             self.map_plot.setLabel("left", "加速度" if unit == "rpm" else "变化率", units=unit+"/s")
             self.map_plot.setTitle(f"Savitzky–Golay 导数 · 平滑窗 {result['smooth_s']:.4g} s")
-            for value in (m["target"], m["target"]+abs(m["target"]-m["baseline"])*result["band"],
-                          m["target"]-abs(m["target"]-m["baseline"])*result["band"]):
+            for value in ((m["target"], m["target"]+abs(m["target"]-m["baseline"])*result["band"],
+                          m["target"]-abs(m["target"]-m["baseline"])*result["band"])
+                          if result.get("step_valid", True) else ()):
                 self.wave_plot.addItem(pg.InfiniteLine(value, angle=0, pen="#b6a277"))
-            self.wave_plot.addItem(pg.InfiniteLine(result["event"], pen="#ffb65e"))
+            if result.get("step_valid", True):
+                self.wave_plot.addItem(pg.InfiniteLine(result["event"], pen="#ffb65e"))
             for key in ("t10", "t90"):
                 if result[key] is not None:
                     self.wave_plot.addItem(pg.InfiniteLine(result[key], pen="#70959e"))
@@ -413,6 +452,11 @@ class DynamicAnalysisDialog(QDialog):
                 "调节 "+fmt("settling_s", " s"), "峰值变化率 "+fmt("peak_slope", " "+unit+"/s"),
                 "振铃 "+fmt("ringing_hz", " Hz"), "饱和占比 "+fmt("saturation_fraction", " (0–1)"),
                 "稳态误差 "+fmt("steady_error", " "+unit)]))
+            if not result.get("step_valid", True):
+                self.status.setText(result["message"]+" ｜ 峰值变化率 "+fmt("peak_slope", " "+unit+"/s")+
+                                    " ｜ 峰峰值 "+fmt("peak_to_peak", " "+unit)+
+                                    " ｜ 波动 RMS "+fmt("ac_rms", " "+unit)+
+                                    " ｜ 饱和占比 "+fmt("saturation_fraction", ""))
             sat = result["saturation"]
             if sat is not None:
                 indices = np.flatnonzero(sat)[::max(1, np.count_nonzero(sat)//2000)]
@@ -431,6 +475,13 @@ class DynamicAnalysisDialog(QDialog):
             # before placing a rectangular image, keeping original arrays on export.
             uniform = np.linspace(x[0], x[-1], max(2, len(x)))
             db = np.asarray([np.interp(uniform, x, row) for row in db])
+            if "valid_time_ranges" in result:
+                valid = np.zeros(len(uniform), dtype=bool)
+                for start, end in result["valid_time_ranges"]:
+                    valid |= (uniform >= start) & (uniform <= end)
+                    if start == end:
+                        valid[np.argmin(abs(uniform-start))] = True
+                db[:, ~valid] = np.nan
             img = pg.ImageItem(axisOrder="row-major")
             img.setImage(db, autoLevels=False, levels=(-70, 0))
             self.map_plot.addItem(img)
@@ -450,6 +501,8 @@ class DynamicAnalysisDialog(QDialog):
                                  if "resolution" in result else
                                  "Morlet ω₀=6 · L2 归一化 · 边缘影响区已留空；|W|²不等同于物理能量 J")
                                 + " ｜ 色标以本图峰值为 0 dB；跨实验定量比较请使用导出的原始功率")
+            if result.get("message"):
+                self.status.setText(result["message"]+f" ｜ Δ阶次 = {result['resolution']:.4g}")
         self.map_plot.enableAutoRange()
         self.export.setEnabled(True)
 

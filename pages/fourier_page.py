@@ -447,6 +447,7 @@ class FourierAnalysisPage(QWidget):
         self._loaded_sources: dict[str, dict] = {}
         self._source_items = source_items or []
         self._signal_entries: list[dict] = []
+        self._dynamic_panels = {}
         self._order_lms_dialog = None
         self._updating_selection_region = False
         self._last_result = None
@@ -497,7 +498,6 @@ class FourierAnalysisPage(QWidget):
         fft_content = QWidget()
         self.analysis_tabs.addTab(fft_content, "傅里叶 FFT")
         root = QVBoxLayout(fft_content)
-        self._dynamic_panels = {}
         for name in ("STFT 时频", "小波能量", "阶次分析", "动态响应"):
             self.analysis_tabs.addTab(QWidget(), name)
 
@@ -685,6 +685,13 @@ class FourierAnalysisPage(QWidget):
         self._peak_summary.setStyleSheet("color:#ffcc80; font-size:11px;")
         self._peak_summary.setWordWrap(True)
         root.addWidget(self._peak_summary)
+        self._detail = QLabel(
+            "Ia/Ib 等交流量计算基波与THD；Iq/Vd/Vq/转速/转矩等"
+            "直流量改为平均值、纹波RMS、峰峰值、纹波率和主振荡频率。"
+            "“去直流”只移除0 Hz平均值，不会移除基波主峰。")
+        self._detail.setStyleSheet("color:#90a4ae; font-size:11px;")
+        self._detail.setWordWrap(True)
+        root.addWidget(self._detail)
         self.analysis_tabs.currentChanged.connect(self._activate_analysis_tab)
         self._signal_combo.currentIndexChanged.connect(self._sync_analysis_source)
 
@@ -735,14 +742,6 @@ class FourierAnalysisPage(QWidget):
                 panel.status.setText("分析中；完成后点击“读取所选数据”切换信号")
             else:
                 panel.refresh_source()
-
-        self._detail = QLabel(
-            "Ia/Ib 等交流量计算基波与THD；Iq/Vd/Vq/转速/转矩等"
-            "直流量改为平均值、纹波RMS、峰峰值、纹波率和主振荡频率。"
-            "“去直流”只移除0 Hz平均值，不会移除基波主峰。")
-        self._detail.setStyleSheet("color:#90a4ae; font-size:11px;")
-        self._detail.setWordWrap(True)
-        root.addWidget(self._detail)
 
     @staticmethod
     def _signal_category(key: str, label: str = "") -> str:
@@ -801,6 +800,7 @@ class FourierAnalysisPage(QWidget):
             if previous_index >= 0:
                 self._signal_combo.setCurrentIndex(previous_index)
         self._disable_custom_interval()
+        self._sync_analysis_source()
 
     def _selected_snapshot(self) -> tuple[str, dict]:
         token = self._signal_combo.currentData()
