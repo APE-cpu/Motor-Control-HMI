@@ -89,8 +89,10 @@ class DigitalTwinPage(QWidget):
         boundary.setStyleSheet(
             "QLabel { color: #9fb3c8; background: rgba(23, 43, 61, 0.72); "
             "border: 1px solid rgba(64, 180, 255, 0.28); border-radius: 8px; "
-            "padding: 10px 12px; }")
+            "padding: 10px 36px 10px 12px; }")
         root.addWidget(boundary)
+        from widgets.card_close_button import CardCloseButton
+        self._boundary_close = CardCloseButton(boundary, "digital_twin_boundary")
 
         top = QHBoxLayout()
         top.addWidget(self._build_runtime_box(), 3)

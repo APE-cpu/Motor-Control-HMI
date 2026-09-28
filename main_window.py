@@ -208,6 +208,8 @@ class MainWindow(QMainWindow):
             runtime_state=self.runtime_state)
         self._startup_step("电流采样诊断页")
         self.current_sampling_page = CurrentSamplingPage(self.comm_manager)
+        self.monitor_page.export_archive = self.experiment_page
+        self.current_sampling_page.export_archive = self.experiment_page
 
         self.stack.addWidget(self.monitor_page)
         self.stack.addWidget(self.control_page, "motor_section")
@@ -568,6 +570,12 @@ class MainWindow(QMainWindow):
             logger.log("运行状态应答处理失败", str(exc))
 
     def closeEvent(self, event) -> None:  # noqa: N802 - Qt signature
+        if (self.monitor_page._export_ticket is not None or
+                (self.monitor_page._save_worker is not None and
+                 self.monitor_page._save_worker.isRunning())):
+            self.statusBar().showMessage("波形仍在保存，请保存完成后退出。", 10000)
+            event.ignore()
+            return
         # 子页面不会因主窗口关闭而可靠收到 closeEvent。必须先同步停止
         # Simulink C++ 后台线程，否则 QApplication 退出后仍存活的 QThread
         # 会导致 Windows AppHang/QThread destroyed while running。
