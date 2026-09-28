@@ -30,6 +30,10 @@ struct RlsResult {
     double p_trace = 0.0;
     double id_hat_a = 0.0;
     double iq_hat_a = 0.0;
+    double id_prediction_a = 0.0;
+    double iq_prediction_a = 0.0;
+    double innovation_d = 0.0;
+    double innovation_q = 0.0;
     std::array<double, 7> theta_d{};
     std::array<double, 7> theta_q{};
 };
@@ -50,7 +54,11 @@ struct RlsDqInput {
 class OnlineRlsEstimator {
 public:
     explicit OnlineRlsEstimator(double nominal_inductance_h = 0.00066,
-                                bool exact_simulink_reference = false);
+                                bool exact_simulink_reference = false,
+                                double bandwidth_rad_s = 4000.0,
+                                double forgetting_factor = 1.0,
+                                bool rls_enabled = true);
+    void set_rls_adaptation(bool enabled);
     void set_enabled(bool enabled, bool reset = true);
     bool enabled() const noexcept;
     void reset();
@@ -82,13 +90,13 @@ private:
         double disturbance_gain = 3.0057064158538105;
 
         void configure(std::uint32_t rate_hz, double nominal_inductance_h,
-                       bool exact_simulink_reference) noexcept;
+                       bool exact_simulink_reference, double bandwidth_rad_s) noexcept;
         void reset() noexcept;
         double step(double measured_current, double applied_voltage) noexcept;
     };
 
     void reset_unlocked(std::uint32_t rate_hz);
-    static bool update_axis(Axis& axis,
+    bool update_axis(Axis& axis,
                             const std::array<double, kTheta>& regressor,
                             double output, double& innovation);
     bool ingest_dq_unlocked(const RlsDqInput& input, RlsResult& result,
@@ -98,6 +106,14 @@ private:
     mutable std::mutex mutex_;
     double nominal_inductance_h_ = 0.00066;
     bool exact_simulink_reference_ = false;
+    double bandwidth_rad_s_ = 4000.0;
+    double forgetting_factor_ = 1.0;
+    bool rls_enabled_ = true;
+    bool rls_adaptation_ = true;
+    double id_prediction_a_ = 0.0;
+    double iq_prediction_a_ = 0.0;
+    double innovation_d_ = 0.0;
+    double innovation_q_ = 0.0;
     bool enabled_ = false;
     std::uint32_t rate_hz_ = 16000;
     Axis d_;

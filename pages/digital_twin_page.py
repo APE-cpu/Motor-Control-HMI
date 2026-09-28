@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (
     QPushButton,
     QScrollArea,
     QSpinBox,
+    QTabWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -62,13 +63,18 @@ class DigitalTwinPage(QWidget):
         self._ui_refresh_timer.timeout.connect(self._drain_engine_sample)
 
         outer = QVBoxLayout(self)
+        from pages.algorithm_validation_page import AlgorithmValidationPage
+        self.validation_page = AlgorithmValidationPage(self)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self.validation_page, "算法验证 · ESO / RLS")
+        outer.addWidget(self.tabs)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
         content = QWidget()
         root = QVBoxLayout(content)
         scroll.setWidget(content)
-        outer.addWidget(scroll)
+        self.tabs.addTab(scroll, "Simulink 整机仿真")
 
         title_row = QHBoxLayout()
         title = QLabel("数字孪生工作台")
@@ -122,6 +128,9 @@ class DigitalTwinPage(QWidget):
             runtime_state.stateChanged.connect(
                 lambda _previous, _current, _reason: self._sync_controls())
         self._sync_controls()
+
+    def validation_busy(self) -> bool:
+        return self.validation_page.busy()
 
     def _build_runtime_box(self) -> QGroupBox:
         box = QGroupBox("Simulink C++ 仿真运行")
@@ -602,6 +611,9 @@ class DigitalTwinPage(QWidget):
         显式调用此方法。若原生模型未能及时返回，拒绝销毁仍在运行的 QThread，
         避免 Qt 在解释器退出阶段直接中止进程。
         """
+        if self.validation_busy():
+            self.validation_page._cancel()
+            return False
         self._ui_refresh_timer.stop()
         engine = self._engine
         if engine is None:

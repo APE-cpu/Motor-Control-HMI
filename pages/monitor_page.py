@@ -1842,6 +1842,10 @@ class MonitorPage(QWidget):
             ("估算转矩", "torque"),
         ]
 
+    def algorithm_capture_snapshot(self):
+        """Freeze synchronized F1 batches for read-only offline validation."""
+        return self._rls_capture.snapshot()
+
     def fourier_snapshot(self, key: str) -> dict:
         """为离线分析复制原始缓冲，不传递显示平滑后的数据。"""
         if key in ("i_alpha", "i_beta"):

@@ -41,15 +41,23 @@ bool finite_dq_input(const RlsDqInput& input) {
 
 OnlineRlsEstimator::OnlineRlsEstimator(
         double nominal_inductance_h,
-        bool exact_simulink_reference)
+        bool exact_simulink_reference, double bandwidth_rad_s,
+        double forgetting_factor, bool rls_enabled)
     : nominal_inductance_h_(
           std::isfinite(nominal_inductance_h) && nominal_inductance_h > 0.0
               ? nominal_inductance_h : 0.00066),
-      exact_simulink_reference_(exact_simulink_reference) {}
+      exact_simulink_reference_(exact_simulink_reference),
+      bandwidth_rad_s_(bandwidth_rad_s),
+      forgetting_factor_(forgetting_factor), rls_enabled_(rls_enabled) {}
+
+void OnlineRlsEstimator::set_rls_adaptation(bool enabled) {
+    std::lock_guard<std::mutex> lock(mutex_);
+    rls_adaptation_ = enabled;
+}
 
 void OnlineRlsEstimator::EsoAxis::configure(
         std::uint32_t rate_hz, double nominal_inductance_h,
-        bool exact_simulink_reference) noexcept {
+        bool exact_simulink_reference, double bandwidth_rad_s) noexcept {
     if (exact_simulink_reference &&
             rate_hz == static_cast<std::uint32_t>(kEsoModelRateHz) &&
             std::abs(nominal_inductance_h - kSimulinkInductanceH) < 1e-15) {
@@ -70,7 +78,7 @@ void OnlineRlsEstimator::EsoAxis::configure(
         std::max<std::uint32_t>(1U, rate_hz));
     const double reference_pole = std::sqrt(1.0 - kEsoCurrentGain);
     const double pole = std::pow(
-        reference_pole, kEsoModelRateHz / safe_rate);
+        reference_pole, kEsoModelRateHz / safe_rate * bandwidth_rad_s / 4000.0);
     input_gain = 1.0 / (safe_rate * nominal_inductance_h);
     current_gain = 1.0 - pole * pole;
     disturbance_gain = (1.0 - pole) * (1.0 - pole) / input_gain;
@@ -125,13 +133,15 @@ void OnlineRlsEstimator::reset_unlocked(std::uint32_t rate_hz) {
     d_ = {};
     q_ = {};
     eso_d_.configure(rate_hz_, nominal_inductance_h_,
-                     exact_simulink_reference_);
+                     exact_simulink_reference_, bandwidth_rad_s_);
     eso_q_.configure(rate_hz_, nominal_inductance_h_,
-                     exact_simulink_reference_);
+                     exact_simulink_reference_, bandwidth_rad_s_);
     eso_d_.reset();
     eso_q_.reset();
     id_hat_a_ = 0.0;
     iq_hat_a_ = 0.0;
+    id_prediction_a_ = iq_prediction_a_ = 0.0;
+    innovation_d_ = innovation_q_ = 0.0;
     id_history_ = {};
     iq_history_ = {};
     vd_history_ = {};
@@ -156,7 +166,7 @@ bool OnlineRlsEstimator::update_axis(
         double output, double& innovation) {
     std::array<double, kTheta> p_phi{};
     double prediction = 0.0;
-    double denominator = 1.0;  // forgetting factor lambda = 1
+    double denominator = forgetting_factor_;
     for (std::size_t i = 0; i < kTheta; ++i) {
         for (std::size_t j = 0; j < kTheta; ++j) {
             p_phi[i] += axis.covariance[i][j] * regressor[j];
@@ -172,6 +182,9 @@ bool OnlineRlsEstimator::update_axis(
     if (!std::isfinite(innovation)) {
         return false;
     }
+    if (!rls_adaptation_) {
+        return true;
+    }
     const double inverse_denominator = 1.0 / denominator;
     for (std::size_t i = 0; i < kTheta; ++i) {
         axis.theta[i] += p_phi[i] * inverse_denominator * innovation;
@@ -183,6 +196,7 @@ bool OnlineRlsEstimator::update_axis(
         for (std::size_t j = 0; j < kTheta; ++j) {
             axis.covariance[i][j] -=
                 p_phi[i] * p_phi[j] * inverse_denominator;
+            axis.covariance[i][j] /= forgetting_factor_;
             if (!std::isfinite(axis.covariance[i][j])) {
                 return false;
             }
@@ -199,6 +213,10 @@ bool OnlineRlsEstimator::snapshot_unlocked(std::uint32_t tick_ms,
     result.innov_rms_a = std::sqrt(std::max(0.0, innovation_power_ema_));
     result.id_hat_a = id_hat_a_;
     result.iq_hat_a = iq_hat_a_;
+    result.id_prediction_a = id_prediction_a_;
+    result.iq_prediction_a = iq_prediction_a_;
+    result.innovation_d = innovation_d_;
+    result.innovation_q = innovation_q_;
     double trace_d = 0.0;
     double trace_q = 0.0;
     for (std::size_t i = 0; i < kTheta; ++i) {
@@ -222,12 +240,14 @@ bool OnlineRlsEstimator::ingest_dq_unlocked(
 
     // ESOrls routes the corrected ESO current estimates, not the noisy
     // measurements, into both the RLS output and its current-delay regressors.
+    id_prediction_a_ = eso_d_.state_current;
+    iq_prediction_a_ = eso_q_.state_current;
     id_hat_a_ = eso_d_.step(input.id_a, input.ud_v);
     iq_hat_a_ = eso_q_.step(input.iq_a, input.uq_v);
 
     // The source model has one voltage delay before the RLS subsystem and a
     // 1/2-sample pair inside it. Effective voltage lags are k-2 and k-3.
-    if (primed_ >= 1U) {
+    if (rls_enabled_ && primed_ >= 1U) {
         const std::array<double, kTheta> phi_d{
             id_history_[0], id_history_[1], id_history_[2],
             vd_history_[1], vd_history_[2],
@@ -242,6 +262,8 @@ bool OnlineRlsEstimator::ingest_dq_unlocked(
                 !update_axis(q_, phi_q, iq_hat_a_, innovation_q)) {
             return false;
         }
+        innovation_d_ = innovation_d;
+        innovation_q_ = innovation_q;
         const double power = innovation_d * innovation_d +
             innovation_q * innovation_q;
         innovation_power_ema_ += (power - innovation_power_ema_) / 1024.0;

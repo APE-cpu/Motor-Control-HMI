@@ -10,11 +10,11 @@ import math
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import Qt, QSignalBlocker
+from PySide6.QtCore import Qt, QSignalBlocker, QSize
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFileDialog, QGridLayout, QGroupBox,
     QDialog, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox,
-    QVBoxLayout, QWidget,
+    QVBoxLayout, QWidget, QTabWidget, QSizePolicy,
 )
 
 try:
@@ -412,6 +412,31 @@ class OrderLmsDialog(QDialog):
             QMessageBox.warning(self, "CSV导出失败", str(exc))
 
 
+class _AnalysisTabs(QTabWidget):
+    """Let the current subpage determine height inside the outer scroll area."""
+    def hasHeightForWidth(self):
+        return False
+
+    def heightForWidth(self, width):
+        return self.sizeHint().height()
+
+    def sizeHint(self):
+        page = self.currentWidget()
+        if page is None:
+            return super().sizeHint()
+        hint = page.sizeHint()
+        return QSize(max(hint.width(), self.tabBar().sizeHint().width())+4,
+                     hint.height()+self.tabBar().sizeHint().height()+4)
+
+    def minimumSizeHint(self):
+        page = self.currentWidget()
+        if page is None:
+            return super().minimumSizeHint()
+        hint = page.minimumSizeHint()
+        return QSize(max(hint.width(), self.tabBar().minimumSizeHint().width())+4,
+                     hint.height()+self.tabBar().minimumSizeHint().height()+4)
+
+
 class FourierAnalysisPage(QWidget):
     """分析当前监控原始缓冲，或从“保存所有波形”CSV读取数据。"""
 
@@ -422,19 +447,19 @@ class FourierAnalysisPage(QWidget):
         self._loaded_sources: dict[str, dict] = {}
         self._source_items = source_items or []
         self._signal_entries: list[dict] = []
+        self._dynamic_panels = {}
         self._order_lms_dialog = None
         self._updating_selection_region = False
         self._last_result = None
         self._harmonic_hz = {"speed": 0.0, "angle": 0.0}
 
         root = QVBoxLayout(self)
-        title = QLabel("离线傅里叶分析")
+        title = QLabel("离线傅里叶与动态分析")
         title.setObjectName("TitleLabel")
         root.addWidget(title)
         intro = QLabel(
-            "对已采集的原始缓冲或已保存 CSV 做 FFT；不在实时刷新线程中计算。"
-            "分析使用原始点，不使用监控页的“显示平滑”结果。"
-            "完成一次分析后可直接拖动蓝色区间的左右边界，松开即重新计算。")
+            "选择信号后，在各子分页进行分析；支持实机原始缓冲与 CSV，"
+            "监控页的显示平滑不参与计算。FFT 的蓝色区间也可用于其他分析。")
         intro.setStyleSheet("color:#90a4ae;")
         intro.setWordWrap(True)
         root.addWidget(intro)
@@ -467,6 +492,14 @@ class FourierAnalysisPage(QWidget):
         self._file_combo.currentIndexChanged.connect(self._refresh_categories)
         self._category_combo.currentIndexChanged.connect(self._refresh_signals)
         self._refresh_categories()
+
+        self.analysis_tabs = _AnalysisTabs()
+        root.addWidget(self.analysis_tabs, 1)
+        fft_content = QWidget()
+        self.analysis_tabs.addTab(fft_content, "傅里叶 FFT")
+        root = QVBoxLayout(fft_content)
+        for name in ("STFT 时频", "小波能量", "阶次分析", "动态响应"):
+            self.analysis_tabs.addTab(QWidget(), name)
 
         controls = QGroupBox("分析设置")
         grid = QGridLayout(controls)
@@ -559,7 +592,7 @@ class FourierAnalysisPage(QWidget):
         buttons.addWidget(self._analyze_btn)
         self._load_btn = QPushButton("加载波形 CSV…")
         self._load_btn.clicked.connect(self._load_csv_dialog)
-        buttons.addWidget(self._load_btn)
+        source_row.addWidget(self._load_btn)
         self._save_plot_btn = QPushButton("保存带标注频谱图…")
         self._save_plot_btn.clicked.connect(self._save_plot)
         buttons.addWidget(self._save_plot_btn)
@@ -568,6 +601,10 @@ class FourierAnalysisPage(QWidget):
             "在独立窗口中离线学习机械阶次，不增加当前页面高度")
         self._order_lms_btn.clicked.connect(self._open_order_lms)
         buttons.addWidget(self._order_lms_btn)
+        self._dynamic_btn = QPushButton("时频与动态分析…")
+        self._dynamic_btn.clicked.connect(self._open_dynamic_analysis)
+        self._dynamic_btn.hide()
+        self._dynamic_dialogs = []
         buttons.addStretch(1)
         grid.addLayout(buttons, 5, 0, 1, 4)
         root.addWidget(controls)
@@ -648,7 +685,6 @@ class FourierAnalysisPage(QWidget):
         self._peak_summary.setStyleSheet("color:#ffcc80; font-size:11px;")
         self._peak_summary.setWordWrap(True)
         root.addWidget(self._peak_summary)
-
         self._detail = QLabel(
             "Ia/Ib 等交流量计算基波与THD；Iq/Vd/Vq/转速/转矩等"
             "直流量改为平均值、纹波RMS、峰峰值、纹波率和主振荡频率。"
@@ -656,6 +692,56 @@ class FourierAnalysisPage(QWidget):
         self._detail.setStyleSheet("color:#90a4ae; font-size:11px;")
         self._detail.setWordWrap(True)
         root.addWidget(self._detail)
+        self.analysis_tabs.currentChanged.connect(self._activate_analysis_tab)
+        self._signal_combo.currentIndexChanged.connect(self._sync_analysis_source)
+
+    def _analysis_source(self):
+        label, snapshot = self._selected_snapshot()
+        source, path = self._source_combo.currentData(), self._file_combo.currentData()
+        references = {}
+        for item in self._signal_entries:
+            if item["source"] != source:
+                continue
+            kind, key = item["token"]
+            if kind == "loaded" and item["file"] == path:
+                references[item["label"]] = lambda k=key: self._loaded_sources[k]
+            elif kind == "live" and self._snapshot_provider is not None:
+                references[item["label"]] = lambda k=key: self._snapshot_provider(k)
+        interval = None
+        if self._use_plot_interval.isChecked() and self._selection_region.isVisible():
+            interval = sorted(self._selection_region.getRegion())
+        return label, snapshot, references, interval
+
+    def _activate_analysis_tab(self, index):
+        # QStackedLayout otherwise reserves the tallest hidden page's minimum
+        # height, making the short CWT/order controls push plots off screen.
+        for i in range(self.analysis_tabs.count()):
+            policy = QSizePolicy.Expanding if i == index else QSizePolicy.Ignored
+            self.analysis_tabs.widget(i).setSizePolicy(policy, policy)
+        self.analysis_tabs.updateGeometry()
+        self.updateGeometry()
+        if index <= 0:
+            return
+        if index not in self._dynamic_panels:
+            from pages.dynamic_analysis_dialog import DynamicAnalysisDialog
+            holder = self.analysis_tabs.widget(index)
+            layout = QVBoxLayout(holder)
+            layout.setContentsMargins(0, 0, 0, 0)
+            panel = DynamicAnalysisDialog("尚未读取", dict(values=[], times=[]), parent=holder,
+                                          embedded=True, fixed_mode=index-1,
+                                          source_provider=self._analysis_source)
+            self._dynamic_panels[index] = panel
+            layout.addWidget(panel)
+        self.analysis_tabs.updateGeometry()
+        self.layout().invalidate()
+        self.updateGeometry()
+
+    def _sync_analysis_source(self):
+        for panel in self._dynamic_panels.values():
+            if panel.busy():
+                panel.status.setText("分析中；完成后点击“读取所选数据”切换信号")
+            else:
+                panel.refresh_source()
 
     @staticmethod
     def _signal_category(key: str, label: str = "") -> str:
@@ -714,6 +800,7 @@ class FourierAnalysisPage(QWidget):
             if previous_index >= 0:
                 self._signal_combo.setCurrentIndex(previous_index)
         self._disable_custom_interval()
+        self._sync_analysis_source()
 
     def _selected_snapshot(self) -> tuple[str, dict]:
         token = self._signal_combo.currentData()
@@ -725,6 +812,41 @@ class FourierAnalysisPage(QWidget):
         if self._snapshot_provider is None:
             raise ValueError("当前监控缓冲不可用")
         return self._signal_combo.currentText(), self._snapshot_provider(key)
+
+    def analysis_busy(self) -> bool:
+        return any(dialog.busy() for dialog in [*self._dynamic_dialogs, *self._dynamic_panels.values()])
+
+    def _open_dynamic_analysis(self) -> None:
+        from pages.dynamic_analysis_dialog import DynamicAnalysisDialog
+        try:
+            label, snapshot = self._selected_snapshot()
+            references = {}
+            source = self._source_combo.currentData()
+            path = self._file_combo.currentData()
+            for item in self._signal_entries:
+                if item["source"] != source:
+                    continue
+                kind, key = item["token"]
+                if kind == "loaded":
+                    if item["file"] != path:
+                        continue
+                    references[item["label"]] = lambda k=key: self._loaded_sources[k]
+                elif self._snapshot_provider is not None:
+                    references[item["label"]] = lambda k=key: self._snapshot_provider(k)
+            interval = None
+            if self._use_plot_interval.isChecked() and self._selection_region.isVisible():
+                interval = sorted(self._selection_region.getRegion())
+            dialog = DynamicAnalysisDialog(label, snapshot, references, interval, self)
+            self._dynamic_dialogs.append(dialog)
+            dialog.finished.connect(lambda _: self._release_dynamic_dialog(dialog))
+            dialog.show()
+        except Exception as exc:
+            QMessageBox.warning(self, "动态分析无法打开", str(exc))
+
+    def _release_dynamic_dialog(self, dialog):
+        if dialog in self._dynamic_dialogs:
+            self._dynamic_dialogs.remove(dialog)
+        dialog.deleteLater()
 
     def _analyze_selected(self) -> None:
         try:
