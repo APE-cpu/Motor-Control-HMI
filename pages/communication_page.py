@@ -654,6 +654,7 @@ class CommunicationPage(QWidget):
         v.setContentsMargins(8, 8, 8, 8)
         v.setSpacing(6)
         title = QLabel("📊 遥测通道详情（实时传输内容）")
+        title.setContentsMargins(0, 0, 28, 0)
         title.setStyleSheet("font-size:12px; font-weight:bold; color:#80cbc4;")
         v.addWidget(title)
 
@@ -713,8 +714,8 @@ class CommunicationPage(QWidget):
         v.addWidget(note)
 
         v.addStretch(1)
-        from ui_theme import appearance_manager
-        appearance_manager().register_hint(w)
+        from widgets.card_close_button import CardCloseButton
+        self._telemetry_detail_close = CardCloseButton(w, "communication_telemetry")
         return w
 
     def _send_telemetry(self) -> None:

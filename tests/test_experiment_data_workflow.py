@@ -4,7 +4,7 @@ import os
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 import pytest
-from PySide6.QtCore import QCoreApplication, QEvent, QSettings
+from PySide6.QtCore import QCoreApplication, QEvent, QSettings, Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QLabel, QMessageBox
 
@@ -154,25 +154,29 @@ def test_sampling_export_creates_completed_snapshot_without_starting_recording(a
 
 
 def test_hint_preference_persists_and_does_not_hide_runtime_status(app, tmp_path):
-    from ui_theme import ThemeManager
+    from widgets.card_close_button import CardCloseButton
+    from widgets.appearance_bar import AppearanceBar
     settings = QSettings(str(tmp_path / "appearance.ini"), QSettings.IniFormat)
-    manager = ThemeManager(app, settings)
     card = QLabel("说明")
+    other = QLabel("另一张说明")
     status = QLabel("运行状态")
+    card.show()
+    other.show()
     status.show()
-    manager.register_hint(card)
-    manager.set_hints_visible(False)
+    close = CardCloseButton(card, "first", settings)
+    CardCloseButton(other, "second", settings)
+    card.resize(400, 60)
+    app.processEvents()
+    assert close.x() == card.width() - close.width() - 6
+    QTest.mouseClick(close, Qt.LeftButton)
     assert card.isHidden()
+    assert not other.isHidden()
     assert not status.isHidden()
-    settings.sync()
-    restored = ThemeManager(app, QSettings(str(tmp_path / "appearance.ini"), QSettings.IniFormat))
-    assert restored.hints_visible is False
-    manager.set_hints_visible(True)
-    assert not card.isHidden()
-    for item in (manager, restored):
-        app.removeEventFilter(item)
+    reopened = QLabel("重新打开的说明")
+    CardCloseButton(reopened, "first", QSettings(str(tmp_path / "appearance.ini"), QSettings.IniFormat))
+    assert reopened.isHidden()
+    bar = AppearanceBar()
+    assert not hasattr(bar, "hints_toggle")
+    for item in (card, other, reopened, status, bar):
+        item.close()
         item.deleteLater()
-    card.close()
-    status.close()
-    card.deleteLater()
-    status.deleteLater()
