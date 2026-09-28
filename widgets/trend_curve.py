@@ -3,11 +3,24 @@ from collections import deque
 from typing import Deque, Dict
 
 from PySide6.QtCore import Qt
+from PySide6.QtGui import QPainter, QPalette
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QSizePolicy, QVBoxLayout, QWidget,
 )
 
 from config.config import CURVE_BUFFER_SIZE
+
+
+class _ElidedLabel(QLabel):
+    """放不下时以"…"结尾省略，而不是硬生生截断；text() 仍返回完整文字。"""
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt API
+        painter = QPainter(self)
+        rect = self.contentsRect()
+        elided = self.fontMetrics().elidedText(self.text(), Qt.ElideRight, rect.width())
+        self.style().drawItemText(painter, rect, Qt.AlignLeft | Qt.AlignVCenter,
+                                  self.palette(), self.isEnabled(), elided,
+                                  QPalette.WindowText)
 
 try:
     import numpy as np
@@ -91,7 +104,7 @@ class TrendCurve(QWidget):
             # 处理链路说明放在图上方，避免与波形图下方的时间轴混在一起。
             # 原有“均值/RMS/峰峰值/THD”实时统计行不再加入布局；
             # 频域分析改到独立的离线傅里叶页，需要时才计算。
-            self._processing_label = QLabel("")
+            self._processing_label = _ElidedLabel("")
             self._processing_label.setStyleSheet(
                 "color: #90a4ae; font-size: 11px; padding: 1px 4px;")
             self._processing_label.setWordWrap(False)
@@ -291,7 +304,7 @@ class TrendCurve(QWidget):
         """在采样/滤波说明同一行的右侧添加操作控件。"""
         if _PG_OK and hasattr(self, "_header_layout"):
             widget.setSizePolicy(QSizePolicy.Fixed, QSizePolicy.Fixed)
-            self._header_layout.addWidget(widget, 0, Qt.AlignRight)
+            self._header_layout.addWidget(widget, 0, Qt.AlignRight | Qt.AlignVCenter)
 
     def processing_details(self) -> str:
         """返回可随数据导出/离线分析保存的处理说明。"""

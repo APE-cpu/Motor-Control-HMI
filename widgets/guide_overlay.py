@@ -13,12 +13,27 @@ from PySide6.QtCore import QEvent, QPoint, QRect, QRectF, Qt, QTimer, Signal
 from PySide6.QtGui import QColor, QPainter, QPainterPath, QPen, QRegion
 from PySide6.QtWidgets import (
     QAbstractScrollArea, QFrame, QHBoxLayout, QLabel, QPushButton, QScrollArea,
-    QVBoxLayout, QWidget,
+    QTabWidget, QVBoxLayout, QWidget,
 )
 
 _ACCENT = QColor("#4fc3f7")
 _WARN = QColor("#ffb74d")
 _PAD = 6
+
+
+def _reveal_tabs(widget: QWidget) -> None:
+    """控件在未选中的标签页里时，切到那个标签页（纯界面导航，不触发任何控件）。"""
+    parent = widget.parentWidget()
+    while parent is not None:
+        if isinstance(parent, QTabWidget):
+            # 标签页挂在 QTabWidget 内部的 QStackedWidget 下，按"是否包含目标控件"判断
+            for index in range(parent.count()):
+                page = parent.widget(index)
+                if page is widget or page.isAncestorOf(widget):
+                    if parent.currentIndex() != index:
+                        parent.setCurrentIndex(index)
+                    break
+        parent = parent.parentWidget()
 
 
 @dataclass(frozen=True)
@@ -144,9 +159,11 @@ class GuideOverlay(QWidget):
     def _enter_step(self) -> None:
         step = self._steps[self._index]
         if step.control_id:
-            _widget, page_key = self._resolve(step.control_id)
+            widget, page_key = self._resolve(step.control_id)
             if page_key:
                 self._show_page(page_key)
+            if widget is not None:
+                _reveal_tabs(widget)
         self._bubble.apply(step, self._index, len(self._steps))
         self._update_geometry()
         # 页面切换有约 190 ms 过渡动画：结束后把控件滚入视野，再对齐一次

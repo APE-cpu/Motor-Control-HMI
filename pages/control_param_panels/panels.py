@@ -10,6 +10,7 @@ from PySide6.QtWidgets import (
 )
 
 from config.config import SENSORLESS_METHODS
+from widgets.formula_view import Eq, FormulaSheet, Notes, Sec, Txt, Warn
 
 
 class _Panel(QWidget):
@@ -35,12 +36,8 @@ class _FormulaPanel(_Panel):
 
         box = QGroupBox("数学模型与参数说明")
         bv = QVBoxLayout(box)
-        self._formula = QLabel()
-        self._formula.setTextFormat(Qt.RichText)
-        self._formula.setWordWrap(True)
-        self._formula.setAlignment(Qt.AlignTop | Qt.AlignLeft)
-        self._formula.setStyleSheet(
-            "QLabel { font-size: 13px; color: #c7d3e0; padding: 4px; }")
+        self._formula = FormulaSheet()
+        self._formula.setContentsMargins(4, 0, 4, 4)
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setFrameShape(QScrollArea.NoFrame)
@@ -48,8 +45,8 @@ class _FormulaPanel(_Panel):
         bv.addWidget(scroll)
         h.addWidget(box, 3)
 
-    def set_formula(self, html: str) -> None:
-        self._formula.setText(html)
+    def set_formula(self, blocks) -> None:
+        self._formula.set_blocks(blocks)
 
 
 def _loop_group(title: str, rows: list) -> tuple:
@@ -106,53 +103,20 @@ def _dspin(mn, mx, val, decimals=4, step=None):
     return sp
 
 
-# ─── 公式排版辅助（Qt 富文本） ───────────────────────────────
-def _sec(title: str) -> str:
-    """小节标题：蓝色加粗。"""
-    return (f"<p style='color:#4fc3f7; font-weight:bold; font-size:14px;"
-            f" margin:12px 0 4px 0;'>{title}</p>")
-
-
-def _fx(*lines: str) -> str:
-    """公式块：深色底、衬线数学字体、加大字号、行距。"""
-    body = "".join(
-        f"<div style='margin:5px 2px;'>{ln}</div>" for ln in lines)
-    return ("<table width='100%' cellspacing='0' cellpadding='10'"
-            " bgcolor='#10131a'><tr><td style=\"font-family:'Cambria Math',"
-            "'STIX Two Math','Times New Roman',serif; font-size:16px;"
-            " color:#e8f1ff;\">" + body + "</td></tr></table>")
-
-
-def _txt(text: str) -> str:
-    """正文说明行。"""
-    return f"<p style='margin:6px 0; color:#c7d3e0;'>{text}</p>"
-
-
-def _note(*items: str) -> str:
-    """参数说明列表。"""
-    lis = "".join(
-        f"<li style='margin:5px 0; color:#aebccb;'>{i}</li>" for i in items)
-    return f"<ul style='margin:4px 0;'>{lis}</ul>"
-
-
 # ─── 闭环 PI（转速外环 + 电流内环级联） ─────────────────────────
-_PI_FORMULA = (
-    _txt("<b>级联双闭环</b>：转速外环输出电流给定，电流内环输出电压。")
-    + _sec("转速环（外环）")
-    + _fx("e<sub>ω</sub> = ω* − ω",
-          "i<sub>q</sub>* = K<sub>pω</sub>·e<sub>ω</sub> + "
-          "K<sub>iω</sub>·∫e<sub>ω</sub> dt",
-          "|i<sub>q</sub>*| ≤ i<sub>qmax</sub>&nbsp;&nbsp;（输出限幅）")
-    + _sec("电流环（内环，含 dq 解耦前馈）")
-    + _fx("v<sub>d</sub> = K<sub>pi</sub>·e<sub>d</sub> + "
-          "K<sub>ii</sub>·∫e<sub>d</sub> dt − ω<sub>e</sub>L<sub>q</sub>i<sub>q</sub>",
-          "v<sub>q</sub> = K<sub>pi</sub>·e<sub>q</sub> + "
-          "K<sub>ii</sub>·∫e<sub>q</sub> dt + ω<sub>e</sub>(L<sub>d</sub>i<sub>d</sub>"
-          " + ψ<sub>f</sub>)")
-    + _txt("其中 e<sub>d</sub> = i<sub>d</sub>* − i<sub>d</sub>，"
-           "e<sub>q</sub> = i<sub>q</sub>* − i<sub>q</sub>；表贴式取 i<sub>d</sub>* = 0。")
-    + _sec("参数说明")
-    + _note(
+_PI_FORMULA = [
+    Txt("<b>级联双闭环</b>：转速外环输出电流给定，电流内环输出电压。"),
+    Sec("转速环（外环）"),
+    Eq(r"e_\omega = \omega^* - \omega"),
+    Eq(r"i_q^* = K_{p\omega}\,e_\omega + K_{i\omega}\int e_\omega\,\mathrm{d}t"),
+    Eq(r"|i_q^*| \leq i_{q\max}", "输出限幅"),
+    Sec("电流环（内环，含 dq 解耦前馈）"),
+    Eq(r"v_d = K_{pi}\,e_d + K_{ii}\int e_d\,\mathrm{d}t - \omega_e L_q i_q"),
+    Eq(r"v_q = K_{pi}\,e_q + K_{ii}\int e_q\,\mathrm{d}t + \omega_e\,(L_d i_d + \psi_f)"),
+    Txt("其中 e<sub>d</sub> = i<sub>d</sub>* − i<sub>d</sub>，"
+        "e<sub>q</sub> = i<sub>q</sub>* − i<sub>q</sub>；表贴式取 i<sub>d</sub>* = 0。"),
+    Sec("参数说明"),
+    Notes(
         "K<sub>pω</sub>/K<sub>iω</sub>：转速环增益。Kp 大→响应快但易超调；"
         "Ki 消除稳态误差，过大引起振荡",
         "i<sub>qmax</sub>：转速环输出限幅 = 最大转矩电流，兼作过流保护；"
@@ -160,8 +124,8 @@ _PI_FORMULA = (
         "K<sub>pi</sub>/K<sub>ii</sub>：电流环增益，按带宽整定 "
         "K<sub>pi</sub> = L·ω<sub>bw</sub>，K<sub>ii</sub> = R·ω<sub>bw</sub>",
         "采样时间：内环带宽须远高于外环（≥10 倍），典型电流环 10~20 kHz、"
-        "转速环 1 kHz"))
-
+        "转速环 1 kHz"),
+]
 
 class PIPanel(_FormulaPanel):
     def __init__(self) -> None:
@@ -216,28 +180,28 @@ class PIPanel(_FormulaPanel):
 
 
 # ─── PMSM 位置—速度—电流三级级联 ───────────────────────────
-_POSITION_FORMULA = (
-    _txt("<b>位置三级级联</b>：最外层位置环输出速度给定，下面复用速度 PI 和电流 PI。"
-         "位置环不直接驱动 PWM。")
-    + _sec("位置环（最外环，200 Hz）")
-    + _fx("e<sub>θ</sub> = θ* − θ（连续机械角，支持多圈）",
-          "θ<sub>r</sub>, n<sub>r</sub> = Trajectory(θ*, n<sub>lim</sub>, a<sub>lim</sub>)",
-          "n<sub>pos</sub> = K<sub>pθ</sub>(θ<sub>r</sub> − θ) − "
-          "K<sub>dθ</sub>n + LPF(K<sub>pfθ</sub>·6n<sub>r</sub>)",
-          "n* = sat(n<sub>pos</sub>, ±n<sub>lim</sub>)")
-    + _sec("速度环与电流环")
-    + _fx("i<sub>q</sub>* = PI<sub>ω</sub>(n* − n)",
-          "v<sub>dq</sub> = PI<sub>i</sub>(i<sub>dq</sub>* − i<sub>dq</sub>)"
-          " + dq 解耦前馈")
-    + _sec("对拖台架用法")
-    + _note(
+_POSITION_FORMULA = [
+    Txt("<b>位置三级级联</b>：最外层位置环输出速度给定，下面复用速度 PI 和电流 PI。"
+        "位置环不直接驱动 PWM。"),
+    Sec("位置环（最外环，200 Hz）"),
+    Eq(r"e_\theta = \theta^* - \theta", "连续机械角，支持多圈"),
+    Eq(r"(\theta_r,\ n_r) = \mathrm{Traj}(\theta^*,\ n_{\mathrm{lim}},\ a_{\mathrm{lim}})",
+       "加减速受限轨迹"),
+    Eq(r"n_{\mathrm{pos}} = K_{p\theta}\,(\theta_r - \theta) - K_{d\theta}\,n"
+       r" + \mathrm{LPF}(6\,K_{pf\theta}\,n_r)"),
+    Eq(r"n^* = \mathrm{sat}(n_{\mathrm{pos}},\ \pm n_{\mathrm{lim}})"),
+    Sec("速度环与电流环"),
+    Eq(r"i_q^* = \mathrm{PI}_\omega(n^* - n)"),
+    Eq(r"v_{dq} = \mathrm{PI}_i(i_{dq}^* - i_{dq}) + v_{\mathrm{ff}}", "v_ff：dq 解耦前馈"),
+    Sec("对拖台架用法"),
+    Notes(
         "上位机仍输入最终角度；固件内部生成加减速受限轨迹，避免位置阶跃瞬间顶到速度限幅",
         "首轮用 ±10°，速度限幅 60 rpm、轨迹加速度 30 rpm/s；确认轨迹与反馈方向正确后再提高",
         "Kpfθ 作用于轨迹速度而非最终目标的数值跳变，因此运行中应能看到非零速度前馈",
         "F407 当前固定：电流/PWM 16 kHz、速度 500 Hz；位置环在 500 Hz 任务中按 200 Hz 执行",
         "位置最外环使用比例、实际速度阻尼与目标速度前馈；积分仍只由速度/电流内环承担",
-        "速度指令确认跨过±10 rpm并反向时，固件卸载一次速度PI积分，避免旧方向转矩加重滑动过冲"))
-
+        "速度指令确认跨过±10 rpm并反向时，固件卸载一次速度PI积分，避免旧方向转矩加重滑动过冲"),
+]
 
 class PositionPanel(PIPanel):
     """位置环参数 + 现有速度/电流 PI 参数。"""
@@ -286,22 +250,21 @@ class PositionPanel(PIPanel):
 
 
 # ─── 速度开环 / 电流闭环调试 ───────────────────────────────
-_OPENLOOP_FORMULA = (
-    _txt("<b>速度环旁路，d/q 电流环保持闭环</b>。直接给定 Iqref，"
-         "用于电流环 PI 整定；这不是 V/f 开环运行。")
-    + _sec("电流闭环")
-    + _fx("e<sub>q</sub> = I<sub>qref</sub> − I<sub>q</sub>",
-          "V<sub>q</sub> = K<sub>pi</sub>e<sub>q</sub> + "
-          "K<sub>ii</sub>∫e<sub>q</sub>dt",
-          "I<sub>dref</sub> = 0")
-    + _sec("参数说明")
-    + _note(
+_OPENLOOP_FORMULA = [
+    Txt("<b>速度环旁路，d/q 电流环保持闭环</b>。直接给定 Iqref，"
+        "用于电流环 PI 整定；这不是 V/f 开环运行。"),
+    Sec("电流闭环"),
+    Eq(r"e_q = I_{q,\mathrm{ref}} - I_q"),
+    Eq(r"V_q = K_{pi}\,e_q + K_{ii}\int e_q\,\mathrm{d}t"),
+    Eq(r"I_{d,\mathrm{ref}} = 0"),
+    Sec("参数说明"),
+    Notes(
         "Iqref：q轴转矩电流给定；空载电机会向任一方向加速，不能把它当速度给定",
         "Kpi/Kii：电流内环整数增益；运行中每次只允许修改 ±10%",
-        "斜坡时间：改变 Iqref 时的过渡时间，避免电流阶跃过猛")
-    + _txt("<b style='color:#ff8a65'>⚠ 注意空载加速</b>：本模式无速度环，空载电机会持续加速；"
-           "超过 1500 rpm 下位机受控停机，超过 2500 rpm 按跑飞锁存故障。"))
-
+        "斜坡时间：改变 Iqref 时的过渡时间，避免电流阶跃过猛"),
+    Warn("<b>⚠ 注意空载加速</b>：本模式无速度环，空载电机会持续加速；"
+         "超过 1500 rpm 下位机受控停机，超过 2500 rpm 按跑飞锁存故障。"),
+]
 
 class OpenLoopPanel(_FormulaPanel):
     def __init__(self) -> None:
@@ -333,63 +296,61 @@ class OpenLoopPanel(_FormulaPanel):
 
 # ─── MPC ───────────────────────────────────────────────────
 _MPC_LOOPS = ["电流环（转速环用 PI）", "转速环（电流环用 PI）", "转速+电流双环"]
+_LOOP_NOTE = object()          # 公式模板中「环路结构」说明的插入位置
 
-_FCS_FORMULA = (
-    _txt("<b>FCS-MPC（有限集）</b>：每个控制周期遍历逆变器 8 个基本电压矢量"
-         " u ∈ {{V<sub>0</sub> … V<sub>7</sub>}}，取代价最小者直接输出（无调制器）。")
-    + _sec("预测模型（dq 电流方程，前向欧拉，T<sub>s</sub> 为控制周期）")
-    + _fx("i<sub>d</sub>(k+1) = i<sub>d</sub> + T<sub>s</sub>/L<sub>d</sub> · "
-          "[ v<sub>d</sub> − R<sub>s</sub>i<sub>d</sub> + "
-          "ω<sub>e</sub>L<sub>q</sub>i<sub>q</sub> ]",
-          "i<sub>q</sub>(k+1) = i<sub>q</sub> + T<sub>s</sub>/L<sub>q</sub> · "
-          "[ v<sub>q</sub> − R<sub>s</sub>i<sub>q</sub> − "
-          "ω<sub>e</sub>(L<sub>d</sub>i<sub>d</sub> + ψ<sub>f</sub>) ]")
-    + _sec("价值函数（预测 N 步）")
-    + _fx("J = Σ<sub>k=1..N</sub> q·[ (i<sub>d</sub>* − i<sub>d</sub>(k))² + "
-          "(i<sub>q</sub>* − i<sub>q</sub>(k))² ] + r·‖Δu(k)‖² + I<sub>lim</sub>")
-    + _sec("约束处理")
-    + _fx("I<sub>lim</sub> = 0&nbsp;（|i| ≤ i<sub>max</sub>）；"
-          "否则 I<sub>lim</sub> = ECR&nbsp;（大罚值，等效剔除越限矢量）")
-    + "{loop_note}"
-    + _sec("参数说明")
-    + _note(
+_FCS_FORMULA = [
+    Txt("<b>FCS-MPC（有限集）</b>：每个控制周期遍历逆变器 8 个基本电压矢量"
+        " u ∈ {V<sub>0</sub> … V<sub>7</sub>}，取代价最小者直接输出（无调制器）。"),
+    Sec("预测模型（dq 电流方程，前向欧拉，T<sub>s</sub> 为控制周期）"),
+    Eq(r"i_d(k+1) = i_d + \dfrac{T_s}{L_d}\left[v_d - R_s i_d + \omega_e L_q i_q\right]"),
+    Eq(r"i_q(k+1) = i_q + \dfrac{T_s}{L_q}"
+       r"\left[v_q - R_s i_q - \omega_e\,(L_d i_d + \psi_f)\right]"),
+    Sec("价值函数（预测 N 步）"),
+    Eq(r"J = \sum_{k=1}^{N} q\left[(i_d^* - i_d(k))^2 + (i_q^* - i_q(k))^2\right]"
+       r" + r\,\Vert\Delta u(k)\Vert^2 + I_{\mathrm{lim}}"),
+    Sec("约束处理"),
+    Eq(r"I_{\mathrm{lim}} = 0,\quad |i| \leq i_{\max}"),
+    Eq(r"I_{\mathrm{lim}} = \mathrm{ECR},\quad |i| > i_{\max}", "大罚值，等效剔除越限矢量"),
+    _LOOP_NOTE,
+    Sec("参数说明"),
+    Notes(
         "N/M：预测/控制时域。N 大→前瞻多但计算量按 8<sup>N</sup> 增长，"
         "FCS 常用 N = 1~2",
         "q/r：跟踪误差与开关变化的权重比。r 越大开关频率越低（损耗小、纹波大）",
         "ECR：约束违反罚值，越大越接近硬约束",
-        "u/Δu/x 约束：FCS 中 u 天然离散有界，x 约束以罚项进入价值函数"))
+        "u/Δu/x 约束：FCS 中 u 天然离散有界，x 约束以罚项进入价值函数"),
+]
 
-_CCS_FORMULA = (
-    _txt("<b>CCS-MPC（连续集）</b>：解二次规划得连续电压矢量，经 SVPWM 调制"
-         "输出，开关频率固定。")
-    + _sec("优化问题（滚动时域，每周期只执行 u(0)）")
-    + _fx("min&nbsp; J = Σ<sub>k=1..N</sub> ‖x(k) − x*‖²<sub>Q</sub> + "
-          "Σ<sub>k=0..M−1</sub> ‖Δu(k)‖²<sub>R</sub> + ECR·ε²")
-    + _sec("约束条件 s.t.")
-    + _fx("x(k+1) = A·x(k) + B·u(k)&nbsp;&nbsp;（线性化预测模型）",
-          "u<sub>min</sub> ≤ u ≤ u<sub>max</sub>，|Δu| ≤ Δu<sub>max</sub>"
-          "&nbsp;&nbsp;（硬约束）",
-          "x<sub>min</sub> − ε ≤ x ≤ x<sub>max</sub> + ε，ε ≥ 0"
-          "&nbsp;&nbsp;（软约束，ε 为松弛变量）")
-    + "{loop_note}"
-    + _sec("参数说明")
-    + _note(
+_CCS_FORMULA = [
+    Txt("<b>CCS-MPC（连续集）</b>：解二次规划得连续电压矢量，经 SVPWM 调制"
+        "输出，开关频率固定。"),
+    Sec("优化问题（滚动时域，每周期只执行 u(0)）"),
+    Eq(r"\min\ J = \sum_{k=1}^{N}\Vert x(k) - x^*\Vert_Q^2"
+       r" + \sum_{k=0}^{M-1}\Vert\Delta u(k)\Vert_R^2 + \mathrm{ECR}\cdot\varepsilon^2"),
+    Sec("约束条件 s.t."),
+    Eq(r"x(k+1) = A\,x(k) + B\,u(k)", "线性化预测模型"),
+    Eq(r"u_{\min} \leq u \leq u_{\max},\quad |\Delta u| \leq \Delta u_{\max}", "硬约束"),
+    Eq(r"x_{\min} - \varepsilon \leq x \leq x_{\max} + \varepsilon,\quad \varepsilon \geq 0",
+       "软约束，ε 为松弛变量"),
+    _LOOP_NOTE,
+    Sec("参数说明"),
+    Notes(
         "N：预测时域，应覆盖被控对象主导时间常数；M ≤ N，M 之后控制量保持不变",
         "Q/R：状态误差与控制增量权重。Q/R 大→跟踪快、控制猛；小→平滑、省能量",
         "ECR：松弛惩罚，防止约束冲突导致 QP 无解",
-        "u/Δu：执行器幅值与速率约束；x：状态（转速/电流）安全范围"))
+        "u/Δu：执行器幅值与速率约束；x：状态（转速/电流）安全范围"),
+]
 
 _LOOP_NOTES = {
-    _MPC_LOOPS[0]: _sec("环路结构") + _txt(
+    _MPC_LOOPS[0]: [Sec("环路结构"), Txt(
         "MPC 替代<b>电流环</b>；转速环仍用 PI，其输出 i<sub>q</sub>* "
-        "作为 MPC 的电流参考。"),
-    _MPC_LOOPS[1]: _sec("环路结构") + _txt(
-        "MPC 替代<b>转速环</b>，输出 i<sub>q</sub>* 给下级 PI 电流环执行。"),
-    _MPC_LOOPS[2]: _sec("环路结构") + _txt(
+        "作为 MPC 的电流参考。")],
+    _MPC_LOOPS[1]: [Sec("环路结构"), Txt(
+        "MPC 替代<b>转速环</b>，输出 i<sub>q</sub>* 给下级 PI 电流环执行。")],
+    _MPC_LOOPS[2]: [Sec("环路结构"), Txt(
         "单一 MPC 同时优化转速与电流（状态向量含 ω 和 i<sub>dq</sub>），"
-        "无内外环级联。"),
+        "无内外环级联。")],
 }
-
 
 class MPCPanel(_FormulaPanel):
     def __init__(self) -> None:
@@ -423,9 +384,12 @@ class MPCPanel(_FormulaPanel):
         self._update_formula()
 
     def _update_formula(self) -> None:
-        note = _LOOP_NOTES.get(self.loop.currentText(), "")
+        note = _LOOP_NOTES.get(self.loop.currentText(), [])
         tmpl = _FCS_FORMULA if "FCS" in self.mpc_type.currentText() else _CCS_FORMULA
-        self.set_formula(tmpl.format(loop_note=note))
+        blocks = []
+        for block in tmpl:
+            blocks.extend(note if block is _LOOP_NOTE else [block])
+        self.set_formula(blocks)
 
     def values(self) -> dict:
         return {"mpc_type": self.mpc_type.currentText(),
@@ -443,21 +407,22 @@ class MPCPanel(_FormulaPanel):
 
 
 # ─── 无位置传感器控制 ────────────────────────────────────────
-_SENSORLESS_FORMULA = (
-    _txt("<b>环路结构：控制律仍为 PI 双闭环</b>（同「闭环PI控制」），仅位置/"
-         "转速反馈由观测器估计值 θ̂、ω̂ 替代物理传感器。观测器方程随所选方法"
-         "而异（SMO/EKF/MRAS/HFI，原理详见「传感器详情 / 自检」）。")
-    + _sec("I/f 强拖启动（反电动势法低速不可观）")
-    + _fx("θ<sub>e</sub> = 2π ∫f<sub>start</sub> dt，注入恒流 i<sub>start</sub>",
-          "转速爬升 → 观测器收敛 → 切入闭环")
-    + _sec("参数说明")
-    + _note(
+_SENSORLESS_FORMULA = [
+    Txt("<b>环路结构：控制律仍为 PI 双闭环</b>（同「闭环PI控制」），仅位置/"
+        "转速反馈由观测器估计值 θ̂、ω̂ 替代物理传感器。观测器方程随所选方法"
+        "而异（SMO/EKF/MRAS/HFI，原理详见「传感器详情 / 自检」）。"),
+    Sec("I/f 强拖启动（反电动势法低速不可观）"),
+    Eq(r"\theta_e = 2\pi\int f_{\mathrm{start}}\,\mathrm{d}t", "按启动频率积分"),
+    Eq(r"|i| = i_{\mathrm{start}}", "注入恒定电流"),
+    Txt("转速爬升 → 观测器收敛 → 切入闭环"),
+    Sec("参数说明"),
+    Notes(
         "观测器增益：收敛速度与噪声/抖振的折中，过大易振荡",
         "估算方法：SMO 鲁棒/中高速，EKF 平滑/计算量大，MRAS 参数敏感，"
         "HFI 零低速可用",
         "启动频率：强拖阶段的电角频率斜坡终值",
-        "启动电流：强拖注入电流，需克服负载转矩，过大发热"))
-
+        "启动电流：强拖注入电流，需克服负载转矩，过大发热"),
+]
 
 class SensorlessPanel(_FormulaPanel):
     def __init__(self) -> None:
@@ -480,19 +445,20 @@ class SensorlessPanel(_FormulaPanel):
 
 
 # ─── 双凸极电机专属面板 ──────────────────────────────────────
-_CCC_FORMULA = (
-    _txt("<b>电流斩波控制（CCC）</b>：低速段转矩控制，滞环把相电流限制在带内。")
-    + _sec("滞环开关律（导通区间内）")
-    + _fx("i &lt; i<sub>lower</sub> → 开通（+U<sub>dc</sub>）",
-          "i &gt; i<sub>upper</sub> → 关断（0 或 −U<sub>dc</sub> 续流）")
-    + _sec("磁阻转矩")
-    + _fx("T = ½ · i² · dL(θ)/dθ&nbsp;&nbsp;（电感上升区通电得正转矩）")
-    + _sec("参数说明")
-    + _note(
+_CCC_FORMULA = [
+    Txt("<b>电流斩波控制（CCC）</b>：低速段转矩控制，滞环把相电流限制在带内。"),
+    Sec("滞环开关律（导通区间内）"),
+    Eq(r"i < i_{\mathrm{lower}}\ \Rightarrow\ u = +U_{dc}", "开通"),
+    Eq(r"i > i_{\mathrm{upper}}\ \Rightarrow\ u = 0\ \ \mathrm{or}\ -U_{dc}", "关断续流"),
+    Sec("磁阻转矩"),
+    Eq(r"T = \dfrac{1}{2}\,i^2\,\dfrac{\mathrm{d}L(\theta)}{\mathrm{d}\theta}",
+       "电感上升区通电得正转矩"),
+    Sec("参数说明"),
+    Notes(
         "i<sub>upper</sub>/i<sub>lower</sub>：滞环上下限，差值决定实际斩波频率与纹波",
         "斩波频率：开关频率上限（保护功率管），滞环自然频率高于此值时强制限频",
-        "滞环带宽：带宽小→电流平滑但开关损耗大"))
-
+        "滞环带宽：带宽小→电流平滑但开关损耗大"),
+]
 
 class CurrentChoppingPanel(_FormulaPanel):
     """电流斩波控制（CCC）：低速重载常用，电流滞环维持在 [i_lower, i_upper]。"""
@@ -515,22 +481,22 @@ class CurrentChoppingPanel(_FormulaPanel):
                 "hysteresis_band": self.band.value()}
 
 
-_APC_FORMULA = (
-    _txt("<b>角度位置控制（APC）</b>：中高速段主流方式，按转子位置角决定各相"
-         "开通/关断，导通期内电压全开（单脉冲）。")
-    + _sec("导通逻辑（对每相，考虑提前角）")
-    + _fx("θ<sub>on</sub> − θ<sub>adv</sub> ≤ θ &lt; θ<sub>off</sub> − "
-          "θ<sub>adv</sub>&nbsp;&nbsp;→ 该相通电")
-    + _sec("磁阻转矩")
-    + _fx("T = ½ · i² · dL(θ)/dθ",
-          "平均转矩由 θ<sub>on</sub>/θ<sub>off</sub> 与转速共同决定")
-    + _sec("参数说明")
-    + _note(
+_APC_FORMULA = [
+    Txt("<b>角度位置控制（APC）</b>：中高速段主流方式，按转子位置角决定各相"
+        "开通/关断，导通期内电压全开（单脉冲）。"),
+    Sec("导通逻辑（对每相，考虑提前角）"),
+    Eq(r"\theta_{\mathrm{on}} - \theta_{\mathrm{adv}} \leq \theta"
+       r" < \theta_{\mathrm{off}} - \theta_{\mathrm{adv}}", "该相通电"),
+    Sec("磁阻转矩"),
+    Eq(r"T = \dfrac{1}{2}\,i^2\,\dfrac{\mathrm{d}L(\theta)}{\mathrm{d}\theta}"),
+    Txt("平均转矩由 θ<sub>on</sub>/θ<sub>off</sub> 与转速共同决定。"),
+    Sec("参数说明"),
+    Notes(
         "θ<sub>on</sub>：开通角。提前开通让电流在电感上升区前建立",
         "θ<sub>off</sub>：关断角。过迟→电流拖入电感下降区产生负转矩",
         "θ<sub>adv</sub>：提前角，随转速增大而增大（补偿电流建立时间 ≈ L·i/U）",
-        "限流值：防止低速单脉冲模式下电流失控"))
-
+        "限流值：防止低速单脉冲模式下电流失控"),
+]
 
 class AnglePositionPanel(_FormulaPanel):
     """角度位置控制（APC）：依据转子角度开通/关断，可设提前角。"""
@@ -553,22 +519,20 @@ class AnglePositionPanel(_FormulaPanel):
                 "current_limit": self.i_limit.value()}
 
 
-_VOLTAGE_FORMULA = (
-    _txt("<b>电压 PWM 控制</b>：占空比直接调制绕组平均电压，无电流/转速闭环"
-         "（或仅留外部限流保护）。")
-    + _sec("控制律")
-    + _fx("U<sub>avg</sub> = D · U<sub>dc</sub>",
-          "n ≈ (U<sub>avg</sub> − I·R) / k<sub>e</sub>"
-          "&nbsp;&nbsp;（稳态近似，随负载下垂）")
-    + _sec("参数说明")
-    + _note(
+_VOLTAGE_FORMULA = [
+    Txt("<b>电压 PWM 控制</b>：占空比直接调制绕组平均电压，无电流/转速闭环"
+        "（或仅留外部限流保护）。"),
+    Sec("控制律"),
+    Eq(r"U_{\mathrm{avg}} = D\cdot U_{dc}"),
+    Eq(r"n \approx \dfrac{U_{\mathrm{avg}} - I R}{k_e}", "稳态近似，随负载下垂"),
+    Sec("参数说明"),
+    Notes(
         "直流母线电压 U<sub>dc</sub>：调制的电压基准",
         "占空比 D：0~1，直接决定平均电压",
         "PWM 频率：高→电流纹波小、开关损耗大；典型 10~20 kHz（避开可听频段）",
-        "电压限幅：输出电压上限保护")
-    + _txt("<b style='color:#ff8a65'>⚠ 无电流闭环</b>：堵转/低速时电流仅受"
-           "绕组电阻限制，注意硬件限流。"))
-
+        "电压限幅：输出电压上限保护"),
+    Warn("<b>⚠ 无电流闭环</b>：堵转/低速时电流仅受绕组电阻限制，注意硬件限流。"),
+]
 
 class VoltageControlPanel(_FormulaPanel):
     """电压 PWM 控制：占空比直接调制平均电压，结构简单适合宽调速。"""

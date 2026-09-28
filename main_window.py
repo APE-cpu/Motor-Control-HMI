@@ -210,29 +210,29 @@ class MainWindow(QMainWindow):
         self.current_sampling_page = CurrentSamplingPage(self.comm_manager)
 
         self.stack.addWidget(self.monitor_page)
-        self.stack.addWidget(self.control_page)
+        self.stack.addWidget(self.control_page, "motor_section")
         self.stack.addWidget(self.vector_page, "vector")
-        self.stack.addWidget(self.power_flow_page)
+        self.stack.addWidget(self.power_flow_page, "inverter")
         self.stack.addWidget(self.identify_page, "identify")
-        self.stack.addWidget(self.communication_page)
-        self.stack.addWidget(self.ai_page)
-        self.stack.addWidget(self.edge_ai_page)
+        self.stack.addWidget(self.communication_page, "control_board")
+        self.stack.addWidget(self.ai_page, "windings")
+        self.stack.addWidget(self.edge_ai_page, "encoder")
 
         if enable_training:
             self._startup_step("模型训练页")
             from pages.training_page import TrainingPage
             self.training_page = TrainingPage(self.comm_manager, self.control_page)
-            self.stack.addWidget(self.training_page)
+            self.stack.addWidget(self.training_page, "drive_train")
 
-        self.stack.addWidget(self.current_sampling_page)
-        self.stack.addWidget(self.experiment_page)
-        self.stack.addWidget(self.operation_log_page)
-        self.stack.addWidget(self.manual_page)
+        self.stack.addWidget(self.current_sampling_page, "windings")
+        self.stack.addWidget(self.experiment_page, "drive_train")
+        self.stack.addWidget(self.operation_log_page, "encoder")
+        self.stack.addWidget(self.manual_page, "motor_section")
         self.stack.addWidget(self.digital_twin_page, "twin")
         # 放在物理页面序列末尾，不改动已有页面索引；
         # 导航仍将它归在“分析可视化”分组。
         self.stack.addWidget(self.fourier_page, "fourier")
-        self.stack.addWidget(self.frequency_response_page)
+        self.stack.addWidget(self.frequency_response_page, "inverter")
 
         self._startup_step("组装主界面")
         layout.addWidget(self.nav)

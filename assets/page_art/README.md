@@ -9,6 +9,22 @@
 Qt 在运行时统一为中性灰笔色，以 20% 不透明度绘制并做边缘渐隐。
 绘图区保持不透明，背景没有动画、定时器或零件图集加载。
 
+2026-09-28 第二批：六张线稿铺到其余页面（源文件在 `驭衡线稿参考/2026-09-28`，
+第四张采用修正轴线对中的 v2 版）。提示词见
+[structure_prompts_2026-09-28.json](structure_prompts_2026-09-28.json)、
+[drive_train_v2_prompt.json](drive_train_v2_prompt.json)。
+
+| 文件 | 源图 | 使用页面 |
+|---|---|---|
+| motor_section_structure.png | 01 | 电机控制、使用说明书 |
+| inverter_structure.png | 02 | 功率流、波特图与传函 |
+| encoder_structure.png | 03 | 边缘AI、操作记录 |
+| drive_train_structure.png | 04 v2 | 训练、实验管理 |
+| windings_structure.png | 05 | 诊断助手、电流采样诊断 |
+| control_board_structure.png | 06 | 通信设置 |
+
+监控页保留原有电机背景；矢量、傅里叶、辨识、孪生四页沿用第一批线稿。
+
 以下彩色插图和图集为先前版本留档，当前界面不再引用。
 
 

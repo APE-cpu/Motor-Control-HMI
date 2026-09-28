@@ -86,11 +86,12 @@ def test_frequency_response_page_shows_formulas_and_margin():
     app = _app()
     page = FrequencyResponsePage()
 
-    assert "G<sub>p</sub>" in page._formula_plant.text()
-    assert "C(z)" in page._formula_controller.text()
-    assert "T<sub>raw</sub>" in page._formula_loop.text()
-    assert page._formula_controller.font().family() == "Cambria Math"
-    assert page._formula_controller.font().pointSize() >= 15
+    assert "G_p(z)" in page._formula_plant.plain_text()
+    assert "C(z)" in page._formula_controller.plain_text()
+    assert r"T_{\mathrm{raw}}" in page._formula_loop.plain_text()
+    # 公式为预渲染 SVG，整行显示不折行
+    images = page._formula_controller.formula_images()
+    assert images and all(image.rendered for image in images)
     assert "相位裕度" in page._theory_metrics.text()
     assert "闭环−3 dB带宽" in page._theory_metrics.text()
     assert "1 A=1588" in page._theory_metrics.text()

@@ -193,7 +193,9 @@ def main() -> int:
         splash.close()
         raise
 
-    window.show()
+    # 最大化启动：1280×800 的默认窗口放不下监控页，右侧诊断栏打开时
+    # “启动/停止/紧急停止”会被挤到横向滚动区之外
+    window.showMaximized()
     splash.finish(window)
     # 第一次启动时播放界面总览引导（之后可在说明书页或 Ctrl+K → guide 重看）
     window.assist.maybe_start_first_run_tour()

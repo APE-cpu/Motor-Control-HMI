@@ -241,6 +241,31 @@ def test_palette_navigates_and_manual_opens_cards(window):
     assist.palette.hide_palette()
 
 
+def test_every_task_card_has_recorded_gif():
+    cards = load_cards(resource_path("manual", "cards"), resource_path("使用说明书.md"))
+    missing = [c.id for c in cards if c.group != REFERENCE_GROUP and c.steps and
+               not resource_path("manual", "media", f"{c.id}.gif").is_file()]
+    assert missing == [], "请运行 python tools/generate_manual_gifs.py 重新录制"
+
+
+def test_manual_plays_gif_only_while_visible(window):
+    from PySide6.QtTest import QTest
+    manual = window.manual_page
+    window.assist.open_card("rl-identification")
+    QTest.qWait(300)
+    assert manual.media_path("rl-identification") is not None
+    assert manual.media_playing
+    assert manual._media.height() <= 320                  # 不挤占正文
+    manual._media_toggle.setChecked(False)               # 收起
+    assert not manual.media_playing and not manual._media.isVisibleTo(manual)
+    manual._media_toggle.setChecked(True)
+    assert manual.media_playing
+    window.assist.show_page("monitor")                   # 离开说明书页即暂停
+    QTest.qWait(300)
+    assert not manual.media_playing
+    assert manual.open_card("ref-01") and not manual._media_toggle.isVisibleTo(manual)
+
+
 def test_guide_follows_card_steps_without_clicking(window):
     assist = window.assist
     clicks = []
@@ -248,6 +273,12 @@ def test_guide_follows_card_steps_without_clicking(window):
     assert assist.start_guide("rl-identification") is None
     guide = assist.guide
     assert guide.active and guide.current_step.control_id == "monitor.probe_amplitude"
+    # 目标控件在未选中的“在线辨识”标签页里：引导要自动切过去并真正高亮
+    from PySide6.QtTest import QTest
+    QTest.qWait(450)
+    tabs = window.monitor_page._curve_tabs
+    assert tabs.currentWidget().isAncestorOf(window.monitor_page._probe_amplitude)
+    assert not guide._hole.isNull()
     seen = []
     for _ in range(10):
         if not guide.active:

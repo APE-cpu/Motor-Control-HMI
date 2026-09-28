@@ -115,7 +115,8 @@ def test_main_window_theme_switch_styles_visible_page_then_new_page():
         assert next_page.styleSheet() != manager._stylesheet_for(target)
         window.hide()  # 无界面测试不启动页面过渡动画
         window._switch_page(3)
-        assert next_page.styleSheet() == manager._stylesheet_for(target)
+        # 带线稿的页面在主题样式后追加线稿透明底样式
+        assert next_page.styleSheet().startswith(manager._stylesheet_for(target))
     finally:
         manager.apply_theme(original_theme, persist=False)
         window.close()

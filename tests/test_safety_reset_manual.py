@@ -13,6 +13,7 @@ from main_window import MainWindow
 from pages.control_page import ControlPage
 from pages.power_flow_page import PowerFlowPage
 from pages.vector_page import VectorPage, _PG_OK
+from widgets.formula_view import FormulaImage
 
 
 def _app():
@@ -133,8 +134,9 @@ def test_功率页显示计算式且系统导航提供说明书(tmp_path, monkey
     power_page = PowerFlowPage(CommManager())
     power_page._chk_enabled.setChecked(True)
     texts = "\n".join(label.text() for label in power_page.findChildren(QLabel))
-    assert "P_inv = 3/2" in texts
-    assert "P_brake = V_dc²" in texts
+    formulas = "\n".join(image.latex for image in power_page.findChildren(FormulaImage))
+    assert r"P_{\mathrm{inv}} = \dfrac{3}{2}" in formulas
+    assert r"P_{\mathrm{brake}} = \dfrac{V_{dc}^2}" in formulas
     frame = TelemetryFrame()
     frame.powers = {
         "supply": 100.0, "loss_src": 5.0, "inv": 90.0,

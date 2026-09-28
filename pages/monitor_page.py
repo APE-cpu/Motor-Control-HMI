@@ -10,7 +10,7 @@ from PySide6.QtGui import QColor, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox, QDialog, QFileDialog, QGridLayout, QGroupBox, QHBoxLayout,
     QDoubleSpinBox, QLabel, QMessageBox, QProgressBar, QPushButton, QSpinBox, QSizePolicy,
-    QTabWidget, QVBoxLayout, QWidget,
+    QTabWidget, QToolButton, QVBoxLayout, QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
@@ -46,8 +46,12 @@ def _make_curve_panel(curve: TrendCurve, title: str) -> QWidget:
     curve.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
     v = QVBoxLayout(panel)
     v.setContentsMargins(0, 0, 0, 0)
-    btn = QPushButton("弹出 ↗")
-    btn.setFixedHeight(22)
+    btn = QToolButton()
+    btn.setText("↗ 弹出")
+    btn.setToolTip(f"在独立窗口中查看“{title}”")
+    btn.setAutoRaise(True)
+    btn.setFixedHeight(20)
+    btn.setStyleSheet("QToolButton { font-size: 11px; padding: 0 6px; }")
 
     def _popout():
         win = QWidget(None, Qt.Window)
@@ -1274,7 +1278,9 @@ class MonitorPage(QWidget):
         # 曲线页占用监控页剩余高度，不把内部 pyqtgraph 的
         # 默认高度传递给主窗口。
         tabs.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Ignored)
-        tabs.setMinimumHeight(0)
+        # 保底 260 px，避免窗口不够高时曲线被压成一条线；
+        # 页面建议高度约 763 px，1280×800 窗口（内容区 778 px）下仍不出现纵向滚动
+        tabs.setMinimumHeight(260)
         tabs.addTab(trend_tab, "📈 趋势曲线（最近 1000 点）")
         tabs.addTab(sensor_tab, "🧭 传感器波形")
         tabs.addTab(power_tab, "⚡ 转矩与电压")

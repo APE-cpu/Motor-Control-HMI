@@ -7,8 +7,8 @@ from __future__ import annotations
 
 import re
 
-from PySide6.QtCore import QUrl, Qt, Signal
-from PySide6.QtGui import QDesktopServices, QKeySequence, QShortcut, QTextDocument
+from PySide6.QtCore import QSize, QUrl, Qt, Signal
+from PySide6.QtGui import QDesktopServices, QKeySequence, QMovie, QShortcut, QTextDocument
 from PySide6.QtWidgets import (
     QHBoxLayout, QLabel, QLineEdit, QPushButton, QSplitter, QTextBrowser,
     QToolButton, QTreeWidget, QTreeWidgetItem, QVBoxLayout, QWidget,
@@ -24,6 +24,7 @@ _CARD_LINK = re.compile(r"\[\[([A-Za-z0-9_\-]+)\]\]")
 _ANCHOR_COLOR = re.compile(r'(<a [^>]*>\s*<span style="[^"]*?)color:#[0-9a-fA-F]{6}')
 _LINK_COLOR = "#4fc3f7"
 _SECTION_ORDER = ("预期", "失败时")
+_MEDIA_MAX_HEIGHT = 320          # 动图最大显示高度，给正文留出空间
 
 
 def _set_markdown(browser: QTextBrowser, text: str) -> None:
@@ -44,6 +45,9 @@ class ManualPage(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self._cards_dir = resource_path("manual", "cards")
+        self._media_dir = resource_path("manual", "media")
+        self._movie: QMovie | None = None
+        self._media_expanded = True
         self._legacy_path = resource_path("使用说明书.md")
         self.cards: list[Card] = []
         self._by_id: dict[str, Card] = {}
@@ -99,6 +103,17 @@ class ManualPage(QWidget):
         actions.addWidget(self._btn_locate)
         actions.addWidget(self._btn_guide)
         actions.addStretch(1)
+        # 动图演示：由 tools/generate_manual_gifs.py 按卡片步骤从真实界面录制
+        self._media_toggle = QToolButton()
+        self._media_toggle.setCheckable(True)
+        self._media_toggle.setChecked(True)
+        self._media_toggle.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        self._media_toggle.toggled.connect(self._toggle_media)
+        actions.addWidget(self._media_toggle)
+        self._media = QLabel()
+        self._media.setAlignment(Qt.AlignLeft | Qt.AlignTop)
+        self._media.setToolTip("按卡片步骤录制的界面演示；可点右上方按钮收起")
+        self._media.hide()
         self._browser = QTextBrowser()
         self._browser.setOpenLinks(False)
         self._browser.anchorClicked.connect(self._on_anchor)
@@ -119,6 +134,7 @@ class ManualPage(QWidget):
         right_layout.addWidget(self._card_title)
         right_layout.addWidget(self._card_meta)
         right_layout.addLayout(actions)
+        right_layout.addWidget(self._media)
         right_layout.addWidget(self._browser, 3)
         right_layout.addWidget(self._principle_toggle)
         right_layout.addWidget(self._principle, 2)
@@ -217,6 +233,7 @@ class ManualPage(QWidget):
         self._btn_guide.setVisible(is_task)
         self._btn_locate.setEnabled(bool(card.page or card.controls))
         self._btn_guide.setEnabled(bool(card.steps))
+        self._load_media(card)
         _set_markdown(self._browser, self._link_cards(self._body_markdown(card)))
         principle = card.sections.get(PRINCIPLE_SECTION, "")
         self._principle_toggle.setVisible(bool(principle))
@@ -228,6 +245,78 @@ class ManualPage(QWidget):
     @property
     def current_card(self) -> Card | None:
         return self._current
+
+    # ------------------------------------------------------------ 动图
+    def media_path(self, card_id: str):
+        path = self._media_dir / f"{card_id}.gif"
+        return path if path.is_file() else None
+
+    @property
+    def media_playing(self) -> bool:
+        return (self._movie is not None and self._media.isVisibleTo(self) and
+                self._movie.state() == QMovie.Running)
+
+    def _load_media(self, card: Card) -> None:
+        if self._movie is not None:
+            self._movie.stop()
+            self._media.setMovie(None)
+            self._movie.deleteLater()
+            self._movie = None
+        path = self.media_path(card.id)
+        self._media_toggle.setVisible(path is not None)
+        if path is None:
+            self._media.hide()
+            return
+        self._movie = QMovie(str(path), parent=self)
+        self._movie.setCacheMode(QMovie.CacheAll)
+        self._media.setMovie(self._movie)
+        self._fit_media()
+        self._toggle_media(self._media_expanded)
+
+    def _fit_media(self) -> None:
+        if self._movie is None:
+            return
+        frame = self._movie.frameRect().size()
+        if frame.isEmpty():
+            self._movie.jumpToFrame(0)
+            frame = self._movie.currentImage().size()
+        if frame.isEmpty():
+            return
+        width = max(200, self._browser.width())
+        scale = min(width / frame.width(), _MEDIA_MAX_HEIGHT / frame.height())
+        size = QSize(int(frame.width() * scale), int(frame.height() * scale))
+        self._movie.setScaledSize(size)
+        self._media.setFixedHeight(size.height())
+
+    def _toggle_media(self, expanded: bool) -> None:
+        self._media_expanded = expanded
+        if self._media_toggle.isChecked() != expanded:
+            self._media_toggle.setChecked(expanded)
+        self._media_toggle.setArrowType(Qt.DownArrow if expanded else Qt.RightArrow)
+        self._media_toggle.setText("动图演示（点击收起）" if expanded else "动图演示（点击展开）")
+        has_movie = self._movie is not None
+        self._media.setVisible(expanded and has_movie)
+        if has_movie:
+            if expanded and self.isVisible():
+                self._movie.start()
+            else:
+                self._movie.setPaused(True)
+
+    def resizeEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().resizeEvent(event)
+        self._fit_media()
+
+    def showEvent(self, event) -> None:  # noqa: N802 - Qt API
+        super().showEvent(event)
+        if self._movie is not None and self._media_expanded:
+            self._fit_media()
+            self._movie.start()
+
+    def hideEvent(self, event) -> None:  # noqa: N802 - Qt API
+        # 离开说明书页就暂停动图，避免后台持续解码占用 CPU
+        if self._movie is not None:
+            self._movie.setPaused(True)
+        super().hideEvent(event)
 
     @staticmethod
     def _meta_html(card: Card) -> str:

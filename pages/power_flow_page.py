@@ -19,6 +19,7 @@ from PySide6.QtWidgets import (
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
+from widgets.formula_view import Eq, FormulaImage
 from widgets.trend_curve import TrendCurve
 
 _BOX_FILL = QColor("#37474f")
@@ -33,11 +34,12 @@ class _CalculationPanel(QGroupBox):
     """能量链旁的公式、实时数值和守恒诊断。"""
 
     _FORMULAS = (
-        ("逆变器电气输入", "P_inv = 3/2 · (v_d · i_d + v_q · i_q)"),
-        ("定子铜损", "P_Cu = 3/2 · R_s · (i_d² + i_q²)"),
-        ("电磁功率", "P_em = T_e · ω_m"),
-        ("转轴动能", "P_kin = P_em − P_fric/load"),
-        ("电源与制动", "P_src = V_src · I_src    P_brake = V_dc² / R_brake"),
+        ("逆变器电气输入", Eq(r"P_{\mathrm{inv}} = \dfrac{3}{2}\,(v_d i_d + v_q i_q)")),
+        ("定子铜损", Eq(r"P_{\mathrm{Cu}} = \dfrac{3}{2}\,R_s\,(i_d^2 + i_q^2)")),
+        ("电磁功率", Eq(r"P_{\mathrm{em}} = T_e\,\omega_m")),
+        ("转轴动能", Eq(r"P_{\mathrm{kin}} = P_{\mathrm{em}} - P_{\mathrm{fric/load}}")),
+        ("电源与制动", Eq(r"P_{\mathrm{src}} = V_{\mathrm{src}}\,I_{\mathrm{src}},\quad"
+                          r"P_{\mathrm{brake}} = \dfrac{V_{dc}^2}{R_{\mathrm{brake}}}")),
     )
     _VALUES = (
         ("supply", "电源输入"), ("inv", "逆变器输入"),
@@ -62,12 +64,7 @@ class _CalculationPanel(QGroupBox):
             layout.setSpacing(2)
             heading = QLabel(title)
             heading.setStyleSheet("color: #b8c6d8; font-weight: 600; border: none;")
-            formula = QLabel(equation)
-            formula.setTextFormat(Qt.PlainText)
-            formula.setStyleSheet(
-                "color: #80cbc4; font-family: Consolas, 'Courier New', monospace; "
-                "font-size: 12px; border: none;")
-            formula.setWordWrap(True)
+            formula = FormulaImage(equation.latex)
             layout.addWidget(heading)
             layout.addWidget(formula)
             root.addWidget(card)

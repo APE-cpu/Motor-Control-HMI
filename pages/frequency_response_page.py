@@ -5,7 +5,6 @@ import math
 from typing import Callable
 
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
 from PySide6.QtWidgets import (
     QCheckBox, QComboBox, QDoubleSpinBox, QFormLayout, QGridLayout, QGroupBox,
     QHeaderView, QHBoxLayout, QLabel, QMessageBox, QPushButton, QSpinBox,
@@ -18,6 +17,54 @@ try:
     _PLOT_OK = True
 except Exception:  # pragma: no cover - 依赖缺失时页面仍能打开
     _PLOT_OK = False
+
+from widgets.formula_view import Eq, FormulaSheet, Txt
+
+# ─── 模型公式（LaTeX，预渲染为 SVG；说明文字与公式分开） ─────────────
+_FIRMWARE_FORMULAS = {
+    "scale": [
+        Eq(r"I_{\mathrm{digit}} = K_I\,I_A"),
+        Eq(r"K_I = \dfrac{65536\,R_{\mathrm{shunt}}\,G}{V_{\mathrm{ref}}}"),
+        Eq(r"V = K_V\,V_{\mathrm{digit}}"),
+        Eq(r"K_V = \dfrac{V_{\mathrm{bus}}}{\sqrt{3}\cdot 32768}"),
+    ],
+    "controller": [
+        Eq(r"C(z) = K_I K_V\left[\dfrac{Kp_d}{D_p}"
+           r" + \dfrac{Ki_d / D_i}{1 - z^{-1}}\right]"),
+        Txt("积分器每个 16 kHz 控制周期累加一次当前误差。"),
+    ],
+    "plant": [
+        Eq(r"a = e^{-R\,T_s/L},\qquad b = \dfrac{1 - a}{R}"),
+        Eq(r"G_p(z) = \dfrac{b\,z^{-1}}{1 - a\,z^{-1}}"),
+        Txt("z<sup>−1</sup> 表示 ZOH 对象的一拍状态更新。"),
+    ],
+    "loop": [
+        Eq(r"H_f(z) = \dfrac{\alpha}{1 - (1 - \alpha)\,z^{-1}}"),
+        Eq(r"L(z) = C(z)\,G_p(z)\,z^{-d}\,H_f(z)"),
+        Eq(r"T_{\mathrm{raw}}(z) = \dfrac{C\,G_p\,z^{-d}}{1 + L(z)}"),
+        Eq(r"T_{\mathrm{fb}}(z) = H_f(z)\,T_{\mathrm{raw}}(z)"),
+    ],
+}
+
+_CONTINUOUS_FORMULAS = {
+    "scale": [
+        Txt("连续域模型直接使用 SI 量纲。"),
+        Eq(r"e_i\ [\mathrm{A}]\ \longrightarrow\ v_q\ [\mathrm{V}]", "电流误差 → q 轴电压"),
+    ],
+    "controller": [
+        Eq(r"C(s) = K_p + \dfrac{K_i}{s}"),
+        Eq(r"K_p = L\,\omega_c,\qquad K_i = R\,\omega_c"),
+    ],
+    "plant": [
+        Eq(r"G_p(s) = \dfrac{1}{L_q\,s + R_s}"),
+        Eq(r"G_d(s) = e^{-s\,T_d}"),
+    ],
+    "loop": [
+        Eq(r"H_f(s) = \dfrac{\omega_f}{s + \omega_f}"),
+        Eq(r"L(s) = C(s)\,G_p(s)\,G_d(s)\,H_f(s)"),
+        Eq(r"T(s) = \dfrac{C\,G_p\,G_d}{1 + L(s)}"),
+    ],
+}
 
 
 def _crossing_log_frequency(frequency, values, target=0.0):
@@ -606,7 +653,7 @@ class FrequencyResponsePage(QWidget):
         formula = QGroupBox("模型公式")
         formula_layout = QGridLayout(formula)
 
-        def formula_card(title_text: str) -> tuple[QGroupBox, QLabel]:
+        def formula_card(title_text: str) -> tuple[QGroupBox, FormulaSheet]:
             card = QGroupBox(title_text)
             card.setStyleSheet(
                 "QGroupBox {"
@@ -620,19 +667,10 @@ class FrequencyResponsePage(QWidget):
                 " background-color:#1b2636; border-radius:6px;"
                 "}")
             card_layout = QVBoxLayout(card)
-            card_layout.setContentsMargins(16, 14, 16, 12)
-            label = QLabel()
-            label.setTextFormat(Qt.RichText)
-            label.setWordWrap(True)
-            label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-            formula_font = QFont("Cambria Math", 15)
-            formula_font.setWeight(QFont.DemiBold)
-            label.setFont(formula_font)
-            label.setMinimumHeight(78)
-            label.setStyleSheet(
-                "color:#f1f7fb; line-height:1.55; letter-spacing:0.2px;")
-            card_layout.addWidget(label)
-            return card, label
+            card_layout.setContentsMargins(12, 14, 12, 10)
+            sheet = FormulaSheet(compact=True)
+            card_layout.addWidget(sheet)
+            return card, sheet
 
         scale_card, self._formula_scale = formula_card("① 量纲换算")
         controller_card, self._formula_controller = formula_card("② 离散控制器")
@@ -642,6 +680,9 @@ class FrequencyResponsePage(QWidget):
         formula_layout.addWidget(controller_card, 0, 1)
         formula_layout.addWidget(plant_card, 1, 0)
         formula_layout.addWidget(loop_card, 1, 1)
+        # 两列等宽：公式放不下时各自等比缩小，不因某条公式较长挤占另一列
+        formula_layout.setColumnStretch(0, 1)
+        formula_layout.setColumnStretch(1, 1)
 
         results = QGroupBox("计算结果")
         results_layout = QVBoxLayout(results)
@@ -1230,6 +1271,14 @@ class FrequencyResponsePage(QWidget):
         self._sync_model_controls()
         self._calculate_theory()
 
+    def _show_formulas(self, formulas: dict) -> None:
+        for key, sheet in (("scale", self._formula_scale),
+                           ("controller", self._formula_controller),
+                           ("plant", self._formula_plant),
+                           ("loop", self._formula_loop)):
+            if sheet.blocks() != formulas[key]:
+                sheet.set_blocks(formulas[key])
+
     def _calculate_theory(self) -> None:
         if not _PLOT_OK:
             return
@@ -1248,25 +1297,7 @@ class FrequencyResponsePage(QWidget):
                     self._filter_alpha_q15.value())
                 self._kp.setValue(result["kp_physical"])
                 self._ki.setValue(result["ki_continuous_equivalent"])
-                self._formula_scale.setText(
-                    "I<sub>digit</sub>=K<sub>I</sub>·I<sub>A</sub><br>"
-                    "K<sub>I</sub>=65536·R<sub>shunt</sub>·G/V<sub>ref</sub>"
-                    "<br><br>V=K<sub>V</sub>·V<sub>digit</sub><br>"
-                    "K<sub>V</sub>=V<sub>bus</sub>/(√3·32768)")
-                self._formula_controller.setText(
-                    "C(z)=K<sub>I</sub>K<sub>V</sub>·[ Kp<sub>d</sub>/D<sub>p</sub>"
-                    "<br>＋ (Ki<sub>d</sub>/D<sub>i</sub>)/(1−z<sup>−1</sup>) ]"
-                    "<br><br>积分器每个16 kHz控制周期累加一次当前误差。")
-                self._formula_plant.setText(
-                    "a=e<sup>−R·T<sub>s</sub>/L</sup>　，　b=(1−a)/R"
-                    "<br><br>G<sub>p</sub>(z)=b·z<sup>−1</sup> / "
-                    "(1−a·z<sup>−1</sup>)"
-                    "<br><br>z<sup>−1</sup>表示ZOH对象的一拍状态更新。")
-                self._formula_loop.setText(
-                    "H<sub>f</sub>(z)=α / [1−(1−α)z<sup>−1</sup>]"
-                    "<br><br>L(z)=C(z)G<sub>p</sub>(z)z<sup>−d</sup>H<sub>f</sub>(z)"
-                    "<br>T<sub>raw</sub>(z)=CG<sub>p</sub>z<sup>−d</sup> / [1＋L(z)]"
-                    "<br>T<sub>fb</sub>(z)=H<sub>f</sub>(z)T<sub>raw</sub>(z)")
+                self._show_formulas(_FIRMWARE_FORMULAS)
             else:
                 if self._auto_pi.isChecked():
                     omega_c = 2.0 * math.pi * self._design_bw.value()
@@ -1280,20 +1311,7 @@ class FrequencyResponsePage(QWidget):
                     self._delay_us.value() * 1e-6,
                     self._filter_fc.value() if self._feedback_filter.isChecked()
                     else None)
-                self._formula_scale.setText(
-                    "连续域模型直接使用SI量纲。<br><br>"
-                    "输入：电流误差 [A]<br>输出：q轴电压 [V]")
-                self._formula_controller.setText(
-                    "C(s)=K<sub>p</sub>＋K<sub>i</sub>/s"
-                    "<br><br>K<sub>p</sub>=L·ω<sub>c</sub>"
-                    "<br>K<sub>i</sub>=R·ω<sub>c</sub>")
-                self._formula_plant.setText(
-                    "G<sub>p</sub>(s)=1/(L<sub>q</sub>s＋R<sub>s</sub>)"
-                    "<br><br>G<sub>d</sub>(s)=e<sup>−sT<sub>d</sub></sup>")
-                self._formula_loop.setText(
-                    "H<sub>f</sub>(s)=ω<sub>f</sub>/(s＋ω<sub>f</sub>)"
-                    "<br><br>L(s)=C(s)G<sub>p</sub>(s)G<sub>d</sub>(s)H<sub>f</sub>(s)"
-                    "<br>T(s)=CG<sub>p</sub>G<sub>d</sub>/[1＋L(s)]")
+                self._show_formulas(_CONTINUOUS_FORMULAS)
         except ValueError as exc:
             QMessageBox.warning(self, "模型无法计算", str(exc))
             return
