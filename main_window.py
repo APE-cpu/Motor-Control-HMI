@@ -34,6 +34,7 @@ from pages.fourier_page import FourierAnalysisPage
 from pages.frequency_response_page import FrequencyResponsePage
 from widgets.side_nav import SideNav
 from widgets.appearance_bar import AppearanceBar
+from widgets.assist import install_assist_features
 from widgets.page_artwork import IllustratedPageFrame
 from ui_theme import APP_NAME, APP_SUBTITLE, appearance_manager
 from communications.comm_manager import CommManager, decode_motor_fault_code
@@ -247,6 +248,8 @@ class MainWindow(QMainWindow):
         appearance.register_window(self)
         appearance.themeChanged.connect(self._style_visible_theme)
         appearance.apply_theme(appearance.theme_id, persist=False)
+        # Ctrl+K 命令面板、F1 页面帮助、说明书定位与新手引导
+        install_assist_features(self)
         logger.log("软件启动")
 
     def _style_visible_theme(self, _theme_id: str) -> None:

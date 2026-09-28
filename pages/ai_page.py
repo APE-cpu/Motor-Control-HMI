@@ -210,7 +210,8 @@ class AIPage(QWidget):
         self._firmware_config_cache = (
             dict(firmware_config_provider())
             if callable(firmware_config_provider) else {})
-        self._diagnostic_store = DiagnosticTelemetryStore(max_samples=5000)
+        # 16 kHz 下约 4 s；原 5000 点在 16 kHz 只有 0.31 s，FFT 分辨率仅 3.2 Hz
+        self._diagnostic_store = DiagnosticTelemetryStore(max_samples=64000)
         self._tool_registry = create_read_only_registry()
         self._tool_context = ToolContext(
             comm=comm,

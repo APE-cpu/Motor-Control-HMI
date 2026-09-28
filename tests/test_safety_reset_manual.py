@@ -154,7 +154,9 @@ def test_功率页显示计算式且系统导航提供说明书(tmp_path, monkey
         lambda *parts: tmp_path.joinpath(*parts))
     window = MainWindow(enable_training=False)
     assert window.stack.indexOf(window.manual_page) == 11
-    assert "数字孪生实验标准流程" in window.manual_page._browser.toPlainText()
+    # 说明书改为任务卡后，旧版各章节保留为可搜索的参考卡
+    window.manual_page.search("数字孪生实验标准流程")
+    assert "数字孪生实验标准流程" in window.manual_page.current_card.title
     window.close()
     window.deleteLater()
 

@@ -85,6 +85,7 @@ if "%MODE%"=="lite" (
       --add-data "assets;assets" ^
       --add-data "README.md;." ^
       --add-data "使用说明书.md;." ^
+      --add-data "manual;manual" ^
       --add-data "软件介绍.md;." ^
       --add-data "motor_anomaly.onnx;." ^
       %ZLG_DLL% ^
@@ -110,6 +111,7 @@ if "%MODE%"=="lite" (
       --add-data "assets;assets" ^
       --add-data "README.md;." ^
       --add-data "使用说明书.md;." ^
+      --add-data "manual;manual" ^
       --add-data "软件介绍.md;." ^
       --add-data "motor_anomaly.onnx;." ^
       --collect-data rapidocr_onnxruntime ^

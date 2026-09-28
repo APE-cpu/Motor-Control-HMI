@@ -195,6 +195,8 @@ def main() -> int:
 
     window.show()
     splash.finish(window)
+    # 第一次启动时播放界面总览引导（之后可在说明书页或 Ctrl+K → guide 重看）
+    window.assist.maybe_start_first_run_tour()
     return app.exec()
 
 
