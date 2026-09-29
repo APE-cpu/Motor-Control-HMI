@@ -126,10 +126,12 @@ bool TelemetryProcessor::ingest_f1(const std::uint8_t* payload,
     constexpr std::uint16_t kF1Format30Tag = 0xF130U;
     constexpr std::uint16_t kF1Format32Tag = 0xF132U;
     constexpr std::uint16_t kF1Format40Tag = 0xF140U;
+    // Wildfire JIAOYANG board overrides MCSDK's weak VBS_GetAvBusVoltage_V
+    // (yh_bus_voltage_sensor.c): Vbus = (adc/65536 * 3.3 - 1.65) * 37.
+    // The generated VBUS_PARTITIONING_FACTOR=0.027 is NOT used on this board.
     constexpr double kBusAdcReferenceV = 3.30;
-    // Generated F407 power-stage configuration:
-    // VBUS_PARTITIONING_FACTOR = Vadc/Vbus = 0.0270 (no midpoint bias).
-    constexpr double kBusPartitioningFactor = 0.0270;
+    constexpr double kBusBiasV = 1.65;
+    constexpr double kBusGain = 37.0;
     // TIM1 runs at 168 MHz and center-aligned PWM is 16 kHz.  MCSDK stores
     // compare values against Half_PWMPeriod = PWMperiod/2 = 5250 counts.
     constexpr double kPwmHalfPeriodCounts = 5250.0;
@@ -233,8 +235,8 @@ bool TelemetryProcessor::ingest_f1(const std::uint8_t* payload,
             const auto bus_offset = sample_size == 40U ? 34U : 26U;
             const double bus_adc = static_cast<double>(
                 read_u16_le(sample + bus_offset));
-            result.vbus_v = bus_adc / 65536.0 * bus_reference_v /
-                            kBusPartitioningFactor;
+            result.vbus_v = (bus_adc / 65536.0 * kBusAdcReferenceV - kBusBiasV) *
+                            kBusGain;
             if (sample_size == 40U) {
                 result.duty_a = read_u16_le(sample + 28U);
                 result.duty_b = read_u16_le(sample + 30U);

@@ -2,13 +2,14 @@
 from __future__ import annotations
 
 import json
+import threading
 from datetime import datetime
 from dataclasses import asdict, is_dataclass
 from enum import Enum
 from pathlib import Path
 from typing import Callable
 
-from PySide6.QtCore import QTimer, Qt, QUrl
+from PySide6.QtCore import QTimer, Qt, QUrl, Signal
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import (
     QComboBox, QDialog, QDoubleSpinBox, QFormLayout, QGroupBox, QHBoxLayout, QLabel,
@@ -31,7 +32,9 @@ from logs.operation_logger import logger
 from runtime_paths import writable_path
 from widgets.historical_telemetry_dialog import HistoricalTelemetryDialog
 from widgets.experiment_conclusion_dialog import ExperimentConclusionDialog
-from widgets.media_recorder import MediaPanel
+from core.dyno_load import LOAD_MODES, dyno_setting, save_dyno_setting
+from experiments.media_subtitles import write_session_subtitles
+from widgets.media_recorder import MediaPanel, read_media_manifest
 
 
 _STATUS_TEXT = {
@@ -57,6 +60,8 @@ def _default_experiment_name() -> str:
 
 
 class ExperimentPage(QWidget):
+    loadModeChanged = Signal(str)      # 对拖工况变化（主窗口同步到功率流页）
+
     def __init__(self, comm: CommManager, *, software_version: str = "",
                  storage_root: str | Path | None = None,
                  snapshot_provider: Callable[[], dict] | None = None,
@@ -122,6 +127,11 @@ class ExperimentPage(QWidget):
         tabs.addTab(self.media_panel, "音视频")
         self.media_panel.recordingChanged.connect(
             lambda on: tabs.setTabText(2, "音视频 ● 录制中" if on else "音视频"))
+        from pages.experiment_log_page import ExperimentLogPage
+        self.log_page = ExperimentLogPage(
+            self.manager.repository, conclusion_updater=self.manager.update_conclusion,
+            embedded=True)
+        tabs.addTab(self.log_page, "实验日志")
         root.addWidget(tabs, 1)
         self._workspace_tabs = tabs
 
@@ -145,6 +155,8 @@ class ExperimentPage(QWidget):
         for spin in (self._rated_power, self._bus_voltage):
             spin.valueChanged.connect(lambda _value: self._draft_timer.start())
         self._source.currentIndexChanged.connect(lambda _index: self._draft_timer.start())
+        self._load_mode.currentIndexChanged.connect(lambda _index: self._draft_timer.start())
+        self._load_mode.currentIndexChanged.connect(self._on_load_mode_changed)
         self._refresh_runtime_state()
         self._refresh_heartbeat()
         self._refresh_status()
@@ -175,6 +187,13 @@ class ExperimentPage(QWidget):
         form.addRow("实验目的", self._purpose)
         form.addRow("操作者", self._operator)
         form.addRow("数据来源", self._source)
+        self._load_mode = QComboBox()
+        for key, text in LOAD_MODES.items():
+            self._load_mode.addItem(text, key)
+        self._load_mode.setToolTip(
+            "对拖实验时负载电机驱动器的状态。上电未启动时三相 50% 占空比、绕组等效短接，"
+            "负载电机会产生随转速增大的制动转矩；实验日志据此计算短路制动模型并与实测对比。")
+        form.addRow("对拖负载", self._load_mode)
         self._draft_status = QLabel("实验信息自动保存")
         form.addRow("", self._draft_status)
         return box
@@ -474,6 +493,11 @@ class ExperimentPage(QWidget):
                 }
             extra = dict(device_data.get("extra", {}))
             extra.update(equipment_extra)
+            if self._load_mode.currentData() != "unknown":
+                _mode, load_inertia = dyno_setting()
+                extra["dyno_load"] = {"mode": self._load_mode.currentData(),
+                                      "text": self._load_mode.currentText(),
+                                      "load_inertia_kgm2": load_inertia}
             extra["hardware_version"] = protocol.get("hardware_version", "")
             extra["device_id"] = protocol.get("device_id", "")
             device = DeviceProfile(
@@ -533,6 +557,7 @@ class ExperimentPage(QWidget):
             self._stop_media()
             self._capture_runtime_context("end")
             self._last_session = self.manager.complete()
+            self._write_subtitles(session.experiment_id)
             self._set_message(f"实验 {session.experiment_id} 已保存。")
             self._name.setText(_default_experiment_name())   # 下一次实验默认用新的日期时间
         except Exception as exc:
@@ -558,6 +583,7 @@ class ExperimentPage(QWidget):
             self._stop_media()
             self._capture_runtime_context("end")
             self._last_session = self.manager.abort("用户从实验管理页中止")
+            self._write_subtitles(session.experiment_id)
             self._set_message(f"实验 {session.experiment_id} 已中止，已有数据已保留。",
                               error=True)
             self._name.setText(_default_experiment_name())
@@ -603,6 +629,32 @@ class ExperimentPage(QWidget):
             self._set_message(f"实验 {session.experiment_id} 正在记录；录像未启动："
                               f"{self.media_panel.status.text()}", error=True)
 
+    def _on_load_mode_changed(self, *_args) -> None:
+        """对拖工况与功率流页共用（QSettings）；“未记录”不覆盖台架设置。"""
+        mode = self._load_mode.currentData()
+        if mode != "unknown":
+            save_dyno_setting(mode)
+        self.loadModeChanged.emit(mode)
+
+    def set_load_mode(self, mode: str) -> None:
+        index = self._load_mode.findData(mode)
+        if index >= 0 and index != self._load_mode.currentIndex():
+            self._load_mode.setCurrentIndex(index)
+
+    def _write_subtitles(self, experiment_id: str) -> None:
+        """实验结束后在录像旁写 .srt 字幕（日期、转速、电流、关键事件）；后台执行，失败不影响实验。"""
+        media_dir = self.manager.repository.session_dir(experiment_id) / "media"
+        if not read_media_manifest(media_dir):
+            return
+
+        def work() -> None:
+            try:
+                write_session_subtitles(self.manager.repository, experiment_id)
+            except Exception as exc:  # noqa: BLE001 - 字幕只是附加信息
+                logger.log("录像字幕", f"{experiment_id} 字幕写入失败：{exc}")
+
+        threading.Thread(target=work, name="media-subtitles", daemon=True).start()
+
     def _stop_media(self) -> None:
         """实验结束前停止录制，并把录制起止写进实验事件（结束后就不能再写事件）。"""
         entry = self.media_panel.stop()
@@ -625,7 +677,7 @@ class ExperimentPage(QWidget):
         self._btn_add_marker.setEnabled(running)
         for widget in (
             self._name, self._purpose, self._operator, self._device_name,
-            self._rated_power, self._bus_voltage, self._source,
+            self._rated_power, self._bus_voltage, self._source, self._load_mode,
         ):
             widget.setEnabled(not running)
         for widget in (
@@ -831,6 +883,9 @@ class ExperimentPage(QWidget):
             index = self._source.findData(data.get("source", "real"))
             if index >= 0:
                 self._source.setCurrentIndex(index)
+            index = self._load_mode.findData(data.get("load_mode", "unknown"))
+            if index >= 0:
+                self._load_mode.setCurrentIndex(index)
         except (OSError, ValueError, TypeError, AttributeError) as exc:
             self._draft_status.setText(f"草稿读取失败：{exc}")
 
@@ -841,6 +896,7 @@ class ExperimentPage(QWidget):
                 "operator": self._operator.text(), "device_name": self._device_name.text(),
                 "rated_power": self._rated_power.value(),
                 "bus_voltage": self._bus_voltage.value(), "source": self._source.currentData(),
+                "load_mode": self._load_mode.currentData(),
             })
             self._draft_status.setText("实验信息已保存 · 操作者下次自动恢复")
         except OSError as exc:

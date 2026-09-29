@@ -456,6 +456,15 @@ def load_rls_capture_csv(path: str | Path) -> dict[str, object]:
         "applied_voltage_source_direct": has_applied_voltage,
         **columns,
     }
+    # 2026-09-29 前保存的文件母线电压按错误分压解码（约 3.6 倍），读入时还原
+    from core.vbus_legacy import correct_columns
+    voltages = {name: output[name] for name in
+                ("vbus_v", "vdda_v", "vd_applied_v", "vq_applied_v") if name in output}
+    if correct_columns(voltages):
+        for name in ("vbus_v", "vd_applied_v", "vq_applied_v"):
+            if name in output:
+                output[name] = array("d", voltages[name].tolist())
+        output["vbus_legacy_corrected"] = True
     validate_rls_columns(output)
     return output
 

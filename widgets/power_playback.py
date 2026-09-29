@@ -100,12 +100,16 @@ class PowerPlayback(QGroupBox):
 
     # ------------------------------------------------------------ 数据
     def _params(self) -> PowerParams:
+        from core.dyno_load import dyno_setting
+        mode, load_inertia = dyno_setting()
+        motor = None
         if callable(self._params_provider):
             try:
-                return PowerParams.from_motor(self._params_provider())
+                motor = self._params_provider()
             except Exception:  # noqa: BLE001 - 参数不可用时用铭牌默认值
-                pass
-        return PowerParams()
+                motor = None
+        base = PowerParams.from_motor(motor) if motor is not None else PowerParams()
+        return base.with_dyno(mode, motor, load_inertia)
 
     def _open_dialog(self) -> None:
         start = Path(__file__).resolve().parents[1] / "波形记录"

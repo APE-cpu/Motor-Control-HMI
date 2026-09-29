@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -44,9 +45,14 @@ def test_固件F1连续流由16kHz中断环形缓冲生产且主循环批量发�
     assert "s_f1_sample_sequence++" in app
     assert "VBS_GetAvBusVoltage_d" in app
     assert "s_f1_cached_vbus_d" in app
-    assert "VBUS_PARTITIONING_FACTOR      0.0270" in power_stage
-    assert "kBusPartitioningFactor = 0.0270" in host_parser
-    assert "kBusSensorBias" not in host_parser
+    # 野火板用 yh_bus_voltage_sensor.c 覆盖了 MCSDK 的母线换算（1.65 V 偏置、×37），
+    # 生成的 VBUS_PARTITIONING_FACTOR=0.027 在该板上不生效；主机两套解析必须与覆盖版一致。
+    yh_bus = (FIRMWARE_ROOT / "USER" / "YH_MotorControl" / "Inc" /
+              "yh_r_divider_bus_voltage_sensor.h").read_text(encoding="utf-8", errors="ignore")
+    assert re.search(r"VBUS_MAGNIFICATION_TIMES\s+37\.0", yh_bus)
+    assert re.search(r"VBUS_VBIAS\s+1\.65", yh_bus)
+    assert "kBusBiasV = 1.65" in host_parser and "kBusGain = 37.0" in host_parser
+    assert "kBusPartitioningFactor" not in host_parser
     assert "FOCVars[M1].Iqd.q, FOCVars[M1].Iqd.d" in tasks
     assert "s_v2_park_angle_m1" in tasks
     assert "static volatile uint8_t s_rls_probe_enabled" in app

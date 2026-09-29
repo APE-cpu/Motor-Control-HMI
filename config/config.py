@@ -214,9 +214,24 @@ TELEM_CURRENT_SCALE = 100.0   # mA → A
 # physical hardware constants explicit so identification does not inherit the
 # older rounded 0.000629 A/digit approximation.
 F1_CURRENT_A_PER_DIGIT = 3.30 / (65536.0 * 0.01000 * 8.00)
-# Must match the generated firmware power_stage_parameters.h definition.
-# The bus ADC is ground-referenced: Vadc = Vbus * factor.
-F1_VBUS_PARTITION_FACTOR = 0.0270
+# 母线电压：必须与野火骄阳板固件实际使用的换算一致。
+# 该板用 USER/YH_MotorControl/Src/yh_bus_voltage_sensor.c 覆盖了 MCSDK 的弱函数：
+#   Vbus = (ADC/65536 × 3.3 − 1.65) × 37   （带 1.65 V 偏置的差分采样，放大 37 倍）
+# MCSDK 生成的 VBUS_PARTITIONING_FACTOR=0.027 在此板上并不生效；2026-09-28 真机
+# F1/40 数据按 0.027 解码得到 84 V，而同时的 F0（固件按上式）为 23 V。
+F1_VBUS_ADC_REF_V = 3.30
+F1_VBUS_BIAS_V = 1.65
+F1_VBUS_GAIN = 37.0
+
+
+def f1_bus_voltage(bus_adc: float) -> float:
+    """F1 帧里的母线 ADC 读数（16 位左对齐）→ 母线电压 V，与固件 F0 的 vdc 同一公式。"""
+    return (float(bus_adc) / 65536.0 * F1_VBUS_ADC_REF_V - F1_VBUS_BIAS_V) * F1_VBUS_GAIN
+
+
+def f1_bus_adc(vbus_v: float) -> int:
+    """母线电压 → F1 母线 ADC 读数（测试与仿真造帧用）。"""
+    return round((float(vbus_v) / F1_VBUS_GAIN + F1_VBUS_BIAS_V) / F1_VBUS_ADC_REF_V * 65536.0)
 TELEM_ANGLE_SCALE = 100.0     # 0.01° → °
 TELEM_TEMP_OFFSET = 40.0      # int8 + 40 → °C
 # 电磁转矩常数 Kt（N·m/A）：下位机不测转矩，上位机统一按 Te = Kt·Iq 计算。

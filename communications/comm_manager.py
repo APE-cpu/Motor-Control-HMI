@@ -17,7 +17,7 @@ from PySide6.QtCore import QObject, Signal
 
 from config.config import (
     CMD_EMERGENCY_STOP, CMD_SET_TELEMETRY, CMD_START, CMD_STOP, CMD_TELEMETRY,
-    F1_CURRENT_A_PER_DIGIT, F1_VBUS_PARTITION_FACTOR,
+    F1_CURRENT_A_PER_DIGIT, f1_bus_voltage,
     FRAME_HEADER, FRAME_TAIL,
     TELEM_ANGLE_SCALE, TELEM_CURRENT_SCALE, TELEM_FMT, TELEM_FMT_CAN,
     TELEM_LEN, TELEM_LEN_CAN, TELEM_TEMP_OFFSET, TORQUE_CONSTANT_NM_PER_A,
@@ -1269,12 +1269,9 @@ class CommManager(QObject):
                                 "<H", chunk, vbus_offset)[0]
                             sample["vd_raw"] = vd_raw
                             sample["vq_raw"] = vq_raw
-                            # Generated power-stage configuration uses a
-                            # ground-referenced 0.027 divider (no midpoint
-                            # bias): Vadc = Vbus * 0.027.
-                            sample["vbus_v"] = (
-                                vbus_adc / 65536.0 * vdda_v /
-                                F1_VBUS_PARTITION_FACTOR)
+                            # 与固件 F0 的 vdc 同一公式（野火板带 1.65 V 偏置、×37）；
+                            # 不是 MCSDK 生成的 0.027 接地分压，见 config.f1_bus_voltage。
+                            sample["vbus_v"] = f1_bus_voltage(vbus_adc)
                             if sample_size in (32, 40) and 2800 <= vdda_mv <= 3600:
                                 sample["vdda_v"] = vdda_mv / 1000.0
                                 sample["vdda_source_direct"] = True

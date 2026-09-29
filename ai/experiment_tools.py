@@ -16,7 +16,9 @@ from typing import Any
 import numpy as np
 
 from ai.harness import ToolContext, ToolRegistry, ToolResult, ToolSpec
-from core.phasor_decomposition import Capture, analyze, find_pairs, load_capture
+from core.phasor_decomposition import (
+    Capture, analyze, find_pairs, load_capture, steady_window,
+)
 from core.power_estimate import PowerParams, estimate_power_series, power_summary
 from core.vector_distortion import diagnose, estimate_params
 from core.vector_shape import trajectory_shape
@@ -105,18 +107,41 @@ class ExperimentData:
             match = batches[-1]
         return self.session_dir(experiment_id) / "waveforms" / match["batch"] / match["high_rate_file"]
 
-    def window(self, arguments: dict) -> tuple[Capture, dict]:
+    def window(self, arguments: dict, prefer_steady: bool = False) -> tuple[Capture, dict]:
+        """解析时间窗。未指定 t0/t1 且 prefer_steady 时自动选稳态运行段（频谱、矢量分解用），
+        否则取整段（统计、功率用）。"""
         path = self.high_rate_path(arguments["experiment_id"], arguments.get("batch"))
         capture, digest = self.cache.get(path)
-        t0 = float(arguments.get("t0", capture.time[0]))
-        t1 = float(arguments.get("t1", capture.time[-1]))
+        selection = "指定时间窗"
+        if "t0" in arguments or "t1" in arguments:
+            t0 = float(arguments.get("t0", capture.time[0]))
+            t1 = float(arguments.get("t1", capture.time[-1]))
+        else:
+            t0, t1 = float(capture.time[0]), float(capture.time[-1])
+            selection = "整段"
+            if prefer_steady:
+                steady = steady_window(capture)
+                if steady is not None:
+                    t0, t1 = steady
+                    selection = "自动选取的稳态运行段（转速在中位数±12%内的最长连续区间）"
         window = capture.window(t0, t1)
         if window.time.size < 64:
             raise ValueError("时间窗内的采样点太少")
         source = {"file": str(path.relative_to(self.session_dir(arguments["experiment_id"]))),
                   "sha256": digest, "t0": float(window.time[0]), "t1": float(window.time[-1]),
-                  "samples": int(window.time.size), "rate_hz": capture.rate_hz}
+                  "samples": int(window.time.size), "rate_hz": capture.rate_hz,
+                  "selection": selection}
         return window, source
+
+    def motor_params(self):
+        """电机参数（数字孪生 PMSMParams）；取不到时用铭牌默认值。"""
+        if callable(self.params_provider):
+            try:
+                return self.params_provider()
+            except Exception:  # noqa: BLE001
+                pass
+        from communications.motor_sim import PMSMParams
+        return PMSMParams()
 
     def power_params(self) -> PowerParams:
         if callable(self.params_provider):
@@ -128,6 +153,23 @@ class ExperimentData:
 
 
 # ─── 工具实现 ────────────────────────────────────────────────
+def downsample_speed(time, speed, rate_hz: float = 1000.0):
+    """转速测速只有 500 Hz 更新：降到 1 kHz 再做阶跃分析，避免 16 kHz 台阶放大导数噪声。"""
+    t = np.asarray(time, float)
+    y = np.asarray(speed, float)
+    step = max(1, int(round((1.0 / rate_hz) / float(np.median(np.diff(t))))))
+    return t[::step], y[::step]
+
+
+def stft_for(time, values, rate_hz: float) -> dict:
+    """STFT 窗长约 0.1 s（16 kHz 下 2048 点），与 analysis_dynamic 同一实现。"""
+    import analysis_dynamic as dyn
+    window = int(min(8192, max(256, 2 ** round(np.log2(max(rate_hz * 0.1, 32))))))
+    return dyn.stft_map(np.asarray(time, float), np.asarray(values, float), rate_hz,
+                        window=window, fmax=min(rate_hz / 2, 2000.0))
+
+
+
 def _stats(values) -> dict:
     data = np.asarray(values, float)
     return {"mean": float(np.mean(data)), "rms": float(np.sqrt(np.mean(data ** 2))),
@@ -199,7 +241,7 @@ def make_tools(data: ExperimentData) -> list[ToolSpec]:
 
     def capture_spectrum(arguments: dict, _context: ToolContext) -> ToolResult:
         from pages.fourier_page import compute_spectrum
-        window, source = data.window(arguments)
+        window, source = data.window(arguments, prefer_steady=True)
         channel = arguments["channel"]
         count = int(arguments.get("peaks", 8))
         if channel == "current_complex":
@@ -246,7 +288,7 @@ def make_tools(data: ExperimentData) -> list[ToolSpec]:
                       "amplitude_definition": "峰值幅值" + ("（复数双边）" if two_sided else "（单边）")})
 
     def decompose_current_vector(arguments: dict, _context: ToolContext) -> ToolResult:
-        window, source = data.window(arguments)
+        window, source = data.window(arguments, prefer_steady=True)
         analysis = analyze(window, float(window.time[0]), float(window.time[-1]),
                            block_s=float(arguments.get("block_s", 0.25)))
         z = analysis.z
@@ -271,18 +313,103 @@ def make_tools(data: ExperimentData) -> list[ToolSpec]:
             "possible_causes": diagnose(shape),
         }), metadata={"source": source, "method": "阶次锁相 + 残差峰值，分段最小二乘"})
 
+    def step_response(arguments: dict, _context: ToolContext) -> ToolResult:
+        """转速阶跃响应（复用 analysis_dynamic.suggest_step / response_metrics）。"""
+        import analysis_dynamic as dyn
+        window, source = data.window(arguments)
+        if window.speed_rpm is None:
+            return ToolResult(ok=False, error="capture_missing_channel:speed_rpm")
+        t, y = downsample_speed(window.time, window.speed_rpm)
+        step = dyn.suggest_step(t, y)
+        if step is None:
+            return ToolResult(ok=True, data={"step_found": False,
+                                             "note": "记录里没有可识别的转速阶跃"},
+                              metadata={"source": source})
+        result = dyn.response_metrics(t, y, step["event"], step["target"])
+        return ToolResult(ok=True, data=_json({
+            "step_found": True, "event_s": step["event"], "event_basis": step["basis"],
+            "step_valid": result["step_valid"], "message": result["message"],
+            "metrics": result["metrics"]}), metadata={
+            "source": source, "method": "analysis_dynamic.response_metrics（10%→90% 上升、2% 调节带）"})
+
+    def time_frequency(arguments: dict, _context: ToolContext) -> ToolResult:
+        """STFT 时频（复用 analysis_dynamic.stft_map），给出主峰频率随时间的变化。"""
+        import analysis_dynamic as dyn
+        window, source = data.window(arguments)
+        channel = arguments.get("channel", "iq_a")
+        values = window.speed_rpm if channel == "speed_rpm" else window.extra.get(channel)
+        if values is None:
+            return ToolResult(ok=False, error=f"capture_missing_channel:{channel}")
+        stft = stft_for(window.time, values, window.rate_hz)
+        power, freqs = stft["power"], stft["axis"]
+        band = freqs > max(2.0, stft["resolution"] * 2)
+        dominant = freqs[band][np.argmax(power[band], axis=0)] if band.any() else []
+        picks = np.linspace(0, len(stft["time"]) - 1, min(12, len(stft["time"]))).astype(int)
+        return ToolResult(ok=True, data=_json({
+            "channel": channel, "resolution_hz": stft["resolution"], "window_s": stft["window_s"],
+            "dominant_frequency_track": [
+                {"time_s": float(stft["time"][i]), "frequency_hz": float(dominant[i])}
+                for i in picks] if len(dominant) else []}),
+            metadata={"source": source, "method": "analysis_dynamic.stft_map（Hann，PSD）"})
+
     def power_balance(arguments: dict, _context: ToolContext) -> ToolResult:
         window, source = data.window(arguments)
         if "iq_a" not in window.extra or "vq_raw" not in window.extra:
             return ToolResult(ok=False, error="capture_missing_channel:iq_a/vq_raw")
-        params = data.power_params()
+        session = data.repository.load(arguments["experiment_id"])
+        recorded = ((session.device.extra if session.device else {}) or {}).get("dyno_load", {})
+        mode = arguments.get("load_mode") or recorded.get("mode") or "unknown"
+        params = data.power_params().with_dyno(mode, data.motor_params(),
+                                               recorded.get("load_inertia_kgm2"))
         summary = power_summary(estimate_power_series(window.time, window.columns(), params))
         mean = summary["mean_w"]
         # 逆变器输入 − 铜损 − 电磁功率：铁损、死区电压误差、参数误差等未建模部分
         summary["unexplained_w"] = mean["inv"] - mean["cu"] - mean["em"]
-        summary["parameters"] = params.__dict__
+        summary["parameters"] = {"rs_ohm": params.rs_ohm, "kt_nm_per_a": params.kt_nm_per_a,
+                                 "inertia": params.inertia, "load_inertia": params.load_inertia,
+                                 "total_inertia": params.total_inertia, "pole_pairs": params.pole_pairs,
+                                 "load_mode": mode, "load_short_model": params.load_short is not None}
         return ToolResult(ok=True, data=_json(summary), metadata={
             "source": source, "note": "无母线电流：电源输入按逆变器输入计；开关损耗忽略"})
+
+    def dyno_load_check(arguments: dict, _context: ToolContext) -> ToolResult:
+        """对拖负载：负载驱动器上电未启动（绕组短接）时的短路制动模型与实测转矩对比。"""
+        from core import dyno_load
+        experiment_id = arguments["experiment_id"]
+        session = data.repository.load(experiment_id)
+        recorded = ((session.device.extra if session.device else {}) or {}).get("dyno_load", {})
+        mode = arguments.get("load_mode") or recorded.get("mode") or "unknown"
+        extra_r = float(arguments.get("extra_r_ohm", recorded.get("extra_r_ohm", 0.0)) or 0.0)
+        motor_params = data.motor_params()
+        kt = data.power_params().kt_nm_per_a
+        motor = dyno_load.LoadMotor.from_motor(motor_params, kt, extra_r)
+        nameplate = dyno_load.LoadMotor.from_motor(motor_params, None, extra_r)
+        result = {"load_mode": mode, "load_mode_text": dyno_load.LOAD_MODES.get(mode, mode),
+                  "mode_source": "生成日志时指定" if arguments.get("load_mode") else
+                  ("实验记录" if recorded.get("mode") else "未记录"),
+                  "assumption": "负载电机与驱动电机参数相同（同型号对拖）",
+                  "motor": {"rs_ohm": motor.rs_ohm, "ls_h": motor.ls_h, "psi_wb": motor.psi_wb,
+                            "psi_basis": f"ψ = kt/(1.5p)，kt = {kt} N·m/A（与转矩测量同一口径）",
+                            "nameplate_psi_wb": nameplate.psi_wb,
+                            "pole_pairs": motor.pole_pairs, "extra_r_ohm": extra_r},
+                  "characteristics": dyno_load.brake_characteristics(motor)}
+        window, source = data.window(arguments)
+        if window.speed_rpm is None or "iq_a" not in window.extra:
+            return ToolResult(ok=False, error="capture_missing_channel:speed_rpm/iq_a")
+        try:
+            compare = dyno_load.compare_with_measurement(
+                window.time, window.speed_rpm, window.extra["iq_a"], kt, motor)
+            alt = dyno_load.compare_with_measurement(
+                window.time, window.speed_rpm, window.extra["iq_a"],
+                1.5 * nameplate.pole_pairs * nameplate.psi_wb, nameplate)
+        except ValueError as exc:
+            result["levels"] = []
+            result["note"] = str(exc)
+        else:
+            result["levels"] = compare["levels"]
+            result["levels_nameplate_psi"] = alt["levels"]
+        return ToolResult(ok=True, data=_json(result), metadata={
+            "source": source, "method": "负载电机三相短接稳态解（Ld=Lq），实测转矩 = kt·iq（50 ms 块平均）"})
 
     def compare_parameters(arguments: dict, _context: ToolContext) -> ToolResult:
         baseline = data.repository.load(arguments["baseline_id"])
@@ -328,8 +455,18 @@ def make_tools(data: ExperimentData) -> list[ToolSpec]:
         ("decompose_current_vector", "电流矢量分量分解、圆度与畸变原因",
          schema({"block_s": {"type": "number", "minimum": 0.02, "maximum": 5.0}}),
          decompose_current_vector, 60.0),
-        ("power_balance", "能量链路平均功率、能量、电机效率与未解释功率",
-         schema(), power_balance, 30.0),
+        ("power_balance", "能量链路平均功率、能量、电机效率与未解释功率（对拖时计入负载侧惯量与短路铜损）",
+         schema({"load_mode": {"type": "string", "enum": ["unknown", "none", "off", "shorted", "torque"]}}),
+         power_balance, 30.0),
+        ("step_response", "转速阶跃响应：上升时间、超调、调节时间、稳态误差（自动定位阶跃）",
+         schema(), step_response, 30.0),
+        ("time_frequency", "STFT 时频分析：主峰频率随时间的变化（iq 或转速）",
+         schema({"channel": {"type": "string", "enum": ["iq_a", "speed_rpm", "ia_a"]}}),
+         time_frequency, 60.0),
+        ("dyno_load_check", "对拖负载：负载驱动器上电未启动（绕组短接）的制动转矩模型与实测对比",
+         schema({"load_mode": {"type": "string", "enum": ["unknown", "none", "off", "shorted", "torque"]},
+                 "extra_r_ohm": {"type": "number", "minimum": 0.0, "maximum": 2.0}}),
+         dyno_load_check, 30.0),
         ("compare_parameters", "对比两个实验的控制/保护/设备参数，只列出不同项",
          {"type": "object", "properties": {
              "baseline_id": {"type": "string"}, "experiment_id": {"type": "string"}},

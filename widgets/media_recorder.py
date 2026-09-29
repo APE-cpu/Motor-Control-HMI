@@ -235,15 +235,16 @@ class MediaPanel(QWidget):
         form = QFormLayout()
         self._camera = QComboBox()
         self._mic = QComboBox()
-        self._camera.addItem("不录像", _NONE)
-        for key, name in self.recorder.cameras():
-            self._camera.addItem(name, key)
-        self._mic.addItem("不录音", _NONE)
-        for key, name in self.recorder.microphones():
-            self._mic.addItem(name, key)
-        for combo, key in ((self._camera, "camera"), (self._mic, "microphone")):
-            index = combo.findData(self._settings.value(key, _NONE))
-            combo.setCurrentIndex(max(0, index))
+        # 枚举摄像头要约 0.9 s（Windows Media Foundation）：先只放上次选的设备，
+        # 本页第一次显示或开始录制时再枚举真实设备（_ensure_devices）
+        self._devices_loaded = False
+        for combo, key, none_text in ((self._camera, "camera", "不录像"),
+                                      (self._mic, "microphone", "不录音")):
+            combo.addItem(none_text, _NONE)
+            saved = self._settings.value(key, _NONE)
+            if saved not in (None, _NONE):
+                combo.addItem(self._settings.value(f"{key}_name", "上次选择的设备"), saved)
+                combo.setCurrentIndex(1)
             combo.currentIndexChanged.connect(self._apply_devices)
         self.auto = QCheckBox("点“开始记录实验”时自动开始录制，结束或中止实验时自动停止")
         self.auto.setChecked(self._settings.value("auto", False, type=bool))
@@ -273,7 +274,6 @@ class MediaPanel(QWidget):
         root.addWidget(note)
         self.recorder.recordingChanged.connect(self._on_recording)
         self.recorder.errorOccurred.connect(lambda text: self.status.setText(f"录制错误：{text}"))
-        self._apply_devices()
         self._on_recording(False)
 
     # ------------------------------------------------------------ 设备
@@ -281,9 +281,30 @@ class MediaPanel(QWidget):
         value = combo.currentData()
         return None if value in (None, _NONE) else value
 
+    def _ensure_devices(self) -> None:
+        """第一次需要时枚举真实设备，保留原来的选择。"""
+        if self._devices_loaded or not self.recorder.available:
+            return
+        self._devices_loaded = True
+        for combo, devices in ((self._camera, self.recorder.cameras()),
+                               (self._mic, self.recorder.microphones())):
+            current = combo.currentData()
+            combo.blockSignals(True)
+            while combo.count() > 1:
+                combo.removeItem(1)
+            for key, name in devices:
+                combo.addItem(name, key)
+            combo.setCurrentIndex(max(0, combo.findData(current)))
+            combo.blockSignals(False)
+        self._apply_devices()
+
     def _apply_devices(self, *_args) -> None:
-        self._settings.setValue("camera", self._camera.currentData())
-        self._settings.setValue("microphone", self._mic.currentData())
+        if not self._devices_loaded:            # 用户在枚举前就改了选择
+            self._ensure_devices()
+            return
+        for combo, key in ((self._camera, "camera"), (self._mic, "microphone")):
+            self._settings.setValue(key, combo.currentData())
+            self._settings.setValue(f"{key}_name", combo.currentText())
         self.recorder.configure(self._selected(self._camera), self._selected(self._mic))
         self.recorder.set_preview(self.isVisible())
         self._on_recording(self.recorder.recording)
@@ -310,10 +331,12 @@ class MediaPanel(QWidget):
         if not self.has_device:
             self.status.setText("已勾选自动录制，但没有选择摄像头或麦克风")
             return None
+        self._ensure_devices()
         return self.recorder.start(session_dir, started_at)
 
     def start_manual(self) -> None:
         if self._session_dir is not None:
+            self._ensure_devices()
             self.recorder.start(self._session_dir, self._session_started_at)
 
     def stop(self) -> dict | None:
@@ -335,6 +358,7 @@ class MediaPanel(QWidget):
     def showEvent(self, event) -> None:  # noqa: N802 - Qt API
         super().showEvent(event)
         if self.recorder.available:
+            self._ensure_devices()
             self.recorder.set_preview(True)
 
     def hideEvent(self, event) -> None:  # noqa: N802 - Qt API

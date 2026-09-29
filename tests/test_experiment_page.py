@@ -161,8 +161,10 @@ def test_主窗口包含实验管理页面且导航索引正确(tmp_path, monkey
     )
     window = MainWindow(enable_training=False)
 
-    assert window.stack.count() == 16
-    assert window.stack.indexOf(window.experiment_log_page) == 15   # 追加在末尾，不改动已有索引
+    assert window.stack.count() == 15
+    # 实验日志是实验管理页里的一个标签页，不单独占导航
+    assert window.experiment_log_page is window.experiment_page.log_page
+    assert window.stack.indexOf(window.experiment_log_page) == -1
     assert window.stack.indexOf(window.current_sampling_page) == 8
     assert window.stack.indexOf(window.experiment_page) == 9
     assert window.stack.indexOf(window.operation_log_page) == 10

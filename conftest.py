@@ -21,6 +21,20 @@ def _drain_qt_events_after_test():
     _QT_APPLICATION.processEvents()
 
 
+# 这些测试会逐个套用全部主题（app.setStyleSheet）。Qt 会给进程里所有存活控件
+# 重新套样式，而前面测试 close() 掉的主窗口并没有被删除（批量删除会触发 Windows 原生
+# abort，见 pytest_sessionfinish 的说明），所以放在最前面跑：主题循环单跑约 1 s，
+# 排在后面时曾因遗留控件多达 211 s。
+_RUN_FIRST = ("tests/test_page_artwork.py", "tests/test_appearance.py")
+
+
+def pytest_collection_modifyitems(session, config, items):  # noqa: ARG001
+    first = [item for item in items if item.nodeid.replace("\\", "/").startswith(_RUN_FIRST)]
+    if first:
+        rest = [item for item in items if item not in first]
+        items[:] = first + rest
+
+
 def pytest_sessionfinish(session, exitstatus):  # noqa: ARG001
     """关闭遗留窗口，但不在会话钩子里强制派送 DeferredDelete。
 

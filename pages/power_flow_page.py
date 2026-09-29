@@ -14,12 +14,12 @@ import time
 import numpy as np
 from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import (
-    QCheckBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
+    QCheckBox, QComboBox, QDoubleSpinBox, QFrame, QGridLayout, QGroupBox, QHBoxLayout, QLabel,
     QScrollArea, QVBoxLayout, QWidget,
 )
 
 from communications.comm_manager import CommManager, TelemetryFrame
-from core.power_estimate import inverter_power, voltage_from_raw
+from core.power_estimate import PowerParams, inverter_power, load_copper_w, voltage_from_raw
 from widgets.formula_view import Eq, FormulaImage
 from widgets.power_playback import PowerPlayback
 from widgets.power_sankey import PowerSankey
@@ -33,7 +33,10 @@ class _CalculationPanel(QGroupBox):
         ("逆变器电气输入", Eq(r"P_{\mathrm{inv}} = \dfrac{3}{2}\,(v_d i_d + v_q i_q)")),
         ("定子铜损", Eq(r"P_{\mathrm{Cu}} = \dfrac{3}{2}\,R_s\,(i_d^2 + i_q^2)")),
         ("电磁功率", Eq(r"P_{\mathrm{em}} = T_e\,\omega_m")),
-        ("转轴动能", Eq(r"P_{\mathrm{kin}} = P_{\mathrm{em}} - P_{\mathrm{fric/load}}")),
+        ("转轴动能（对拖时 J 取两台电机与联轴器之和）",
+         Eq(r"P_{\mathrm{kin}} = J_{\mathrm{eq}}\,\omega\,\dot{\omega},\quad E = \dfrac{1}{2}J_{\mathrm{eq}}\omega^2")),
+        ("负载电机短接铜损（负载驱动器上电未启动）",
+         Eq(r"P_{\mathrm{load}} = \dfrac{3}{2}\,\dfrac{R\,\omega_e^2\psi^2}{R^2 + \omega_e^2 L^2}")),
         ("电源与制动", Eq(r"P_{\mathrm{src}} = V_{\mathrm{src}}\,I_{\mathrm{src}},\quad"
                           r"P_{\mathrm{brake}} = \dfrac{V_{dc}^2}{R_{\mathrm{brake}}}")),
     )
@@ -42,6 +45,7 @@ class _CalculationPanel(QGroupBox):
         ("em", "电磁功率"), ("kinetic", "动能变化"),
         ("loss_src", "电源内阻"), ("cu", "定子铜损"),
         ("fric", "摩擦/负载"), ("brake", "制动泄放"),
+        ("load_cu", "负载电机铜损"), ("stored_j", "转轴储能"),
     )
 
     def __init__(self) -> None:
@@ -110,7 +114,8 @@ class _CalculationPanel(QGroupBox):
         p = powers
         for key, title in self._VALUES:
             value = float(p.get(key, 0.0))
-            self._value_labels[key].setText(f"{title}  {value:+.1f} W")
+            unit_text = f"{value:.3g} J" if key == "stored_j" else f"{value:+.1f} W"
+            self._value_labels[key].setText(f"{title}  {unit_text}")
         inv = float(p.get("inv", 0.0))
         if inv < -0.5:
             direction, color = "回馈：转轴 → 母线", "#4fc3f7"
@@ -126,7 +131,8 @@ class _CalculationPanel(QGroupBox):
                        float(p.get("brake", 0.0)))
         mech_error = (float(p.get("em", 0.0)) -
                       float(p.get("fric", 0.0)) -
-                      float(p.get("kinetic", 0.0)))
+                      float(p.get("kinetic", 0.0)) -
+                      float(p.get("load_cu", 0.0)))
         motor_storage = (inv - float(p.get("cu", 0.0)) -
                          float(p.get("em", 0.0)))
         self._bus_balance.setText(
@@ -166,6 +172,31 @@ class PowerFlowPage(QWidget):
         self._chk_offline = QCheckBox("离线回放")
         self._chk_offline.setToolTip("回放实验目录里保存的 高速数据.csv；回放期间暂停实时数据")
         title_row.addWidget(self._chk_offline)
+        # 对拖：等效转动惯量 = 驱动电机 + 负载侧（默认同型号电机）；负载驱动器上电未启动时
+        # 负载电机绕组短接，短路铜损单独成支路
+        from core.dyno_load import LOAD_MODES, dyno_setting
+        title_row.addWidget(QLabel("负载"))
+        self._dyno_mode = QComboBox()
+        for key, text in LOAD_MODES.items():
+            if key != "unknown":
+                self._dyno_mode.addItem("单机（无对拖）" if key == "none" else text, key)
+        self._dyno_mode.setToolTip("与实验管理页的“对拖负载”共用同一设置")
+        self._dyno_mode.setMaximumWidth(260)
+        title_row.addWidget(self._dyno_mode)
+        self._load_inertia = QDoubleSpinBox()
+        self._load_inertia.setDecimals(7)
+        self._load_inertia.setRange(0.0, 1.0)
+        self._load_inertia.setSingleStep(1e-6)
+        self._load_inertia.setSuffix(" kg·m²")
+        self._load_inertia.setMaximumWidth(160)
+        self._load_inertia.setToolTip("负载侧转动惯量（负载电机转子 + 联轴器）；默认取与驱动电机相同的 J")
+        title_row.addWidget(self._load_inertia)
+        mode, load_j = dyno_setting()
+        self._dyno_mode.setCurrentIndex(max(0, self._dyno_mode.findData(mode)))
+        self._load_inertia.setValue(load_j if load_j is not None else float(comm.motor_sim_params().J))
+        self._dyno_mode.currentIndexChanged.connect(self._on_dyno_changed)
+        self._load_inertia.valueChanged.connect(self._on_dyno_changed)
+        self._on_dyno_enabled()
         self._eff_label = QLabel("效率 η = --")
         self._eff_label.setStyleSheet("color: #69f0ae; font-weight: bold;")
         title_row.addWidget(self._eff_label)
@@ -222,6 +253,29 @@ class PowerFlowPage(QWidget):
         self._timer.timeout.connect(self._refresh)
         self._timer.setInterval(200)
         self._chk_enabled.toggled.connect(self._set_analysis_enabled)
+
+    # ------------------------------------------------------------ 对拖设置
+    def _on_dyno_enabled(self) -> None:
+        self._load_inertia.setEnabled(self._dyno_mode.currentData() != "none")
+
+    def _on_dyno_changed(self, *_args) -> None:
+        from core.dyno_load import save_dyno_setting
+        save_dyno_setting(self._dyno_mode.currentData(), self._load_inertia.value())
+        self._on_dyno_enabled()
+        if self._playback.loaded:
+            self._playback.recompute()
+
+    def set_dyno_mode(self, mode: str) -> None:
+        """实验管理页改了对拖工况时同步过来。"""
+        index = self._dyno_mode.findData(mode)
+        if index >= 0 and index != self._dyno_mode.currentIndex():
+            self._dyno_mode.setCurrentIndex(index)
+
+    def power_params(self) -> PowerParams:
+        """实时估算用的参数：数字孪生电机参数 + 对拖设置。"""
+        motor = self._comm.motor_sim_params()
+        mode = self._dyno_mode.currentData()
+        return PowerParams.from_motor(motor).with_dyno(mode, motor, self._load_inertia.value())
 
     def _set_offline(self, offline: bool) -> None:
         """离线回放与实时功率流互斥：回放时停掉实时估算，结束后恢复空白待机。"""
@@ -280,7 +334,7 @@ class PowerFlowPage(QWidget):
         if self._previous_speed_at > 0.0:
             dt = now - self._previous_speed_at
             if 0.02 <= dt <= 1.0:
-                inertia = float(self._comm.motor_sim_params().J)
+                inertia = self.power_params().total_inertia
                 raw = inertia * omega * (omega - self._previous_omega) / dt
                 self._kinetic_power_w = 0.75 * self._kinetic_power_w + 0.25 * raw
         self._previous_omega = omega
@@ -336,7 +390,9 @@ class PowerFlowPage(QWidget):
         brake = max(-inv, 0.0) if f.bus_state == "brake" else 0.0
         supply = inv + brake
         kinetic = self._kinetic_power_w
-        load_and_friction = em - kinetic
+        power_params = self.power_params()
+        load_cu = float(load_copper_w(power_params, abs(omega)))
+        load_and_friction = em - kinetic - load_cu
         powers = {
             "supply": supply,
             "loss_src": 0.0,       # 协议暂无母线输入电流
@@ -346,6 +402,8 @@ class PowerFlowPage(QWidget):
             "em": em,
             "fric": load_and_friction,
             "kinetic": kinetic,
+            "load_cu": load_cu,
+            "stored_j": 0.5 * power_params.total_inertia * omega * omega,
         }
         source = ("真机估算：F1 Vq·Iq + F0转速/转矩"
                   if fresh_f1 else

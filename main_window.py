@@ -103,7 +103,7 @@ class MainWindow(QMainWindow):
         super().__init__()
         self._startup_progress = progress
         self._startup_done = 0
-        self._startup_total = 18 if enable_training else 17
+        self._startup_total = 17 if enable_training else 16
         self.setWindowTitle(f"{APP_NAME} · {APP_SUBTITLE} v{APP_VERSION}")
         if tree_name := os.environ.get("YUHENG_WORKTREE"):
             self.setWindowTitle(f"{self.windowTitle()} [{tree_name}]")
@@ -143,15 +143,13 @@ class MainWindow(QMainWindow):
         digital_twin_idx = manual_idx + 1
         fourier_idx = digital_twin_idx + 1
         frequency_response_idx = fourier_idx + 1
-        experiment_log_idx = frequency_response_idx + 1
         ai_section = [("诊断助手", 6), ("边缘AI", 7)]
         if enable_training:
             ai_section.append(("模型训练", 8))
         nav_sections = [
             ("运行控制", [("监控页面", 0), ("电机控制", 1),
                           ("数字孪生", digital_twin_idx),
-                          ("实验管理", experiment_idx),
-                          ("实验日志", experiment_log_idx)]),
+                          ("实验管理", experiment_idx)]),
             ("分析可视化", [("矢量可视化", 2), ("功率流", 3),
                             ("参数辨识", 4), ("离线傅里叶", fourier_idx),
                             ("波特图与传函", frequency_response_idx),
@@ -239,15 +237,16 @@ class MainWindow(QMainWindow):
         # 导航仍将它归在“分析可视化”分组。
         self.stack.addWidget(self.fourier_page, "fourier")
         self.stack.addWidget(self.frequency_response_page, "inverter")
-        self._startup_step("实验日志页")
-        from pages.experiment_log_page import ExperimentLogPage
-        self.experiment_log_page = ExperimentLogPage(
-            self.experiment_page.manager.repository,
-            conclusion_updater=self.experiment_page.manager.update_conclusion,
+        # 实验日志是“实验管理”里的一个标签页；诊断助手与通信在这里才建好，再注入
+        self.experiment_log_page = self.experiment_page.log_page
+        self.experiment_log_page.set_providers(
             ai_client_provider=lambda: (
                 getattr(self.ai_page, "_client", None), self.ai_page._model.text().strip()),
             params_provider=self.comm_manager.motor_sim_params)
-        self.stack.addWidget(self.experiment_log_page, "drive_train")
+        # 对拖工况：实验管理页与功率流页双向同步（两边都写同一个 QSettings）
+        self.experiment_page.loadModeChanged.connect(self.power_flow_page.set_dyno_mode)
+        self.power_flow_page._dyno_mode.currentIndexChanged.connect(
+            lambda _i: self.experiment_page.set_load_mode(self.power_flow_page._dyno_mode.currentData()))
 
         self._startup_step("组装主界面")
         layout.addWidget(self.nav)

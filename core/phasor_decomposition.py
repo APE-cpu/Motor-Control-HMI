@@ -16,6 +16,7 @@ from pathlib import Path
 import numpy as np
 
 from core.vector_shape import clarke
+from core.vbus_legacy import correct_columns
 
 _ORDERS = (1, 0, -1, 2, -2, -5, 7, -11, 13)
 
@@ -137,11 +138,12 @@ _EXTRA_COLUMNS = ("iq_a", "iqref_a", "id_a", "idref_a", "vd_raw", "vq_raw", "vbu
 
 def _load_wide(path: Path, header: list[str]) -> Capture:
     wanted = ["time_s", "ia_a", "ib_a"] + [
-        c for c in ("angle_deg", "speed_rpm") + _EXTRA_COLUMNS if c in header]
+        c for c in ("angle_deg", "speed_rpm", "vdda_v") + _EXTRA_COLUMNS if c in header]
     columns = [header.index(name) for name in wanted]
     data = np.loadtxt(path, delimiter=",", skiprows=1, usecols=columns,
                       encoding="utf-8-sig", ndmin=2)
     values = dict(zip(wanted, data.T))
+    correct_columns(values)          # 旧文件的母线电压按错误分压解码过，读入时还原
     theta = (np.unwrap(np.radians(values["angle_deg"])) if "angle_deg" in values else None)
     capture = _capture(values["time_s"], values["ia_a"], values["ib_a"], theta,
                        values.get("speed_rpm"), f"{path.name}（宽表）")
@@ -254,6 +256,49 @@ def _residual_peaks(residual, rate, exclude_hz, count, min_amp):
     return peaks
 
 
+def steady_window(capture: Capture, min_s: float = 0.5,
+                  band: float = 0.12) -> tuple[float, float] | None:
+    """自动挑出稳态运行段：转速在其中位数 ±band 以内、最长的连续区间。
+
+    启动、停机、停转段会让频谱展宽、让阶次分解失去意义，频谱与矢量分解默认只用稳态段。
+    没有转速列时用电角度求电频率；找不到至少 min_s 的稳态段返回 None。
+    """
+    t = capture.time
+    if t.size < 64:
+        return None
+    if capture.speed_rpm is not None:
+        speed = np.asarray(capture.speed_rpm, float)
+    elif capture.theta is not None:
+        speed = np.gradient(capture.theta, t) / (2 * np.pi) * 60.0
+    else:
+        return None
+    rate = capture.rate_hz or 1.0 / float(np.median(np.diff(t)))
+    size = max(1, int(0.05 * rate))                       # 50 ms 滑动平均，压掉测速量化
+    smooth = np.convolve(speed, np.ones(size) / size, mode="same")
+    peak = float(np.max(np.abs(smooth)))
+    if peak < 10.0:
+        return None
+    running = np.abs(smooth) > 0.3 * peak
+    if not running.any():
+        return None
+    level = float(np.median(smooth[running]))
+    inside = np.abs(smooth - level) <= band * max(abs(level), 1.0)
+    best, start = (0, 0), None
+    for index, flag in enumerate(np.append(inside, False)):
+        if flag and start is None:
+            start = index
+        elif not flag and start is not None:
+            if index - start > best[1] - best[0]:
+                best = (start, index)
+            start = None
+    lo, hi = best
+    # 去掉两端各 50 ms，避开平均窗口的边缘
+    lo, hi = min(lo + size, hi), max(hi - size, lo)
+    if hi - lo < min_s * rate:
+        return None
+    return float(t[lo]), float(t[hi - 1])
+
+
 def analyze(capture: Capture, t0: float, t1: float, block_s: float = 0.25,
             max_extra: int = 4, threshold_pct: float = 1.0) -> Analysis:
     mask = (capture.time >= t0) & (capture.time <= t1)
@@ -289,12 +334,25 @@ def analyze(capture: Capture, t0: float, t1: float, block_s: float = 0.25,
     edges = np.arange(t[0], t[-1], max(block_s, 5.0 / capture.rate_hz))
     edges = np.append(edges, t[-1] + 1e-9)
     per_block = []
+    width = len(keep) + len(extras)
     for lo, hi in zip(edges[:-1], edges[1:]):
         sel = (t >= lo) & (t < hi)
-        if sel.sum() < 2 * (len(keep) + len(extras)):
-            per_block.append(per_block[-1] if per_block else np.zeros(len(keep) + len(extras), complex))
+        if sel.sum() < 2 * width:
+            per_block.append(per_block[-1] if per_block else np.zeros(width, complex))
             continue
-        per_block.append(_fit(z[sel], _basis(keep, extras, t[sel], theta[sel])))
+        span = float(np.ptp(theta[sel])) if sel.any() else 0.0
+        if span >= 2 * np.pi:
+            per_block.append(_fit(z[sel], _basis(keep, extras, t[sel], theta[sel])))
+            continue
+        # 本段电角度转不满一圈（停转、启动瞬间）：各阶次 e^{jkθ} 几乎相同、无法区分，
+        # 硬拟合会得到巨大且互相抵消的系数。只拟合静止矢量（k=0）与频率分量，其余阶次记 0。
+        coeffs = np.zeros(width, complex)
+        subset = [i for i, k in enumerate(keep) if k == 0]
+        orders = [keep[i] for i in subset]
+        partial = _fit(z[sel], _basis(orders, extras, t[sel], theta[sel]))
+        for slot, value in zip(subset + list(range(len(keep), width)), partial):
+            coeffs[slot] = value
+        per_block.append(coeffs)
     block_coeffs = np.array(per_block)                       # [段, 分量]
     fitted = np.empty_like(z)
     for i, (lo, hi) in enumerate(zip(edges[:-1], edges[1:])):

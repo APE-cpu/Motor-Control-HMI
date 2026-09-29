@@ -10,6 +10,7 @@ from communications.comm_manager import CommManager, TelemetryFrame
 from communications.native_telemetry import NativeTelemetryProcessor
 from pages.power_flow_page import PowerFlowPage
 from pages.vector_page import VectorPage, _PG_OK
+from config.config import f1_bus_adc
 
 
 def _app():
@@ -63,7 +64,7 @@ def test_vector_page_uses_native_trail_for_cpp_f1_columns():
     sample = struct.pack(
         "<IHHhhhhhhhhhHH", 42, 73, 32768, 500, 2000, -321, 1990, 25,
         1200, -600, -1000, 6000,
-        round(24.0 * 0.0270 / 3.30 * 65536.0), 0xF130)
+        f1_bus_adc(24.0), 0xF130)
     assert processor.ingest(0xF1, sample * 160)
     columns = processor.drain_f1_columns(vector_trail=comm._native_vector_trail)
     page._on_high_rate_columns(columns)

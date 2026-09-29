@@ -24,6 +24,7 @@ from config.config import (
 from pages.communication_page import CommunicationPage
 from main_window import MainWindow
 from core import RuntimeState
+from config.config import f1_bus_adc
 
 
 def _app():
@@ -190,7 +191,7 @@ def test_Python后备解析F1_32使用VDDA标度():
     comm = CommManager()
     comm._native_telemetry_processor = None
     vdda_mv = 3150
-    bus_adc = round(24.0 * 0.0270 / 3.15 * 65536.0)
+    bus_adc = f1_bus_adc(24.0)
     payload = struct.pack(
         "<IHHhhhhhhhhhHHH", 43, 74, 32768, 500, 2000, -321, 1990, 25,
         1200, -600, -1000, 6000, bus_adc, vdda_mv, 0xF132)

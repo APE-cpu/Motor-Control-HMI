@@ -100,12 +100,20 @@ def test_single_log_has_fixed_sections_and_provenance(experiments):
     generator = ExperimentLogGenerator(manager.repository)
     result = generator.generate(ids[0], make_pdf=False)
     text = result.html.read_text(encoding="utf-8")
-    for title in ("1. 实验概况", "5. 高速数据时域统计", "6. 频谱分析", "7. 电流矢量分解",
-                  "8. 功率流", "10. 音视频记录", "11. 结论", "12. 数据来源与处理"):
-        assert title in text
-    assert "AI 分析</span> 未生成" in text
-    for name in ("频谱.png", "滑动频谱.gif", "矢量合成.gif", "功率流.gif"):
+    titles = ("实验概览", "过程与响应", "电流与频谱", "矢量与分解", "功率与假设",
+              "设备与参数", "事件时间线", "波形与影音", "结论", "附件与来源")
+    for number, title in enumerate(titles, 1):
+        assert f'<div class="section-no">{number:02d}</div><div><h2>{title}' in text
+    assert "AI 分析 <span class=\"tag ai\">未生成</span>" in text
+    assert "技术结论待填写" in text                     # 结论为空不生成“通过”之类的判断
+    assert "图 01" in text and "\x00" not in text      # 图号已按出现顺序编号
+    assert "@bottom-right" in text                     # PDF 页码
+    for name in ("频谱.png", "滑动频谱.gif", "滑动频谱_打印.png", "时频_iq.png", "电流圆.png",
+                 "矢量合成.gif", "矢量合成_打印.png", "矢量合成_跟随.gif", "分量柱状图.png",
+                 "功率流.gif", "功率流_平均.png"):
         assert (result.folder / "log_assets" / name).exists()
+    # 打印版用静态图替代动图
+    assert 'class="print-only" src="log_assets/功率流_平均.png"' in text
     evidence = json.loads((result.folder / "log_data.json").read_text(encoding="utf-8"))
     assert evidence["high_rate"]["power"]["ok"]
     assert (result.folder / "log_audit.jsonl").exists()
@@ -165,7 +173,7 @@ def test_ai_conclusion_is_separate_and_marked(experiments):
     assert manager.repository.load(ids[0]).conclusion == {}
     text = generator.generate(ids[0], make_pdf=False, reuse_assets=True).html.read_text(
         encoding="utf-8")
-    assert "AI 分析 · 需人工确认" in text and "fake-model" in text
+    assert "AI 分析 <span class=\"tag ai\">需人工确认</span>" in text and "fake-model" in text
 
 
 def test_log_page_generates_single_and_comparison(experiments):
@@ -175,9 +183,12 @@ def test_log_page_generates_single_and_comparison(experiments):
     page = ExperimentLogPage(manager.repository)
     page.set_selection([ids[0]])
     assert page.generate()
+    assert page.busy and not page._btn_generate.isEnabled()   # 后台生成，界面不阻塞
+    assert page.wait_idle()
     assert (manager.repository.session_dir(ids[0]) / "report" / LOG_HTML).exists()
     page._template.setCurrentIndex(1)
     page.set_selection(ids, baseline=ids[0])
     assert sorted(page.selected_ids()) == sorted(ids)      # 列表按时间倒序
     assert page.generate()
+    assert page.wait_idle()
     assert "_comparisons" in str(page._folder)

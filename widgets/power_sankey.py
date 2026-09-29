@@ -26,6 +26,15 @@ _TEXT = QColor("#dfe6ee")
 _MUTED = QColor("#90a4ae")
 _NODE = QColor("#37474f")
 
+# 配色：dark 为上位机界面；paper 为实验日志（暖白纸面，青绿为主、铜色为损耗）
+PALETTES = {
+    "dark": {"fwd": _FWD, "rev": _REV, "loss": _LOSS, "store": _STORE, "idle": _IDLE,
+             "text": _TEXT, "muted": _MUTED, "node": _NODE.lighter(170), "dot_lighter": 170},
+    "paper": {"fwd": QColor("#39786b"), "rev": QColor("#4f6d8a"), "loss": QColor("#af6948"),
+              "store": QColor("#8a5a7a"), "idle": QColor("#b7c0b8"), "text": QColor("#24312f"),
+              "muted": QColor("#74817b"), "node": QColor("#5d6b66"), "dot_lighter": 125},
+}
+
 # 待机时的示意数值（只用来画灰色骨架，不显示数值）
 _IDLE_POWERS = {"supply": 100.0, "loss_src": 4.0, "inv": 90.0, "brake": 0.0,
                 "cu": 12.0, "em": 78.0, "fric": 70.0, "kinetic": 8.0}
@@ -52,32 +61,26 @@ class _Link:
     kind: str           # main / loss / store
 
 
-class PowerSankey(QWidget):
+class SankeyPainter:
+    """桑基图的数据与绘制，不依赖 QWidget：实验日志可在后台线程画成 QImage。"""
     _BAR_W = 14.0
 
-    def __init__(self) -> None:
-        super().__init__()
-        self.setMinimumHeight(260)
+    def __init__(self, palette: str = "dark", titles: dict | None = None) -> None:
         self._powers: dict = {}
         self._vdc = 0.0
         self._bus_state = "normal"
         self._phase = 0.0
-        self._anim = QTimer(self)
-        self._anim.setInterval(40)
-        self._anim.timeout.connect(self._tick)
-
-    # ------------------------------------------------------------ 接口
-    def set_active(self, active: bool) -> None:
-        if active:
-            self._anim.start()
-        else:
-            self._anim.stop()
+        self._colors = PALETTES[palette]
+        self._titles = dict(titles or {})     # 节点标题覆盖，如对拖时 load → 负载电机铜损
 
     def set_data(self, powers: dict, vdc: float, bus_state: str) -> None:
         self._powers = dict(powers or {})
         self._vdc = float(vdc or 0.0)
         self._bus_state = bus_state
         self.update()
+
+    def update(self) -> None:           # 纯绘制对象无需刷新窗口
+        pass
 
     @property
     def idle(self) -> bool:
@@ -113,13 +116,14 @@ class PowerSankey(QWidget):
             _Link("em", "load", g("fric"), "main"),
             _Link("em", "kin", g("kinetic"), "store"),
         ]
+        if abs(g("load_cu")) > 1e-6:
+            # 对拖且负载驱动器上电未启动：负载电机短路铜损单独成支路，其余才是摩擦与负载
+            nodes[4].title = "摩擦与其余负载"
+            nodes.append(_Node("load_cu", "负载电机铜损", 0.86, 0.80, sink=True))
+            links.append(_Link("em", "load_cu", g("load_cu"), "loss"))
         return nodes, links
 
     # ------------------------------------------------------------ 绘制
-    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt API
-        qp = QPainter(self)
-        self.paint(qp, float(self.width()), float(self.height()))
-
     def render_frame(self, width: int, height: int, background: str = "#1b1c1c"):
         """离屏画一帧（实验日志动图用），不需要显示窗口。"""
         from PySide6.QtGui import QImage
@@ -159,16 +163,17 @@ class PowerSankey(QWidget):
         self._draw_header(qp, w, h, powers, idle)
 
     def _link_color(self, link: _Link, idle: bool) -> QColor:
+        c = self._colors
         if idle:
-            return QColor(_IDLE)
+            return QColor(c["idle"])
         if link.kind == "loss":
-            color = QColor(_LOSS)
+            color = QColor(c["loss"])
             if link.target == "brake" and abs(link.value) > 1.0:   # 泄放中：呼吸闪烁
                 color.setAlphaF(0.55 + 0.45 * math.sin(self._phase * 6.0))
             return color
         if link.kind == "store":
-            return QColor(_STORE)
-        return QColor(_FWD if link.value >= 0 else _REV)
+            return QColor(c["store"])
+        return QColor(c["fwd"] if link.value >= 0 else c["rev"])
 
     def _draw_link(self, qp: QPainter, link: _Link, nodes: dict, scale: float,
                    w: float, idle: bool) -> None:
@@ -214,7 +219,7 @@ class PowerSankey(QWidget):
         # 能量粒子：分布在带宽内的多条流道上，速度 ∝ 功率，负功率反向
         speed = 0.12 + 0.45 * min(abs(link.value), 300.0) / 300.0
         count = max(3, min(28, int(thickness / 3.5) + 3))
-        dot = QColor(color).lighter(170)
+        dot = QColor(color).lighter(self._colors["dot_lighter"])
         radius = min(3.2, 1.3 + thickness / 30.0)
         qp.setPen(Qt.NoPen)
         for i in range(count):
@@ -233,16 +238,17 @@ class PowerSankey(QWidget):
     def _draw_node(self, qp: QPainter, node: _Node, w: float, p: dict, idle: bool) -> None:
         x = node.x * w - self._BAR_W / 2
         rect = QRectF(x, node.top, self._BAR_W, node.height)
-        color = QColor(_IDLE if idle else (_LOSS if node.key in ("loss_src", "brake", "cu")
-                                           else _STORE if node.key == "kin" else _NODE.lighter(170)))
+        c = self._colors
+        color = QColor(c["idle"] if idle else (c["loss"] if node.key in ("loss_src", "brake", "cu", "load_cu")
+                                               else c["store"] if node.key == "kin" else c["node"]))
         qp.setPen(Qt.NoPen)
         qp.setBrush(color)
         qp.drawRoundedRect(rect, 3, 3)
         value = self._node_value(node.key, p)
-        title = node.title
+        title = self._titles.get(node.key, node.title)
         if node.key == "bus" and not idle:
             title = f"{title} {self._vdc:.1f} V"
-        font = QFont(self.font())
+        font = QFont("Microsoft YaHei")
         font.setPixelSize(13 if not node.sink else 12)
         font.setBold(not node.sink)
         qp.setFont(font)
@@ -256,8 +262,14 @@ class PowerSankey(QWidget):
         else:
             box = QRectF(x - text_w / 2 + self._BAR_W / 2, node.top - 38, text_w, 36)
             align = Qt.AlignHCenter | Qt.AlignBottom
-        qp.setPen(_TEXT if not idle else _MUTED)
+        if box.left() < 2.0:                     # 最左侧节点的标签不要画出画布
+            box.moveLeft(2.0)
+            align = (align & ~Qt.AlignHCenter) | Qt.AlignLeft
+        qp.setPen(c["text"] if not idle else c["muted"])
         text = title if idle else f"{title}\n{value:+.1f} W"
+        if node.key == "kin" and not idle and "stored_j" in p:
+            # 动能功率只有加减速时才有；转轴储能 ½Jω² 更能说明转子“存了多少能量”
+            text += f" · 储能 {float(p['stored_j']):.3g} J"
         qp.drawText(box, align, text)
 
     @staticmethod
@@ -272,7 +284,7 @@ class PowerSankey(QWidget):
         return float(p.get(mapping.get(key, key), 0.0))
 
     def _draw_header(self, qp: QPainter, w: float, h: float, p: dict, idle: bool) -> None:
-        qp.setPen(_MUTED)
+        qp.setPen(self._colors["muted"])
         if idle:
             qp.drawText(QRectF(0, h - 30, w, 26), Qt.AlignCenter,
                         "待机示意：勾选“启用功率流”并运行仿真或连接真机后显示实时能量流")
@@ -290,3 +302,28 @@ class PowerSankey(QWidget):
                 parts.append(f"总效率 {100.0 * em / supply:.0f}%")
         qp.drawText(QRectF(0, h - 30, w, 26), Qt.AlignCenter,
                     "   ·   ".join(parts) if parts else "轻载，效率不具参考意义")
+
+
+class PowerSankey(QWidget, SankeyPainter):
+    """功率流页上的桑基图控件：SankeyPainter 的绘制 + 粒子动画定时器。"""
+
+    def __init__(self) -> None:
+        QWidget.__init__(self)
+        SankeyPainter.__init__(self)
+        self.setMinimumHeight(260)
+        self._anim = QTimer(self)
+        self._anim.setInterval(40)
+        self._anim.timeout.connect(self._tick)
+
+    def update(self) -> None:  # noqa: D401 - QWidget.update
+        QWidget.update(self)
+
+    def set_active(self, active: bool) -> None:
+        if active:
+            self._anim.start()
+        else:
+            self._anim.stop()
+
+    def paintEvent(self, _event) -> None:  # noqa: N802 - Qt API
+        qp = QPainter(self)
+        self.paint(qp, float(self.width()), float(self.height()))

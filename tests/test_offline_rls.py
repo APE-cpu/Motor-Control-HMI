@@ -10,6 +10,7 @@ from rls_offline import (
     resolve_voltage_columns_si, validate_rls_columns,
 )
 from tools.stress_physical_rls import simulate as simulate_physical_rls
+from config.config import f1_bus_adc
 
 
 def _columns(count=2):
@@ -501,7 +502,7 @@ def test_闭环工具变量使用逐点Park角补偿旋转dq耦合():
         np.rint(value / current_per_digit), -32767, 32767))
     voltage_raw = lambda value: int(np.clip(
         np.rint(value / volts_per_digit), -32767, 32767))
-    bus_adc = round(24.0 * 0.0270 / vdda_v * 65536.0)
+    bus_adc = f1_bus_adc(24.0)
     sample_struct = struct.Struct("<IHHhhhhhhhhhHHH")
     processor = native_telemetry.NativeTelemetryProcessor(
         max_f1_samples=count + 1)

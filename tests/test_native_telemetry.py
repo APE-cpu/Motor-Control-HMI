@@ -5,7 +5,7 @@ import struct
 
 import pytest
 
-from config.config import F1_CURRENT_A_PER_DIGIT
+from config.config import F1_CURRENT_A_PER_DIGIT, f1_bus_adc
 from communications.native_telemetry import (
     NativeTelemetryProcessor, create_native_vector_trail,
     native_telemetry_available,
@@ -23,7 +23,7 @@ def test_native_vector_trail_consumes_f1_without_python_point_objects():
     sample = struct.pack(
         "<IHHhhhhhhhhhHH", 42, 73, 32768, 500, 2000, -321, 1990, 25,
         1200, -600, -1000, 6000,
-        round(24.0 * 0.0270 / 3.30 * 65536.0), 0xF130)
+        f1_bus_adc(24.0), 0xF130)
     assert processor.ingest(0xF1, sample * 160)
     columns = processor.drain_f1_columns(vector_trail=trail)
     snapshot = trail.snapshot()
@@ -132,7 +132,7 @@ def test_F1_30字节标记格式直接携带Park_Id和连续序号且不会误�
     sample = struct.pack(
         "<IHHhhhhhhhhhHH", 42, 73, 32768, 500, 2000, -321, 1990, 25,
         1200, -600, -1000, 6000,
-        round(24.0 * 0.0270 / 3.30 * 65536.0), 0xF130)
+        f1_bus_adc(24.0), 0xF130)
     payload = sample * 11  # Tagged format is explicit for every sample.
 
     assert processor.ingest(0xF1, payload)
@@ -159,7 +159,7 @@ def test_F1_32字节格式用实测VDDA换算电流与母线电压():
     processor = NativeTelemetryProcessor()
     processor.set_f1_rate_hz(16000)
     vdda_mv = 3150
-    bus_adc = round(24.0 * 0.0270 / 3.15 * 65536.0)
+    bus_adc = f1_bus_adc(24.0)
     sample = struct.pack(
         "<IHHhhhhhhhhhHHH", 43, 74, 32768, 500, 2000, -321, 1990, 25,
         1200, -600, -1000, 6000, bus_adc, vdda_mv, 0xF132)
@@ -179,7 +179,7 @@ def test_F1_40字节格式从最终PWM比较值重构施加dq电压():
     processor = NativeTelemetryProcessor()
     processor.set_f1_rate_hz(16000)
     vdda_mv = 3150
-    bus_adc = round(24.0 * 0.0270 / 3.15 * 65536.0)
+    bus_adc = f1_bus_adc(24.0)
     sample = struct.pack(
         "<IHHHhhhhhhhhhHHHHHH",
         44, 75, 0, 0, 500, 2000, -321, 1990, 25,
